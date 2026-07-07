@@ -1,52 +1,54 @@
-// Polyfills the window.storage API that the Model Audit Tool was originally
-// built against (Claude's artifact persistent-storage feature) so it works
-// unmodified in a normal browser deployment. Backed by localStorage, scoped
-// under a single prefix. "shared" is accepted for interface compatibility
-// but has no effect here — there's no multi-user backend in this app.
-const PREFIX = "orion-tools:";
+import { useState, Suspense, lazy } from "react";
 
-function fullKey(key) {
-  return PREFIX + key;
-}
+const OrionImportBuilder = lazy(() => import("./tools/OrionImportBuilder.jsx"));
+const ModelAuditTool = lazy(() => import("./tools/ModelAuditTool.jsx"));
 
-if (typeof window !== "undefined" && !window.storage) {
-  window.storage = {
-    async get(key) {
-      try {
-        const value = localStorage.getItem(fullKey(key));
-        return value !== null ? { key, value, shared: false } : null;
-      } catch {
-        return null;
-      }
-    },
-    async set(key, value) {
-      try {
-        localStorage.setItem(fullKey(key), value);
-        return { key, value, shared: false };
-      } catch {
-        return null;
-      }
-    },
-    async delete(key) {
-      try {
-        const existed = localStorage.getItem(fullKey(key)) !== null;
-        localStorage.removeItem(fullKey(key));
-        return { key, deleted: existed, shared: false };
-      } catch {
-        return null;
-      }
-    },
-    async list(prefix = "") {
-      try {
-        const keys = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          if (k && k.startsWith(PREFIX + prefix)) keys.push(k.slice(PREFIX.length));
-        }
-        return { keys, prefix, shared: false };
-      } catch {
-        return null;
-      }
-    },
-  };
+const TOOLS = [
+  { key: "import", label: "Orion Import Builder", component: OrionImportBuilder },
+  { key: "audit", label: "Model Audit Tool", component: ModelAuditTool },
+];
+
+export default function App() {
+  const [active, setActive] = useState("import");
+  const ActiveTool = TOOLS.find(t => t.key === active)?.component;
+
+  return (
+    <div>
+      <nav
+        style={{
+          display: "flex",
+          gap: 4,
+          padding: "10px 16px",
+          background: "#0f172a",
+          borderBottom: "1px solid #1e293b",
+          position: "sticky",
+          top: 0,
+          zIndex: 100,
+        }}
+      >
+        {TOOLS.map(t => (
+          <button
+            key={t.key}
+            onClick={() => setActive(t.key)}
+            style={{
+              padding: "6px 14px",
+              borderRadius: 6,
+              border: "none",
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: "pointer",
+              background: active === t.key ? "#3b82f6" : "transparent",
+              color: active === t.key ? "#fff" : "#94a3b8",
+              transition: "all 0.15s",
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
+      <Suspense fallback={<div style={{ padding: 40, textAlign: "center", color: "#94a3b8" }}>Loading…</div>}>
+        <ActiveTool />
+      </Suspense>
+    </div>
+  );
 }
