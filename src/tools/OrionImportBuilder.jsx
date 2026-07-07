@@ -1,1717 +1,1646 @@
-// Model Audit Tool v2.1 — dynamic P6 row detection
-import { useState, useCallback, useMemo, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import * as XLSX from "xlsx";
 
-// ── Master model list (from Orion) ────────────────────────────────────────────
-// Populated at runtime from the uploaded master file
-// ── Status config ─────────────────────────────────────────────────────────────
-const STATUS = {
-  OVER:           { label: "Overweight",      color: "#dc2626", bg: "#fef2f2", dot: "#dc2626" },
-  UNDER:          { label: "Underweight",     color: "#d97706", bg: "#fffbeb", dot: "#d97706" },
-  MATCH:          { label: "On Target",       color: "#16a34a", bg: "#f0fdf4", dot: "#16a34a" },
-  MISSING_MASTER: { label: "Not in Master",   color: "#7c3aed", bg: "#f5f3ff", dot: "#7c3aed" },
-  MISSING_TARGET: { label: "No Target Entry", color: "#64748b", bg: "#f8fafc", dot: "#64748b" },
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const TEMPLATE_COLS = [
+  "Model ID","* Model Name","Model Description","* Security Set ID",
+  "* Security Set SubModel Name","* Security Set Target %","Security Set Band/Range",
+  "Security Set Upper %","Security Set Lower %","* Dynamic","Management Style",
+  "Sleeve Suffix","Team ID","* Name Space","Tags",
+  "Category SubModel Name","Category Asset Class Type","Category Team ID","Category Namespace",
+  "Category Target %","Category Band/Range","Category Upper %","Category Lower %",
+  "Class SubModel Name","Class Asset Class Type","Class Team ID","Class Namespace",
+  "Class Target %","Class Band/Range","Class Upper %","Class Lower %",
+  "Subclass SubModel Name","Subclass Asset Class Type","Subclass Team ID","Subclass Namespace",
+  "Subclass Target %","Subclass Band/Range","Subclass Upper %","Subclass Lower %"
+];
+
+const COL_ALIASES = {
+  "model id":"Model ID","* model name":"* Model Name","model name":"* Model Name",
+  "model description":"Model Description","* security set id":"* Security Set ID",
+  "security set id":"* Security Set ID","* security set submodel name":"* Security Set SubModel Name",
+  "security set submodel name":"* Security Set SubModel Name",
+  "* security set target %":"* Security Set Target %","security set target %":"* Security Set Target %",
+  "security set band/range":"Security Set Band/Range","security set upper %":"Security Set Upper %",
+  "security set lower %":"Security Set Lower %","* dynamic":"* Dynamic","dynamic":"* Dynamic",
+  "management style":"Management Style","sleeve suffix":"Sleeve Suffix","team id":"Team ID",
+  "* name space":"* Name Space","name space":"* Name Space","namespace":"* Name Space","tags":"Tags",
+  "category submodel name":"Category SubModel Name","category asset class type":"Category Asset Class Type",
+  "category team id":"Category Team ID","category namespace":"Category Namespace",
+  "category target %":"Category Target %","category band/range":"Category Band/Range",
+  "category upper %":"Category Upper %","category lower %":"Category Lower %",
+  "class submodel name":"Class SubModel Name","class asset class type":"Class Asset Class Type",
+  "class team id":"Class Team ID","class namespace":"Class Namespace",
+  "class target %":"Class Target %","class band/range":"Class Band/Range",
+  "class upper %":"Class Upper %","class lower %":"Class Lower %",
+  "subclass submodel name":"Subclass SubModel Name","subclass asset class type":"Subclass Asset Class Type",
+  "subclass team id":"Subclass Team ID","subclass namespace":"Subclass Namespace",
+  "subclass target %":"Subclass Target %","subclass band/range":"Subclass Band/Range",
+  "subclass upper %":"Subclass Upper %","subclass lower %":"Subclass Lower %",
 };
-const DEFAULT_THRESHOLD = 0.05;
 
-// ── Ticker validation ─────────────────────────────────────────────────────────
-// Real tickers: 1–5 chars, letters/digits/dot/hyphen only, no spaces
-// Cash tickers (CASH-USD, CUSTODIAL_CASH etc.) are exempted from length limits
-const TICKER_RE = /^[A-Z0-9][A-Z0-9.\-]{0,4}$/;
+// Node type colors matching Orion's teal/blue/green/yellow palette
+const NODE_COLORS = {
+  root:     { fill:"#0dd3c5", stroke:"#0aa89c", text:"#003d3a" },
+  category: { fill:"#1a6fb5", stroke:"#145490", text:"#e0f0ff" },
+  class:    { fill:"#c8b400", stroke:"#a09000", text:"#2d2600" },
+  ss:       { fill:"#1a56db", stroke:"#1240a8", text:"#e8f0fe" },
+};
 
-// Explicit segment/label words that pass the char-length check but are NOT tickers
-const SEGMENT_BLOCKLIST = new Set([
-  "EQUITY","EQUITIES","FIXED","INCOME","BOND","BONDS","CASH","ALTERNATIVE",
-  "ALTERNATIVES","COMMODITY","COMMODITIES","CRYPTO","SECTOR","NUCLEAR",
-  "TICKER","SYMBOL","DOMESTIC","INTERNATIONAL","ALLOCATION","TOTAL",
-  "EMERGING","MARKETS","GROWTH","VALUE","BLEND","CORE","SHOTS","THEMES",
-]);
+// ── Parsing ──────────────────────────────────────────────────────────────────
 
-// Normalize cash tickers — catches CASH-USD, CUSTODIAL_CASH, money market tickers etc.
-const CASH_TICKER_VARIANTS = /^(CASH[-_]?.*|CUSTODIAL.?CASH|SGOV|MMKT|FDRXX|SPAXX|FDLXX|SWVXX|VMFXX)$/i;
-function isCashTicker(s) {
-  return CASH_TICKER_VARIANTS.test(s.trim());
-}
+function normalizeKey(k) { return (k||"").toString().trim().toLowerCase(); }
 
-function isValidTicker(s) {
-  if (!s) return false;
-  const v = s.trim().toUpperCase();
-  if (v.includes(" ")) return false;              // "US LARGE CAP" etc.
-  // Cash tickers bypass all other checks — they are always valid holdings
-  if (isCashTicker(v)) return true;
-  if (SEGMENT_BLOCKLIST.has(v)) return false;
-  if (!TICKER_RE.test(v)) return false;           // max 5 chars, valid chars only
-  return true;
-}
-
-// ── Asset-class section keywords ──────────────────────────────────────────────
-const AC_KEYWORDS = ["equity","equities","fixed income","bond","bonds","alternative","alternatives","cash","real estate","commodity","commodities","crypto","cryptocurrency","international","domestic","us equities","us fixed income","sector","nuclear","emerging","themes","shots","inflation","defense","drones","robotics","big tech","cybersecurity"];
-
-function looksLikeAssetClass(cellVal) {
-  if (!cellVal) return false;
-  const v = String(cellVal).trim().toLowerCase();
-  // Cash tickers are never section headers
-  if (isCashTicker(cellVal)) return false;
-  // Multi-word strings with "&" or "/" are section headers (e.g. "Defense & Geopolitical Realignment")
-  if (/[&\/]/.test(v) && v.length > 5) return true;
-  return AC_KEYWORDS.some(k => v === k || v.startsWith(k) || v.endsWith(k));
-}
-
-// Normalize ticker for comparison — strips dots/hyphens (BRK.B == BRKB),
-// and maps all cash variants to a single canonical key (CASH == CUSTODIAL_CASH == CASH-USD)
-const CASH_CANONICAL = "CUSTODIAL_CASH";
-function normalizeTicker(t) {
-  const v = String(t || "").toUpperCase().replace(/[.\-]/g, "");
-  return isCashTicker(v) ? CASH_CANONICAL : v;
-}
-
-// Deduplicate positions by normalized ticker within a model — sum targets
-function dedupePositions(positions) {
-  const map = {};
-  for (const p of positions) {
-    const key = normalizeTicker(p.ticker);
-    if (map[key]) {
-      map[key].target += p.target;
-    } else {
-      map[key] = { ...p, _normKey: key };
-    }
-  }
-  return Object.values(map);
-}
-
-function toTitleCase(s) {
-  return String(s).replace(/\w\S*/g, t => t.charAt(0).toUpperCase() + t.slice(1).toLowerCase());
-}
-
-// ── Fuzzy string match (dice coefficient) ─────────────────────────────────────
-function bigrams(s) {
-  const b = new Set();
-  for (let i = 0; i < s.length - 1; i++) b.add(s.slice(i, i+2));
-  return b;
-}
-function diceScore(a, b) {
-  if (!a || !b) return 0;
-  const A = bigrams(a.toLowerCase()), B = bigrams(b.toLowerCase());
-  let inter = 0;
-  for (const bg of A) if (B.has(bg)) inter++;
-  return (2 * inter) / (A.size + B.size);
-}
-// Normalize a label for matching: strip sheet prefix, expand known abbreviations
-function normalizeForMatch(label) {
-  if (label === "__skip__") return "__skip__";
-  // P6 labels are already master-ready (emitted directly by parseP6Format)
-  if (label.toLowerCase().startsWith("advisor model - p6")) return label.toLowerCase();
-
-  const s = label.toLowerCase();
-  const dashIdx = s.indexOf(" — ");
-  const colLabel   = dashIdx >= 0 ? s.slice(dashIdx + 3) : s;
-  const sheetPart  = dashIdx >= 0 ? s.slice(0, dashIdx) : "";
-  const isTaxAware = s.includes("tax aw");
-  const taxSuffix  = isTaxAware && !colLabel.includes("tax") ? " - tax aware" : "";
-
-  // STP: "Savvy Total Portfolios (Tax Awa — Aggressive" → "stp - aggressive (tax aware)"
-  if (sheetPart.includes("savvy total portfolios")) {
-    const suffix = isTaxAware && !colLabel.includes("tax") ? " (tax aware)" : "";
-    return `stp - ${colLabel}${suffix}`;
-  }
-  // Tilt variants: "Savvy Value Tilt (Tactical) — 50/50" → "savvy tactical model 50/50 - value tilt"
-  if (sheetPart.includes("value tilt"))    return `savvy tactical model ${colLabel} - value tilt${taxSuffix}`;
-  if (sheetPart.includes("growth tilt"))   return `savvy tactical model ${colLabel} - growth tilt${taxSuffix}`;
-  if (sheetPart.includes("dividend tilt")) return `savvy tactical model ${colLabel} - dividend tilt${taxSuffix}`;
-  // Tactical: "Savvy Core (Tactical) — 50/50" → "savvy tactical model 50/50"
-  if (sheetPart.includes("tactical"))  return `savvy tactical model ${colLabel}${taxSuffix}`;
-  // Strategic: "Savvy Core (Strategic) — 50/50" → "savvy strategic model 50/50"
-  if (sheetPart.includes("strategic")) return `savvy strategic model ${colLabel}${taxSuffix}`;
-
-  // STP midpoint labels are already master-ready
-  if (label.match(/^STP - \d+\/\d+/)) return label.toLowerCase();
-  // Savvy Strategic/Tactical normalized labels — pass through directly
-  if (label.toLowerCase().startsWith("savvy strategic model")) return label.toLowerCase();
-  if (label.toLowerCase().startsWith("savvy tactical model")) return label.toLowerCase();
-
-  return colLabel;
-}
-
-function fuzzyMatch(query, candidates) {
-  const normalizedQuery = normalizeForMatch(query);
-  if (normalizedQuery === "__skip__") return null;
-  const isTaxAwareQuery  = normalizedQuery.includes("(tax aware)") || normalizedQuery.includes("- tax aware");
-  const queryIsTactical  = normalizedQuery.includes("tactical");
-  const queryIsStrategic = normalizedQuery.includes("strategic");
-
-  const normalizedNoTax = normalizedQuery
-    .replace(/\s*\(tax aware\)\s*$/i, "")
-    .replace(/\s*-\s*tax aware\s*$/i, "")
-    .trim();
-
-  // Extract ratio (e.g. "70/30") for hard filtering to prevent 0/100 ↔ 100/0 confusion
-  const ratioMatch  = normalizedQuery.match(/\b(\d+\/\d+)\b/);
-  const queryRatio  = ratioMatch ? ratioMatch[1] : null;
-
-  // Tax-aware master exists if any active tax-aware candidate scores strongly
-  const taxAwareMasterExists = isTaxAwareQuery && candidates.some(c =>
-    c.name.toLowerCase().includes("tax aware") &&
-    c.active !== false &&
-    diceScore(normalizedQuery, c.name.toLowerCase()) > 0.85
-  );
-
-  const fallback      = isTaxAwareQuery && !taxAwareMasterExists;
-  const queryToUse    = fallback ? normalizedNoTax : normalizedQuery;
-  const rawQueryToUse = fallback ? normalizedNoTax : query.toLowerCase();
-
-  // Restrict to candidates containing the exact ratio (if present)
-  const ratioCandidates = queryRatio
-    ? candidates.filter(c => c.name.toLowerCase().includes(queryRatio))
-    : candidates;
-  const pool = ratioCandidates.length > 0 ? ratioCandidates : candidates;
-
-  // Precompute best raw score across pool — O(n)
-  let bestRawScore = 0;
-  for (const c of pool) {
-    const s = Math.max(diceScore(queryToUse, c.name.toLowerCase()), diceScore(rawQueryToUse, c.name.toLowerCase()));
-    if (s > bestRawScore) bestRawScore = s;
-  }
-
-  // Precompute whether a same-type active model scores within 3% of best — O(n)
-  let hasSameTypeActiveNearBest = false;
-  for (const c of pool) {
-    if (c.active === false) continue;
-    const cName = c.name.toLowerCase();
-    if (queryIsTactical  && cName.includes("strategic")) continue;
-    if (queryIsStrategic && cName.includes("tactical"))  continue;
-    const s = Math.max(diceScore(queryToUse, cName), diceScore(rawQueryToUse, cName));
-    if (s >= bestRawScore * 0.97) { hasSameTypeActiveNearBest = true; break; }
-  }
-
-  // Score each candidate — O(n), no inner loops
-  let best = null, bestScore = 0;
-  for (const c of pool) {
-    const cName        = c.name.toLowerCase();
-    const cIsTaxAware  = cName.includes("tax aware");
-    const cIsStrategic = cName.includes("strategic");
-    const cIsTactical  = cName.includes("tactical");
-    const isActive     = c.active !== false;
-
-    let s = Math.max(diceScore(queryToUse, cName), diceScore(rawQueryToUse, cName));
-
-    // Tax parity penalty (0.749 breaks ties in favour of correct parity)
-    if (isTaxAwareQuery  && !cIsTaxAware)  s *= 0.749;
-    if (!isTaxAwareQuery && cIsTaxAware)   s *= 0.749;
-
-    // Tactical/strategic type mismatch penalty
-    if (queryIsTactical  && cIsStrategic)  s *= 0.5;
-    if (queryIsStrategic && cIsTactical)   s *= 0.5;
-
-    // Inactive penalty — only when a same-type active model is close enough
-    if (!isActive && hasSameTypeActiveNearBest) s *= 0.4;
-
-    if (s > bestScore) { bestScore = s; best = c; }
-  }
-  return bestScore > 0.2 ? { match: best, score: bestScore } : null;
-}
-
-// ── File reading ──────────────────────────────────────────────────────────────
-function readXLSX(buffer) {
-  const wb = XLSX.read(buffer, { type: "array" });
-  return wb;
-}
-
-function readFileBuffer(file) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onerror = rej;
-    r.onload = e => res(e.target.result);
-    r.readAsArrayBuffer(file);
-  });
-}
-
-// ── Parse master file ─────────────────────────────────────────────────────────
-function parseMasterFile(wb) {
+function parseWorkbookRows(buffer) {
+  const wb = XLSX.read(buffer, { type:"array" });
   const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
-  if (!rows.length) return { models: [], holdings: [] };
-
-  const keys = Object.keys(rows[0]);
-  const findCol = (...cs) => keys.find(k => cs.some(c => k.toLowerCase().includes(c.toLowerCase())));
-  const tickerCol    = findCol("ticker","symbol");
-  const nameCol      = findCol("product name","name","security");
-  const targetCol    = findCol("target percent","target");
-  const actualCol    = findCol("actual percent","actual");
-  const modelNameCol = findCol("model aggregation name","model name");
-  const modelIdCol   = findCol("model aggregation id","model id","eclipse");
-
-  const modelsMap = {};
-  const modelActuals = {};
-  const holdings = [];
-  for (const r of rows) {
-    const ticker = String(r[tickerCol] || "").trim().toUpperCase();
-    if (!ticker) continue;
-    const modelId   = parseInt(r[modelIdCol]) || null;
-    const modelName = String(r[modelNameCol] || "").trim();
-    if (modelId && modelName && !modelsMap[modelId]) modelsMap[modelId] = modelName;
-    if (modelId) modelActuals[modelId] = (modelActuals[modelId] || 0) + (parseFloat(r[actualCol]) || 0);
-    // Use short keys to keep storage footprint small
-    holdings.push({
-      t:   ticker,
-      n:   String(r[nameCol] || "").trim().slice(0, 40),
-      p:   parseFloat(r[targetCol]) || 0,
-      mid: modelId,
-    });
+  const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
+  let headerIdx = -1;
+  for (let i = 0; i < Math.min(raw.length, 15); i++) {
+    const norm = (raw[i]||[]).map(c => normalizeKey(c));
+    if (norm.includes("model id")||norm.includes("* model name")||norm.includes("model name")) { headerIdx=i; break; }
   }
-
-  const models = Object.entries(modelsMap).map(([id, name]) => ({
-    id: parseInt(id),
-    name,
-    active: (modelActuals[parseInt(id)] || 0) > 0,
-  }));
-  return { models, holdings };
-}
-
-// Expand slim holdings back to full format for audit use
-function expandHoldings(holdings, modelsMap) {
-  return holdings.map(h => ({
-    ticker:    h.t,
-    name:      h.n,
-    target:    h.p,
-    modelId:   h.mid,
-    modelName: modelsMap[h.mid] || "",
-  }));
-}
-
-// ── Scale detection: are values already % (sum≈100) or decimal (sum≈1)? ──────
-function detectScale(nums) {
-  const sum = nums.reduce((s, n) => s + n, 0);
-  if (sum < 5) return "decimal";   // sum near 1 → decimals, multiply by 100
-  return "percent";                 // sum near 100 → already percent, use as-is
-}
-function applyScale(num, scale) {
-  return scale === "decimal" ? num * 100 : num;
-}
-
-// ── Paragon "security set" format parser ─────────────────────────────────────
-// Models sheet: row 1 = header (col A = model name, cols B+ = set names)
-//               rows 2+ = model rows with set allocation weights (decimals)
-// Remaining sheets: each is a security set with ticker + weight
-//
-// Effective ticker target in a model = sum over sets of (set_weight × ticker_weight × 100)
-
-function isParagonFormat(wb) {
-  // Heuristic: has a sheet called "Models" whose first row has non-numeric string headers in cols B+
-  if (!wb.SheetNames.includes("Models")) return false;
-  const ws = wb.Sheets["Models"];
-  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
-  if (!raw.length) return false;
-  const header = raw[0];
-  // Col A should be a label column, cols B+ should be security set names (strings)
-  return header.length > 1 && typeof header[1] === "string" && header[1].length > 3;
-}
-
-function parseParagonFormat(wb) {
-  const results = [];
-
-  // ── 1. Parse Models sheet ──────────────────────────────────────────────────
-  const modelsWs = wb.Sheets["Models"];
-  const modelsRaw = XLSX.utils.sheet_to_json(modelsWs, { header: 1, defval: null });
-  const header = modelsRaw[0]; // ["Paragon Asset Allocation Models", "Set A", "Set B", ...]
-  // Map col index → set name (col 0 is model name label)
-  const setColMap = {}; // colIdx → setName
-  for (let ci = 1; ci < header.length; ci++) {
-    if (header[ci]) setColMap[ci] = String(header[ci]).trim();
-  }
-
-  // Each model row: col 0 = model name, cols 1+ = set weight (decimal or null)
-  const modelRows = []; // [{ name, sets: { setName: weight } }]
-  for (let ri = 1; ri < modelsRaw.length; ri++) {
-    const row = modelsRaw[ri];
-    if (!row || !row[0]) continue;
-    const modelName = String(row[0]).trim();
-    const sets = {};
-    for (const [ci, setName] of Object.entries(setColMap)) {
-      const w = parseFloat(row[ci]);
-      if (!isNaN(w) && w > 0) sets[setName] = w;
-    }
-    if (Object.keys(sets).length > 0) modelRows.push({ name: modelName, sets });
-  }
-
-  // ── 2. Parse each security set sheet ──────────────────────────────────────
-  const setHoldings = {}; // setName → [{ ticker, name, weight (0-100) }]
-
-  for (const sheetName of wb.SheetNames) {
-    if (sheetName === "Models") continue;
-    const ws = wb.Sheets[sheetName];
-    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
-    if (!raw.length) continue;
-
-    const holdings = [];
-    for (const row of raw) {
-      if (!row) continue;
-      const c0 = String(row[0] || "").trim();
-      const c1 = String(row[1] || "").trim();
-      const c2 = row[2] != null ? parseFloat(row[2]) : NaN;
-      const c1num = parseFloat(c1);
-      let ticker = null, name = null, rawWeight = null;
-
-      if (!isNaN(c2) && c2 > 0 && isNaN(c1num) && c1.length >= 2 && c1.length <= 5) {
-        // Format B: name | ticker | weight
-        name = c0; ticker = c1.toUpperCase(); rawWeight = c2;
-      } else if (!isNaN(c1num) && c1num > 0 && c0.length >= 1 && c0.length <= 7) {
-        // Format A: ticker | weight
-        ticker = c0.toUpperCase(); rawWeight = c1num;
-      } else { continue; }
-
-      if (!ticker) continue;
-      ticker = ticker.replace(/\//g, ".");
-      holdings.push({ ticker, name: name || "", rawWeight });
-    }
-
-    // Detect scale from all raw weights in this sheet
-    const allWeights = holdings.map(h => h.rawWeight).filter(w => w > 0);
-    const scale = detectScale(allWeights);
-    const parsed = holdings.map(h => ({
-      ticker: h.ticker,
-      name: h.name,
-      target: applyScale(h.rawWeight, scale),
-    }));
-
-    // Normalise so weights sum to 100
-    const total = parsed.reduce((s, h) => s + h.target, 0);
-    const factor = total > 0 ? 100 / total : 1;
-    for (const h of parsed) h.target *= factor;
-    setHoldings[sheetName] = parsed;
-  }
-
-  // ── 3. Blend sets into effective model positions ───────────────────────────
-  for (const { name: modelName, sets } of modelRows) {
-    const blended = {}; // normTicker → { ticker, name, target }
-
-    for (const [setName, setWeight] of Object.entries(sets)) {
-      const holdings = setHoldings[setName];
-      if (!holdings) continue;
-      for (const h of holdings) {
-        const key = normalizeTicker(h.ticker);
-        const contrib = setWeight * h.target; // set_weight(decimal) × ticker%(0-100) → effective %
-        if (blended[key]) {
-          blended[key].target += contrib;
-        } else {
-          blended[key] = { ticker: h.ticker, name: h.name, target: contrib, assetClass: "Equity" };
-        }
-      }
-    }
-
-    const positions = dedupePositions(Object.values(blended));
-    if (!positions.length) continue;
-
-    results.push({
-      modelKey:   `paragon__${modelName}`,
-      modelLabel: modelName,
-      sheetName:  "Models",
-      colLabel:   null,
-      positions,
-    });
-  }
-
-  return results;
-}
-
-// ── P6 "sleeve model" format parser ──────────────────────────────────────────
-// Each sheet = a model family. Row 10 has "Models: X". Row 13 has Asset Class/Security/Symbol.
-// Ticker in col D, model weights (decimals) in cols G/H/I and right-side cols.
-// Labels are emitted ready for fuzzy matching against master — no normalizeForMatch needed.
-
-function isP6Format(wb) {
-  // Structural signature: scan for "Models:" row and "Asset Class"+"Symbol" row
-  for (const sn of wb.SheetNames) {
-    const ws  = wb.Sheets[sn];
-    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
-    if (raw.length < 10) continue;
-    const hasModelsRow  = raw.slice(0, 15).some(r => (r||[]).some(c => String(c||"").includes("Models:")));
-    const hasAssetClass = raw.slice(0, 20).some(r => (r||[]).some(c => String(c||"") === "Asset Class") && (r||[]).some(c => String(c||"") === "Symbol"));
-    if (hasModelsRow && hasAssetClass) return true;
-  }
-  return false;
-}
-
-// Build the master-model label for a P6 sheet+column combination.
-// familyName comes from "Models:  Core+" → "Core+"
-// sheetName is the tab name (e.g. "TaxEfficient", "ESG")
-// colHeader is the column header (e.g. "Moderate", "#1", "Aggressive")
-function p6MasterLabel(sheetName, colHeader) {
-  const sheet = sheetName.toLowerCase().replace(/\s+/g,"");
-  const col   = (colHeader || "").trim();
-  const cl    = col.toLowerCase();
-
-  // Skip columns that don't correspond to master models
-  if (["tactical","strategic model","strategic","tactical model"].includes(cl)) return "__skip__";
-
-  // Risk level mapping (#1/#2/#3 → Moderate/Mod Agg/Aggressive)
-  const riskMap = { "#1":"Moderate", "#2":"Mod Agg", "#3":"Aggressive" };
-  const risk = riskMap[col] || col;
-
-  // Sheet → master name segment
-  if (sheet === "taxefficient" || sheet.includes("taxeff")) {
-    return `Advisor Model - P6 - TAX EFF ${risk}`;
-  }
-  if (sheet === "esg") {
-    return `Advisor Model - P6 - ESG ${risk}`;
-  }
-  if (sheet === "top20" || sheet === "top 20" || sheetName.toLowerCase().includes("top 20")) {
-    return `Advisor Model - P6 ${risk} - LC Stock Sub`;
-  }
-  // Core+ and any other sheet → base P6 model
-  return `Advisor Model - P6 ${risk}`;
-}
-
-function parseP6Format(wb) {
-  const results = [];
-
-  for (const sheetName of wb.SheetNames) {
-    const ws  = wb.Sheets[sheetName];
-    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
-    if (!raw.length) continue;
-
-    // ── Locate key rows dynamically (row offsets vary per sheet) ─────────────
-    // Find "Models:" row
-    let modelsRowIdx = -1;
-    for (let ri = 0; ri < Math.min(raw.length, 15); ri++) {
-      if ((raw[ri]||[]).some(c => String(c||"").includes("Models:"))) { modelsRowIdx = ri; break; }
-    }
-    if (modelsRowIdx < 0) continue;
-
-    // Find "Asset Class"/"Symbol" header row (the main table header)
-    let headerRowIdx = -1;
-    for (let ri = modelsRowIdx; ri < Math.min(raw.length, modelsRowIdx + 8); ri++) {
-      const row = raw[ri] || [];
-      if (row.some(c => String(c||"") === "Asset Class") && row.some(c => String(c||"") === "Symbol")) {
-        headerRowIdx = ri; break;
-      }
-    }
-    if (headerRowIdx < 0) continue;
-
-    // Sleeve weights are 3 rows before the "Models:" row (rows 7-9 = modelsRowIdx - 3 to -1)
-    // Actually they're at fixed offsets relative to modelsRowIdx
-    // Scan for rows with "Bond (Adjusted)"/"Stock (Adjusted)"/"Over/Under" in col C (index 2)
-    const sleeveWeights = {};
-    for (let ri = 0; ri < modelsRowIdx + 5; ri++) {
-      const row = raw[ri] || [];
-      const label = String(row[2] || "").trim();
-      if (["Bond (Adjusted)", "Stock (Adjusted)", "Over/Under"].includes(label)) {
-        sleeveWeights[label] = [
-          parseFloat(row[6]) || 0,
-          parseFloat(row[7]) || 0,
-          parseFloat(row[8]) || 0,
-        ];
-      }
-    }
-
-    // Model column headers: scan first 4 rows for the staggered model name labels
-    // They appear in cols 5-11 in the top rows of the sheet
-    const modelColDefs = [];
-    const leftCIs = [];
-    const labelFound = {}; // ci → label (take first non-null found scanning top rows)
-    for (let ri = 0; ri < Math.min(raw.length, 5); ri++) {
-      const row = raw[ri] || [];
-      for (let ci = 5; ci < 12; ci++) {
-        const v = row[ci];
-        if (v && typeof v === "string" && !v.includes("Model Date") && !labelFound[ci]) {
-          labelFound[ci] = v;
-        }
-      }
-    }
-    for (let ci = 5; ci < 12; ci++) {
-      const label = labelFound[ci];
-      if (label) {
-        const master = p6MasterLabel(sheetName, label);
-        if (master !== "__skip__") {
-          modelColDefs.push({ ci, weightIdx: leftCIs.length, master });
-          leftCIs.push(ci);
-        }
-      }
-    }
-    if (!modelColDefs.length) continue;
-
-    const dataStartRow = headerRowIdx + 1; // row after the header
-
-    // ── 3. Parse security sets ────────────────────────────────────────────────
-    // Find import section (after data rows, look for "IMPORT FILE" or "Model Name")
-    let importStart = -1;
-    for (let ri = dataStartRow + 10; ri < raw.length; ri++) {
-      const row = raw[ri];
-      if (row && (String(row[1]||"").includes("IMPORT FILE") || String(row[1]||"") === "Model Name")) {
-        importStart = ri; break;
-      }
-    }
-    while (importStart >= 0 && importStart < raw.length) {
-      const r = raw[importStart];
-      if (r && (String(r[1]||"") === "Model Name" || String(r[1]||"").includes("IMPORT FILE"))) { importStart++; continue; }
-      break;
-    }
-
-    const sets = {}; // setName → [{ticker, weight}]
-    let currentSet = null;
-
-    if (importStart >= 0) {
-      // Named import section
-      for (let ri = importStart; ri < raw.length; ri++) {
-        const row = raw[ri];
-        if (!row) continue;
-        const colB = String(row[1] || "").trim();
-        const colD = String(row[3] || "").trim().toUpperCase();
-        const colE = parseFloat(row[4]);
-
-        const isMetaRow = !colB || colB.length <= 1 || colB.startsWith("To Do") ||
-          /^[123][).]/.test(colB) || /^\d+$/.test(colB) ||
-          ["IMPORT FILE","Model Name","VLOOK Column"].includes(colB);
-
-        if (!isMetaRow && colB) {
-          currentSet = colB;
-          if (!sets[currentSet]) sets[currentSet] = [];
-        }
-        if (currentSet && colD && !isNaN(colE) && colE > 0) {
-          sets[currentSet].push({ ticker: colD, weight: colE });
-        }
-      }
-
-      // ESG fallback: no set names in col B — tickers listed directly
-      if (Object.keys(sets).length === 0) {
-        const sleeveNames = ["Fixed Income", "Equity", "O/U"];
-        let group = [], sleeveIdx = 0;
-        for (let ri = importStart; ri < raw.length; ri++) {
-          const row = raw[ri];
-          if (!row) continue;
-          const colD = String(row[3] || "").trim().toUpperCase();
-          const colE = parseFloat(row[4]);
-          if (colD && !isNaN(colE) && colE > 0) {
-            group.push({ ticker: colD, weight: colE });
-          } else if (group.length) {
-            const total = group.reduce((s, h) => s + h.weight, 0);
-            if (total >= 0.9) {
-              sets[`${sheetName} ${sleeveNames[sleeveIdx] || "Set"}`] = group;
-              group = []; sleeveIdx++;
-            }
-          }
-        }
-        if (group.length) sets[`${sheetName} ${sleeveNames[sleeveIdx] || "Set"}`] = group;
-      }
-    }
-
-    // No import section — build sets from the main table rows 14-38
-    // Col B = sleeve/set name, col D = ticker, col E = weight
-    // Top 20 Sleeve is expanded using the sub-table (rows 41+) col E values
-    if (Object.keys(sets).length === 0) {
-      results.push({ modelKey: "debug__" + sheetName, modelLabel: "DEBUG " + sheetName + ": reached fallback, importStart=" + importStart, sheetName, colLabel: null, positions: [{ticker:"X",name:"debug",target:1,assetClass:"debug"}] });
-      // Find and parse the Top 20 sub-table first
-      let t20SubHoldings = []; // [{ticker, weight}] using col E (% of sleeve)
-      let t20Start = -1, t20End = -1;
-      for (let ri = 0; ri < raw.length; ri++) {
-        const row = raw[ri];
-        if (!row) continue;
-        if (String(row[3]||"").trim() === "% of Top 20") t20Start = ri + 1;
-        if (t20Start > 0 && ri > t20Start && (row[3] === 1 || String(row[3]||"").trim() === "1")) {
-          t20End = ri; break;
-        }
-      }
-      if (t20Start > 0) {
-        const end = t20End > 0 ? t20End : raw.length;
-        for (let ri = t20Start; ri < end; ri++) {
-          const row = raw[ri];
-          if (!row) continue;
-          const ticker = String(row[2]||"").trim().toUpperCase();
-          const weight = parseFloat(row[4]); // col E = % of sleeve
-          if (ticker && !isNaN(weight) && weight > 0) t20SubHoldings.push({ ticker, weight });
-        }
-      }
-
-      // Parse main table rows from dataStartRow to (t20Start-2) as security sets
-      const SLEEVE_NAMES = ["bond","stock","tactical","over/under"];
-      const endRow = t20Start > 0 ? t20Start - 2 : raw.length;
-      let mainSet = null;
-      for (let ri = dataStartRow; ri < endRow; ri++) {
-        const row = raw[ri];
-        if (!row) continue;
-        const colB = String(row[1] || "").trim();
-        const colD = String(row[3] || "").trim().toUpperCase();
-        const colE = parseFloat(row[4]);
-
-        if (colB && !colD && SLEEVE_NAMES.some(kw => colB.toLowerCase() === kw)) {
-          mainSet = colB;
-          if (!sets[mainSet]) sets[mainSet] = [];
-          continue;
-        }
-        if (!colD) continue;
-
-        if (colD === "TOP 20 SLEEVE") {
-          // Inline-expand with sub-table holdings
-          if (mainSet) {
-            for (const h of t20SubHoldings) {
-              sets[mainSet].push({ ticker: h.ticker, weight: h.weight });
-            }
-          }
-          continue;
-        }
-
-        if (mainSet && !isNaN(colE) && colE > 0) {
-          sets[mainSet].push({ ticker: colD, weight: colE });
-        }
-      }
-    }
-
-    // ── 4. Map sleeve labels to set names ──────────────────────────────────────
-    function findSet(sleeveLabel) {
-      const sl = sleeveLabel.toLowerCase();
-      const isBond  = sl.includes("bond");
-      const isStock = sl.includes("stock");
-      const isOU    = sl.includes("over") || sl.includes("under");
-      for (const name of Object.keys(sets)) {
-        const nl = name.toLowerCase();
-        if (isBond  && (nl.includes("fixed") || nl.includes("bond") || nl.includes("income"))) return name;
-        if (isStock && (nl.includes("equity") || nl.includes("stock"))) return name;
-        if (isOU    && (nl.includes("o/u") || nl.includes("over") || nl.includes("under"))) return name;
-      }
-      return null;
-    }
-
-    // ── 5. Blend sleeves × sets into model positions ──────────────────────────
-    for (const { ci, weightIdx, master } of modelColDefs) {
-      const blended = {};
-
-      for (const [sleeveLabel, weights] of Object.entries(sleeveWeights)) {
-        const w = weights[weightIdx] || 0;
-        if (w === 0) continue;
-
-        const isStockSleeve = sleeveLabel.toLowerCase().includes("stock");
-        const setName = findSet(sleeveLabel);
-        let holdings = setName ? sets[setName] : null;
-        if (!holdings || !holdings.length) continue;
-
-        // Normalise set to sum=1
-        const total = holdings.reduce((s, h) => s + h.weight, 0);
-        const factor = total > 0 ? 1 / total : 1;
-
-        const sl = sleeveLabel.toLowerCase();
-        const ac = sl.includes("bond") ? "Fixed Income" : "Equity";
-
-        for (const h of holdings) {
-          const key = normalizeTicker(h.ticker);
-          const contrib = w * h.weight * factor * 100;
-          if (blended[key]) blended[key].target += contrib;
-          else blended[key] = { ticker: h.ticker, name: "", target: contrib, assetClass: ac };
-        }
-      }
-
-      const positions = dedupePositions(Object.values(blended));
-      const tot = positions.reduce((s,p)=>s+p.target,0).toFixed(1);
-      if (!positions.length) continue;
-      results.push({ modelKey: "p6__" + master, modelLabel: master, sheetName, colLabel: null, positions });
-    }
-  }
-  return results;
-}
-
-// ── Parse target file: returns array of { modelKey, modelLabel, positions[] } ─
-// Each position: { ticker, name, target (%), assetClass }
-function parseTargetFile(wb, masterModels = []) {
-  // Build set of master model names for existence filtering
-  const masterNameSet = new Set(masterModels.map(m => m.name.toLowerCase()));
-  // Fast-path: Paragon security-set format
-  if (isParagonFormat(wb)) return parseParagonFormat(wb);
-  // Fast-path: P6 sleeve model format
-  if (isP6Format(wb)) return parseP6Format(wb);
-  const results = [];
-
-  for (const sheetName of wb.SheetNames) {
-    const ws = wb.Sheets[sheetName];
-    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
-    if (!raw.length) continue;
-
-    // Find header row: look for "Ticker" or "Symbol" in col 0 or 1
-    let headerRowIdx = -1;
-    for (let i = 0; i < Math.min(raw.length, 8); i++) {
-      const row = raw[i];
-      const flat = row.map(c => String(c || "").trim().toLowerCase());
-      if (flat.some(v => v === "ticker" || v === "symbol")) { headerRowIdx = i; break; }
-    }
-
-    // Detect ticker column
-    let tickerColIdx = 0, nameColIdx = 1;
-    if (headerRowIdx >= 0) {
-      raw[headerRowIdx].forEach((h, idx) => {
-        const v = String(h || "").trim().toLowerCase();
-        if (v === "ticker" || v === "symbol") tickerColIdx = idx;
-        if (v.includes("name") || v.includes("fund")) nameColIdx = idx;
-      });
-    }
-
-    // Detect model columns: all numeric-header columns after the name col
-    const modelCols = []; // { colIdx, label }
-    if (headerRowIdx >= 0) {
-      const headerRow = raw[headerRowIdx];
-      for (let ci = nameColIdx + 1; ci < headerRow.length; ci++) {
-        const h = headerRow[ci];
-        if (h !== null && h !== undefined && String(h).trim() !== "") {
-          modelCols.push({ colIdx: ci, label: String(h).trim() });
-        }
-      }
-    }
-
-    const dataStartRow = headerRowIdx >= 0 ? headerRowIdx + 1 : 0;
-
-    // Primary rule: col B populated = holding row, col B empty = section header row
-    // This is reliable across all sheet formats in this file.
-    function isHoldingRow(row) {
-      const nameVal = nameColIdx >= 0 ? row[nameColIdx] : null;
-      return nameVal !== null && nameVal !== undefined && String(nameVal).trim() !== "";
-    }
-
-    // Helper: collect only holding rows for scale detection
-    function collectHoldingRows(colIdx) {
-      const nums = [];
-      for (let ri = dataStartRow; ri < raw.length; ri++) {
-        const row = raw[ri];
-        if (!row) continue;
-        if (!isHoldingRow(row)) continue;
-        const num = parseFloat(row[colIdx]);
-        if (!isNaN(num) && num > 0) nums.push(num);
-      }
-      return nums;
-    }
-
-    if (modelCols.length > 1) {
-      // Multi-model sheet — detect scale per column from holding rows only
-      const scaleByCol = {};
-      for (const mc of modelCols) {
-        scaleByCol[mc.colIdx] = detectScale(collectHoldingRows(mc.colIdx));
-      }
-
-      const posMap = {};
-      for (const mc of modelCols) posMap[mc.colIdx] = [];
-
-      let currentAC = "Equity";
-      let currentSubSection = "";
-      // Sub-section keywords for STP variant derivation
-      const SUB_SECTION_HEADERS = ["us large cap","us small cap","intl developed","emerging markets",
-        "u.s. investment grade","international bonds","high yield corporate","high yield municipal",
-        "u.s. investment grade municipal","alternative","commodities","cash equivalents","fixed income"];
-
-      for (let ri = dataStartRow; ri < raw.length; ri++) {
-        const row = raw[ri];
-        if (!row || row.every(c => c === null || c === undefined || String(c).trim() === "")) continue;
-        const cellA = row[tickerColIdx];
-        const cellB = nameColIdx >= 0 ? row[nameColIdx] : null;
-        const colAStr = String(cellA || "").trim();
-
-        if (!isHoldingRow(row)) {
-          // Section header — update asset class and sub-section context
-          if (colAStr) {
-            currentAC = toTitleCase(colAStr);
-            const lower = colAStr.toLowerCase();
-            if (SUB_SECTION_HEADERS.some(k => lower.includes(k) || k.includes(lower))) {
-              currentSubSection = lower;
-            }
-          }
-          continue;
-        }
-
-        const ticker = colAStr.toUpperCase();
-        if (!ticker) continue;
-        const secName = String(cellB || "").trim();
-
-        for (const mc of modelCols) {
-          const rawVal = row[mc.colIdx];
-          if (rawVal === null || rawVal === undefined) continue;
-          const num = parseFloat(rawVal);
-          if (isNaN(num) || num === 0) continue;
-          const pct = applyScale(num, scaleByCol[mc.colIdx]);
-          const assetClass = isCashTicker(ticker) ? "Cash" : currentAC;
-          posMap[mc.colIdx].push({ ticker, name: secName, target: pct, assetClass, subSection: currentSubSection });
-        }
-      }
-
-      for (const mc of modelCols) {
-        const positions = dedupePositions(posMap[mc.colIdx]);
-        if (!positions.length) continue;
-        results.push({
-          modelKey: `${sheetName}__${mc.label}`,
-          modelLabel: `${sheetName} — ${mc.label}`,
-          sheetName,
-          colLabel: mc.label,
-          positions,
-        });
-      }
-    } else {
-      // Single-model sheet
-      let allocColIdx = 2;
-      if (headerRowIdx >= 0) {
-        raw[headerRowIdx].forEach((h, idx) => {
-          if (idx > nameColIdx) {
-            const v = String(h || "").toLowerCase().trim();
-            if (v.includes("alloc") || v.includes("target") || v.includes("weight") || v.includes("%") || v === "round") allocColIdx = idx;
-          }
-        });
-      }
-
-      // Detect scale from holding rows only
-      const scale = detectScale(collectHoldingRows(allocColIdx));
-
-      const positions = [];
-      let currentAC = "Equity";
-      for (let ri = dataStartRow; ri < raw.length; ri++) {
-        const row = raw[ri];
-        if (!row) continue;
-        const cellA = row[tickerColIdx];
-        const cellB = nameColIdx >= 0 ? row[nameColIdx] : null;
-        const colAStr = String(cellA || "").trim();
-        if (!colAStr) continue;
-
-        if (!isHoldingRow(row)) {
-          if (colAStr) currentAC = toTitleCase(colAStr);
-          continue;
-        }
-        const ticker = colAStr.toUpperCase();
-        if (!ticker) continue;
-        const rawVal = row[allocColIdx];
-        if (rawVal === null || rawVal === undefined) continue;
-        const num = parseFloat(rawVal);
-        if (isNaN(num) || num === 0) continue;
-        const pct = applyScale(num, scale);
-        const assetClass = isCashTicker(ticker) ? "Cash" : currentAC;
-        positions.push({ ticker, name: String(cellB || "").trim(), target: pct, assetClass });
-      }
-
-      if (positions.length) {
-        results.push({
-          modelKey: sheetName,
-          modelLabel: sheetName,
-          sheetName,
-          colLabel: null,
-          positions: dedupePositions(positions),
-        });
-      }
-    }
-  }
-
-  // ── Derive all STP variants from base models ───────────────────────────────
-  const hasSTP = results.some(r => r.modelLabel.includes("Savvy Total Portfolios"));
-  if (hasSTP) {
-
-    // Parse stock model tabs → holdings map
-    const stockModelTabs = {
-      "Core Stock Model":     "Savvy Core S&P 500 Stock Model",
-      "Growth Stock Model":   "Savvy LC Growth Stock Model",
-      "Dividend Stock Model": "Savvy Dividend Stock Model",
-      "Value Stock Model":    "Savvy Value Stock Model",
-    };
-    const stockModelHoldings = {}; // variantName → [{ticker, name, weight (normalised to sum=1)}]
-    for (const [variantName, tabName] of Object.entries(stockModelTabs)) {
-      const ws2 = wb.Sheets[tabName];
-      if (!ws2) continue;
-      const raw2 = XLSX.utils.sheet_to_json(ws2, { header: 1, defval: null });
-      const holdings = [];
-      for (let ri = 1; ri < raw2.length; ri++) {
-        const row = raw2[ri];
-        if (!row) continue;
-        // Format A: ticker(0) name(1) alloc(2)  OR  ticker in col 0, weight in col 2
-        const ticker = String(row[0] || "").trim().toUpperCase();
-        if (!ticker || ticker.length > 6) continue;
-        const weight = parseFloat(row[2]);
-        if (isNaN(weight) || weight <= 0) continue;
-        holdings.push({ ticker, name: String(row[1] || "").trim(), weight });
-      }
-      // Normalise to sum=1
-      const total = holdings.reduce((s, h) => s + h.weight, 0);
-      if (total > 0) for (const h of holdings) h.weight /= total;
-      stockModelHoldings[variantName] = holdings;
-    }
-
-    // Helper: get positions from a named result
-    function getBase(modelLabel) {
-      return results.find(r => r.modelLabel === modelLabel);
-    }
-
-    // Helper: build a derived model from a base + transformation
-    function makeVariant(label, baseLabel, transform) {
-      const base = getBase(baseLabel);
-      if (!base) return null;
-      const positions = transform(base.positions);
-      if (!positions || !positions.length) return null;
-      return { modelKey: `derived__${label}`, modelLabel: label, sheetName: "Derived", colLabel: null, positions };
-    }
-
-    // Transformation helpers
-    function reweight(positions) {
-      const total = positions.reduce((s, p) => s + p.target, 0);
-      if (total <= 0) return positions;
-      return positions.map(p => ({ ...p, target: (p.target / total) * 100 }));
-    }
-
-    function excludeSubSection(positions, ...sections) {
-      return reweight(positions.filter(p => !sections.some(s => (p.subSection || "").includes(s))));
-    }
-
-    function keepSubSections(positions, ...sections) {
-      return reweight(positions.filter(p => sections.some(s => (p.subSection || "").includes(s))));
-    }
-
-    function substituteUSLC(positions, stockVariant) {
-      const stockHoldings = stockModelHoldings[stockVariant];
-      if (!stockHoldings) return positions;
-      // Sum weight of US Large Cap positions
-      const ulcWeight = positions
-        .filter(p => (p.subSection || "").includes("us large cap"))
-        .reduce((s, p) => s + p.target, 0);
-      // Remove US Large Cap ETFs, add stock model holdings scaled to ulcWeight
-      const without = positions.filter(p => !(p.subSection || "").includes("us large cap"));
-      const stocks = stockHoldings.map(h => ({
-        ticker: h.ticker, name: h.name,
-        target: h.weight * ulcWeight,
-        assetClass: "Equity", subSection: "us large cap"
-      }));
-      return dedupePositions([...without, ...stocks]);
-    }
-
-    // Base risk level labels (regular sheet)
-    const BASE_LABELS = [
-      "All Fixed", "Conservative", "Moderately Conservative",
-      "Moderate", "Moderately Aggressive", "Aggressive", "All Equity"
-    ];
-    const STP_SHEET    = "Savvy Total Portfolios";
-    const STP_TAX_SHEET = "Savvy Total Portfolios (Tax Awa";
-
-    const derived = [];
-
-    for (const risk of BASE_LABELS) {
-      const regKey  = `${STP_SHEET} — ${risk}`;
-      const taxKey  = `${STP_TAX_SHEET} — ${risk}`;
-      const regName = `STP - ${risk}`;  // base — already in results
-      const taxName = `STP - ${risk} (Tax Aware)`;
-
-      // ex-USLC regular
-      if (!["All Fixed"].includes(risk)) {
-        derived.push(makeVariant(`STP - ${risk} (ex-USLC)`, regKey,
-          p => excludeSubSection(p, "us large cap")));
-        // ex-USLC Tax Aware
-        derived.push(makeVariant(`STP - ${risk} (ex-USLC) - Tax Aware`, taxKey,
-          p => excludeSubSection(p, "us large cap")));
-      }
-
-      // US Equity Only — small cap stays as-is, international/emerging excluded,
-      // their weight is redistributed pro-rata to US Large Cap holdings only
-      if (!["All Fixed"].includes(risk)) {
-        const usEquityOnly = p => {
-          const isUSLargeCap = pos => (pos.subSection || "").includes("us large cap");
-          const isUSSmallCap = pos => (pos.subSection || "").includes("us small cap");
-          const isIntlOrEM   = pos => {
-            const ss = pos.subSection || "";
-            return ss.includes("intl developed") || ss.includes("emerging");
-          };
-
-          // Weight being removed (intl + emerging)
-          const removedWeight = p.filter(isIntlOrEM).reduce((s, pos) => s + pos.target, 0);
-          // Current US Large Cap total weight
-          const ulcWeight = p.filter(isUSLargeCap).reduce((s, pos) => s + pos.target, 0);
-
-          const result = p
-            .filter(pos => !isIntlOrEM(pos))
-            .map(pos => {
-              if (isUSLargeCap(pos) && ulcWeight > 0) {
-                // Scale each US Large Cap holding up by (ulcWeight + removedWeight) / ulcWeight
-                return { ...pos, target: pos.target * (ulcWeight + removedWeight) / ulcWeight };
-              }
-              return pos; // small cap, FI, alts, cash — unchanged
-            });
-          return dedupePositions(result);
-        };
-        derived.push(makeVariant(`STP - ${risk} - US Equity Only`, regKey, usEquityOnly));
-        derived.push(makeVariant(`STP - ${risk} - US Equity Only (Tax Aware)`, taxKey, usEquityOnly));
-      }
-
-      // Stock model substitutions (replace US Large Cap with individual stocks)
-      for (const [variantName] of Object.entries(stockModelTabs)) {
-        const suffix = variantName; // e.g. "Core Stock Model"
-        derived.push(makeVariant(`STP - ${risk} - ${suffix}`, regKey,
-          p => substituteUSLC(p, variantName)));
-        derived.push(makeVariant(`STP - ${risk} (Tax Aware) - ${suffix}`, taxKey,
-          p => substituteUSLC(p, variantName)));
-      }
-    }
-
-    // Filter out nulls, avoid duplicates, and ONLY keep models that exist in master
-    // This prevents generating variants that have no master counterpart
-    const existingKeys = new Set(results.map(r => r.modelLabel));
-    for (const d of derived) {
-      if (d && !existingKeys.has(d.modelLabel) &&
-          (masterNameSet.size === 0 || masterNameSet.has(d.modelLabel.toLowerCase()))) {
-        results.push(d);
-        existingKeys.add(d.modelLabel);
-      }
-    }
-
-    // ── Midpoint models ────────────────────────────────────────────────────────
-    function avgPositions(leftPos, rightPos) {
-      const rightIdx = {};
-      for (const p of rightPos) rightIdx[normalizeTicker(p.ticker)] = p;
-      const blended = {};
-      for (const p of leftPos) {
-        const key = normalizeTicker(p.ticker);
-        const rt = rightIdx[key] ? rightIdx[key].target : 0;
-        blended[key] = { ...p, target: (p.target + rt) / 2 };
-      }
-      for (const p of rightPos) {
-        const key = normalizeTicker(p.ticker);
-        if (!blended[key]) blended[key] = { ...p, target: p.target / 2 };
-      }
-      return dedupePositions(Object.values(blended).filter(p => p.target > 0));
-    }
-
-    function makeMidpoint(label, leftKey, rightKey) {
-      const leftModel  = results.find(r => r.modelLabel === leftKey);
-      const rightModel = results.find(r => r.modelLabel === rightKey);
-      if (!leftModel || !rightModel) return null;
-      const positions = avgPositions(leftModel.positions, rightModel.positions);
-      return positions.length ? { modelKey: `midpoint__${label}`, modelLabel: label, sheetName: "Midpoint", colLabel: null, positions } : null;
-    }
-
-    const STP_MIDPOINTS = [
-      { label: "STP - 30/70",              left: `${STP_SHEET} — Conservative`,            right: `${STP_SHEET} — Moderately Conservative` },
-      { label: "STP - 50/50",              left: `${STP_SHEET} — Moderately Conservative`, right: `${STP_SHEET} — Moderate` },
-      { label: "STP - 70/30",              left: `${STP_SHEET} — Moderate`,                right: `${STP_SHEET} — Moderately Aggressive` },
-      { label: "STP - 10/90 (Tax Aware)",  left: `${STP_TAX_SHEET} — All Fixed`,               right: `${STP_TAX_SHEET} — Conservative` },
-      { label: "STP - 50/50 (Tax Aware)",  left: `${STP_TAX_SHEET} — Moderately Conservative`, right: `${STP_TAX_SHEET} — Moderate` },
-      { label: "STP - 70/30 (Tax Aware)",  left: `${STP_TAX_SHEET} — Moderate`,                right: `${STP_TAX_SHEET} — Moderately Aggressive` },
-    ];
-
-    for (const mp of STP_MIDPOINTS) {
-      const generated = makeMidpoint(mp.label, mp.left, mp.right);
-      if (generated && !existingKeys.has(generated.modelLabel) &&
-          (masterNameSet.size === 0 || masterNameSet.has(generated.modelLabel.toLowerCase()))) {
-        results.push(generated);
-        existingKeys.add(generated.modelLabel);
-      }
-    }
-  }
-
-  return results;
-}
-function buildInitialMappings(targetModels, masterModels) {
-  const filtered = targetModels.filter(tm => normalizeForMatch(tm.modelLabel) !== "__skip__");
-  if (!filtered.length) return [];
-
-  // Build exact-match index: normalized master name → master model
-  const exactIndex = {};
-  for (const m of masterModels) {
-    exactIndex[m.name.toLowerCase()] = m;
-  }
-
-  // If all target labels are already master-ready P6 names, restrict candidates to P6 models only
-  const allP6 = filtered.every(tm => tm.modelLabel.toLowerCase().includes("p6") ||
-    tm.modelKey.startsWith("p6__"));
-  const candidates = allP6
-    ? masterModels.filter(m => m.name.includes("P6"))
-    : masterModels;
-
-  return filtered.map(tm => {
-    const normalizedLabel = normalizeForMatch(tm.modelLabel);
-
-    // 1. Try exact match first (case-insensitive)
-    const exactMatch = exactIndex[normalizedLabel] || exactIndex[tm.modelLabel.toLowerCase()];
-    if (exactMatch) {
-      // If exact match is inactive, check if an active .e variant exists
-      const dotE = exactIndex[(exactMatch.name + ".e").toLowerCase()];
-      const preferred = (exactMatch.active === false && dotE && dotE.active !== false) ? dotE : exactMatch;
-      return {
-        targetKey: tm.modelKey,
-        targetLabel: tm.modelLabel,
-        masterModelId: preferred.id,
-        masterModelName: preferred.name,
-        confidence: 1.0,
-      };
-    }
-
-    // 2. Fall back to fuzzy match
-    const match = fuzzyMatch(tm.modelLabel, candidates);
-    return {
-      targetKey: tm.modelKey,
-      targetLabel: tm.modelLabel,
-      masterModelId: match ? match.match.id : null,
-      masterModelName: match ? match.match.name : null,
-      confidence: match ? match.score : 0,
-    };
-  });
-}
-
-// ── Audit computation ─────────────────────────────────────────────────────────
-function runAudit(mapping, targetModel, masterHoldings, excludedClasses, threshold) {
-  const masterModelId = mapping.masterModelId;
-  const masterForModel = masterHoldings.filter(h => h.modelId === masterModelId);
-
-  // Index master by normalized ticker
-  const mIdx = {};
-  for (const h of masterForModel) mIdx[normalizeTicker(h.ticker)] = h;
-
-  const included = targetModel.positions.filter(p => !excludedClasses.includes(p.assetClass));
-  const excluded = targetModel.positions.filter(p =>  excludedClasses.includes(p.assetClass));
-
-  const sumIncluded = included.reduce((s, p) => s + (p.target > 0 ? p.target : 0), 0);
-
-  // Index target by normalized ticker
-  const adjMap = {};
-  for (const p of included) {
-    const adj = sumIncluded > 0 && p.target > 0 ? (p.target / sumIncluded) * 100 : 0;
-    adjMap[normalizeTicker(p.ticker)] = { ...p, adjTarget: adj };
-  }
-
-  // Union of all normalized tickers from both sides
-  const allNormTickers = new Set([
-    ...masterForModel.map(h => normalizeTicker(h.ticker)),
-    ...included.map(p => normalizeTicker(p.ticker)),
-  ]);
-
+  if (headerIdx===-1) throw new Error("Could not find a header row with 'Model ID' or 'Model Name'.");
+  const headers = raw[headerIdx].map(c => COL_ALIASES[normalizeKey(c)] || (c?c.toString().trim():null));
   const rows = [];
-  for (const normTicker of allNormTickers) {
-    const mRow = mIdx[normTicker];
-    const tRow = adjMap[normTicker];
-    const masterTarget = mRow ? mRow.target : null;
-    const adjTarget    = tRow ? tRow.adjTarget : null;
-    const rawTarget    = tRow ? tRow.target    : null;
-    // Prefer master ticker for display (canonical), fall back to target ticker
-    const displayTicker = mRow?.ticker || tRow?.ticker || normTicker;
-    const name          = mRow?.name || tRow?.name || displayTicker;
-    const assetClass    = tRow?.assetClass || "—";
-    let status, diff = null;
-    if (masterTarget === null)    status = "MISSING_MASTER";
-    else if (adjTarget === null)  status = "MISSING_TARGET";
-    else {
-      diff = masterTarget - adjTarget;
-      status = Math.abs(diff) <= threshold ? "MATCH" : diff > 0 ? "OVER" : "UNDER";
-    }
-    rows.push({ ticker: displayTicker, name, assetClass, masterTarget, adjTarget, rawTarget, diff, status });
+  for (let i=headerIdx+1; i<raw.length; i++) {
+    const row = raw[i];
+    if (!row||row.every(c=>c===null||c==="")) continue;
+    const obj = {};
+    headers.forEach((h,idx)=>{ if(h) obj[h]=row[idx]!==undefined?row[idx]:null; });
+    if (!obj["* Model Name"]&&!obj["* Security Set SubModel Name"]) continue;
+    rows.push(obj);
   }
-  rows.sort((a, b) => {
-    const order = ["OVER","UNDER","MISSING_MASTER","MISSING_TARGET","MATCH"];
-    const d = order.indexOf(a.status) - order.indexOf(b.status);
-    return d !== 0 ? d : Math.abs(b.diff||0) - Math.abs(a.diff||0);
+  // Preserve the file's own header order (deduped, nulls dropped) so a
+  // round-tripped export doesn't drop columns the fixed template doesn't know about.
+  const orderedHeaders = [];
+  headers.forEach(h => { if (h && !orderedHeaders.includes(h)) orderedHeaders.push(h); });
+  return { headers: orderedHeaders, rows };
+}
+
+function parseExcel(buffer) {
+  return parseWorkbookRows(buffer).rows;
+}
+
+// ── Tree Builder ─────────────────────────────────────────────────────────────
+// Each node stores TWO sets of band values:
+//   own:   band/upper/lower  → written to that node's own column (Category Band/Range etc.)
+//   child: childBand/childUpper/childLower → written to the CHILD tier's band columns
+//
+// Editing "Model" → you set each Category's own target+band (category.band → Category Band/Range)
+// Editing "Category" → you set each Class's target+band (class.band → Class Band/Range)
+// Editing "Class" → you set SS tolerance (class.childBand → Security Set Band/Range)
+
+function buildTree(modelName, rows) {
+  const root = { id:"root", type:"root", label:modelName, target:100, children:[] };
+  const catMap = {};
+  const classMap = {};
+
+  rows.forEach((r, ri) => {
+    const catName   = r["Category SubModel Name"];
+    const className = r["Class SubModel Name"];
+    const ssName    = r["* Security Set SubModel Name"];
+
+    // Category — owns its Category Band/Range/Upper/Lower columns
+    let catNode = catMap[catName];
+    if (catName && !catNode) {
+      catNode = {
+        id: `cat_${catName}`, type:"category", label:catName,
+        target: parseFloat(r["Category Target %"])   || 0,
+        band:   parseFloat(r["Category Band/Range"]) || 0,
+        upper:  parseFloat(r["Category Upper %"])    || 0,
+        lower:  parseFloat(r["Category Lower %"])    || 0,
+        assetClassType: r["Category Asset Class Type"] || "",
+        children:[]
+      };
+      catMap[catName] = catNode;
+      root.children.push(catNode);
+    }
+
+    // Class — owns its Class Band/Range/Upper/Lower columns
+    // Also stores childBand/childUpper/childLower → written to Security Set Band/Range
+    const classKey = `${catName||""}__${className||""}`;
+    let classNode = classMap[classKey];
+    if (className && !classNode) {
+      classNode = {
+        id: `cls_${classKey}`, type:"class", label:className,
+        target:    parseFloat(r["Class Target %"])        || 0,
+        band:      parseFloat(r["Class Band/Range"])      || 0,
+        upper:     parseFloat(r["Class Upper %"])         || 0,
+        lower:     parseFloat(r["Class Lower %"])         || 0,
+        // child bands = what gets written to SS level
+        childBand:  parseFloat(r["Security Set Band/Range"]) || 0,
+        childUpper: parseFloat(r["Security Set Upper %"])    || 0,
+        childLower: parseFloat(r["Security Set Lower %"])    || 0,
+        children:[]
+      };
+      classMap[classKey] = classNode;
+      const parent = catNode || root;
+      parent.children.push(classNode);
+    }
+
+    // Security Set — display only, read from SS columns
+    if (ssName) {
+      const ssNode = {
+        id: `ss_${ri}_${ssName}`, type:"ss", label:ssName,
+        target: parseFloat(r["* Security Set Target %"])  || 100,
+        band:   parseFloat(r["Security Set Band/Range"])  || 0,
+        upper:  parseFloat(r["Security Set Upper %"])     || 0,
+        lower:  parseFloat(r["Security Set Lower %"])     || 0,
+        rowIndex: ri, children:[]
+      };
+      const parent = classNode || catNode || root;
+      parent.children.push(ssNode);
+    }
   });
-  const summary = {
-    total: rows.length,
-    over:    rows.filter(r => r.status==="OVER").length,
-    under:   rows.filter(r => r.status==="UNDER").length,
-    match:   rows.filter(r => r.status==="MATCH").length,
-    missing: rows.filter(r => r.status==="MISSING_MASTER"||r.status==="MISSING_TARGET").length,
-  };
-  return { rows, summary, excluded, sumIncluded };
+
+  return root;
 }
 
-// ── Drag-drop hook ────────────────────────────────────────────────────────────
-function useDrop(onFiles) {
-  const [dragging, setDragging] = useState(false);
-  const counter = useRef(0);
-  return {
-    dragging,
-    onDragEnter: e => { e.preventDefault(); counter.current++; setDragging(true); },
-    onDragLeave: e => { e.preventDefault(); if (--counter.current===0) setDragging(false); },
-    onDragOver:  e => e.preventDefault(),
-    onDrop: e => {
-      e.preventDefault(); counter.current=0; setDragging(false);
-      const files = Array.from(e.dataTransfer.files).filter(f => /\.(xlsx|xls)$/i.test(f.name));
-      if (files.length) onFiles(files);
-    },
-  };
-}
+// ── Apply tree → rows ─────────────────────────────────────────────────────────
+// category.target/band/upper/lower  → Category Target/Band/Upper/Lower %
+// class.target/band/upper/lower     → Class Target/Band/Upper/Lower %
+// class.childBand/childUpper/childLower → Security Set Band/Range/Upper/Lower %
+// ss → read-only, nothing written
 
-const STORAGE_KEY = "master_file_data";
+function applyTreeToRows(rows, tree) {
+  const updated = rows.map(r => ({...r}));
 
-// ── Main component ────────────────────────────────────────────────────────────
-export default function ModelAuditTool() {
-  const [masterData, setMasterData]     = useState(null); // { models, holdings, fileName, savedAt }
-  const [masterFromCache, setMasterFromCache] = useState(false);
-  const [targetModels, setTargetModels] = useState([]); // parsed target models
-  const [debugInfo, setDebugInfo] = useState(null);
-  const [targetFileName, setTargetFileName] = useState(null);
-  const [mappings, setMappings]         = useState([]); // { targetKey, masterModelId, ... }
-  const [loadingM, setLoadingM]         = useState(false);
-  const [loadingT, setLoadingT]         = useState(false);
-  const [storageLoading, setStorageLoading] = useState(true);
-  const [errorM, setErrorM]             = useState(null);
-  const [errorT, setErrorT]             = useState(null);
-  const [threshold, setThreshold]       = useState(DEFAULT_THRESHOLD);
-  const [excludedClasses, setExcludedClasses] = useState([]);
-  const [expanded, setExpanded]         = useState({});
-  const [filters, setFilters]           = useState({});
-  const [mappingOpen, setMappingOpen]   = useState(false);
+  function walk(node) {
+    if (node.type === "root") {
+      node.children.forEach(walk);
 
-  // ── Load master from storage on mount ──
-  useEffect(() => {
-    (async () => {
-      try {
-        const result = await window.storage.get(STORAGE_KEY);
-        if (result?.value) {
-          const data = JSON.parse(result.value);
-          // Expand slim holdings if stored in new format
-          const modelsMap = Object.fromEntries((data.models || []).map(m => [m.id, m.name]));
-          const holdings = data.holdings?.[0]?.t !== undefined
-            ? expandHoldings(data.holdings, modelsMap)
-            : data.holdings;
-          setMasterData({ ...data, holdings });
-          setMasterFromCache(true);
+    } else if (node.type === "category") {
+      rows.forEach((r,i) => {
+        if (r["Category SubModel Name"] === node.label) {
+          updated[i]["Category Target %"]   = node.target;
+          updated[i]["Category Band/Range"] = node.band;
+          updated[i]["Category Upper %"]    = node.upper;
+          updated[i]["Category Lower %"]    = node.lower;
         }
-      } catch { /* no cached data */ }
-      setStorageLoading(false);
-    })();
-  }, []);
-
-  // ── Save master to storage ──
-  const saveMasterToStorage = useCallback(async (data) => {
-    try {
-      await window.storage.set(STORAGE_KEY, JSON.stringify(data));
-    } catch(e) { console.warn("Storage save failed:", e); }
-  }, []);
-
-  const clearMasterStorage = useCallback(async () => {
-    try { await window.storage.delete(STORAGE_KEY); } catch {}
-  }, []);
-
-  // ── Load master from file ──
-  const handleMasterFiles = useCallback(async (files) => {
-    setLoadingM(true); setErrorM(null);
-    try {
-      const buf = await readFileBuffer(files[0]);
-      const wb = readXLSX(buf);
-      const { models, holdings: slimHoldings } = parseMasterFile(wb);
-      // Expand slim holdings for in-memory use
-      const modelsMap = Object.fromEntries(models.map(m => [m.id, m.name]));
-      const holdings = expandHoldings(slimHoldings, modelsMap);
-      const data = { models, holdings, fileName: files[0].name, savedAt: new Date().toLocaleDateString() };
-      setMasterData(data);
-      setMasterFromCache(false);
-      // Save slim format to storage (half the size)
-      await saveMasterToStorage({ models, holdings: slimHoldings, fileName: files[0].name, savedAt: data.savedAt });
-      if (targetModels.length) setMappings(buildInitialMappings(targetModels, models));
-    } catch(e) { setErrorM("Could not parse Master File: " + e.message); }
-    setLoadingM(false);
-  }, [targetModels, saveMasterToStorage]);
-
-  // ── Load target ──
-  const handleTargetFiles = useCallback(async (files) => {
-    setLoadingT(true); setErrorT(null);
-    // Clear previous target state before loading new file
-    setTargetModels([]); setTargetFileName(null); setMappings([]);
-    setExpanded({}); setFilters({}); setExcludedClasses([]);
-    try {
-      const buf = await readFileBuffer(files[0]);
-      const wb = readXLSX(buf);
-      const parsed = parseTargetFile(wb, masterData?.models || []);
-      setTargetModels(parsed);
-      setTargetFileName(files[0].name);
-      const mappings = masterData ? buildInitialMappings(parsed, masterData.models) : [];
-      if (masterData) setMappings(mappings);
-      setDebugInfo({
-        format: isParagonFormat(wb) ? "Paragon" : isP6Format(wb) ? "P6" : "Standard",
-        parsedModels: parsed.map(m => ({ label: m.modelLabel, positions: m.positions.length, total: m.positions.reduce((s,p)=>s+p.target,0).toFixed(1) })),
-        mappings: mappings.map(m => ({ from: m.targetLabel, to: m.masterModelName || "UNMATCHED" })),
       });
-    } catch(e) { setErrorT("Could not parse Target File: " + e.message); }
-    setLoadingT(false);
-  }, [masterData]);
+      node.children.forEach(walk);
 
-  const updateMapping = (targetKey, masterModelId) => {
-    const model = masterData?.models.find(m => m.id === parseInt(masterModelId));
-    setMappings(prev => prev.map(m => m.targetKey === targetKey
-      ? { ...m, masterModelId: model?.id || null, masterModelName: model?.name || null }
-      : m));
-  };
-
-  const allAssetClasses = useMemo(() => {
-    const s = new Set(targetModels.flatMap(tm => tm.positions.map(p => p.assetClass)).filter(c => c && c !== "—"));
-    return [...s].sort();
-  }, [targetModels]);
-
-  const toggleExclude = cls => setExcludedClasses(prev => prev.includes(cls) ? prev.filter(c=>c!==cls) : [...prev, cls]);
-  const toggleExpand = key => setExpanded(prev => ({ ...prev, [key]: !prev[key] }));
-  const allExpanded = mappings.length > 0 && mappings.every(m => expanded[m.targetKey] === true);
-  const collapseAll = () => { const e = {}; mappings.forEach(m => { e[m.targetKey] = false; }); setExpanded(e); };
-  const expandAll   = () => { const e = {}; mappings.forEach(m => { e[m.targetKey] = true;  }); setExpanded(e); };
-  const [sortBy, setSortBy] = useState("default"); // "default" | "issues" | "clean" | "missing"
-  const getFilter = key => filters[key] || "ALL";
-  const setFilter = (key, val) => setFilters(prev => ({ ...prev, [key]: val }));
-
-  const masterDrop = useDrop(handleMasterFiles);
-  const targetDrop = useDrop(handleTargetFiles);
-
-  const ready = masterData && targetModels.length && mappings.length;
-
-  // Sorted mappings — computed outside JSX to avoid IIFE complexity
-  const sortedMappings = useMemo(() => {
-    if (sortBy === "default" || !masterData || !mappings.length) return mappings;
-    const scoreCache = new Map();
-    const getScore = (mapping) => {
-      if (scoreCache.has(mapping.targetKey)) return scoreCache.get(mapping.targetKey);
-      const s = [0, 0, 0];
-      try {
-        if (mapping.masterModelId) {
-          const tm = targetModels.find(t => t.modelKey === mapping.targetKey);
-          if (tm && tm.positions && tm.positions.length) {
-            const { rows } = runAudit(mapping, tm, masterData.holdings, excludedClasses, threshold);
-            s[0] = rows.filter(r => r.status==="OVER"||r.status==="UNDER").length;
-            s[1] = rows.filter(r => r.status==="MISSING_MASTER"||r.status==="MISSING_TARGET").length;
-            s[2] = rows.filter(r => r.status==="MATCH").length;
-          }
+    } else if (node.type === "class") {
+      rows.forEach((r,i) => {
+        if (r["Class SubModel Name"] === node.label) {
+          updated[i]["Class Target %"]          = node.target;
+          updated[i]["Class Band/Range"]        = node.band;
+          updated[i]["Class Upper %"]           = node.upper;
+          updated[i]["Class Lower %"]           = node.lower;
+          // class's childBand controls the SS tier
+          updated[i]["Security Set Band/Range"] = node.childBand  ?? node.band;
+          updated[i]["Security Set Upper %"]    = node.childUpper ?? node.upper;
+          updated[i]["Security Set Lower %"]    = node.childLower ?? node.lower;
         }
-      } catch { /* ignore scoring errors */ }
-      scoreCache.set(mapping.targetKey, s);
-      return s;
-    };
-    return [...mappings].sort((a, b) => {
-      const [ai, am, ac] = getScore(a);
-      const [bi, bm, bc] = getScore(b);
-      if (sortBy === "issues")  return (bi + bm) - (ai + am);
-      if (sortBy === "missing") return bm - am;
-      if (sortBy === "clean")   return bc - ac;
-      return 0;
-    });
-  }, [mappings, sortBy, masterData, targetModels, excludedClasses, threshold]);
+      });
+      // ss children are read-only, no walk needed
+    }
+  }
 
+  walk(tree);
+  return updated;
+}
+
+// ── Layout Engine ─────────────────────────────────────────────────────────────
+const NODE_R = 38;
+const V_GAP  = 90;
+
+function layoutTree(root) {
+  // Assign x positions bottom-up (leaf spreading), y by depth
+  const positions = {};
+  let leafX = 0;
+
+  function measureWidth(node) {
+    if (node.children.length===0) {
+      node._x = leafX * (NODE_R*2+18);
+      leafX++;
+      return;
+    }
+    node.children.forEach(measureWidth);
+    const xs = node.children.map(c=>c._x);
+    node._x = (Math.min(...xs)+Math.max(...xs))/2;
+  }
+
+  function assignY(node, depth) {
+    node._y = depth * (NODE_R*2 + V_GAP);
+    node.children.forEach(c=>assignY(c, depth+1));
+  }
+
+  measureWidth(root);
+  assignY(root, 0);
+
+  // Collect all nodes
+  const all = [];
+  function collect(node) { all.push(node); node.children.forEach(collect); }
+  collect(root);
+
+  const minX = Math.min(...all.map(n=>n._x));
+  const maxX = Math.max(...all.map(n=>n._x));
+  const maxY = Math.max(...all.map(n=>n._y));
+  const pad = 60;
+
+  return { all, minX, maxX, maxY, pad };
+}
+
+// ── Shared band/target input row helpers ──────────────────────────────────────
+
+function useBandState(initTarget, initBand, initUpper, initLower) {
+  const [target, setTargetRaw] = useState(initTarget ?? 0);
+  const [band,   setBandRaw]   = useState(initBand   ?? 0);
+  const [upper,  setUpper]     = useState(initUpper  ?? 0);
+  const [lower,  setLower]     = useState(initLower  ?? 0);
+
+  const setTarget = useCallback((raw) => {
+    const t = parseFloat(raw) || 0;
+    setTargetRaw(t);
+    setBandRaw(b => { if (b > 0) { const a = +(t * b / 100).toFixed(2); setUpper(a); setLower(a); } return b; });
+  }, []);
+
+  const setBand = useCallback((raw) => {
+    const b = parseFloat(raw) || 0;
+    setBandRaw(b);
+    setTargetRaw(t => { const a = +(t * b / 100).toFixed(2); setUpper(a); setLower(a); return t; });
+  }, []);
+
+  const setUpperDirect = useCallback((raw) => {
+    const u = parseFloat(raw) || 0;
+    setUpper(u);
+    setTargetRaw(t => { if (t > 0) setBandRaw(+(u / t * 100).toFixed(2)); return t; });
+  }, []);
+
+  const setLowerDirect = useCallback((raw) => {
+    setLower(parseFloat(raw) || 0);
+  }, []);
+
+  return { target, band, upper, lower, setTarget, setBand, setUpperDirect, setLowerDirect };
+}
+
+function BandFields({ state, showTarget=true, siblingTotal=null, hideTargetSum=false }) {
+  const { target, band, upper, lower, setTarget, setBand, setUpperDirect, setLowerDirect } = state;
+  const sumOk = siblingTotal === null || Math.abs(siblingTotal - 100) < 0.01;
   return (
-    <div style={{ fontFamily: "'Inter', system-ui, sans-serif", background: "#f1f5f9", minHeight: "100vh" }}>
+    <div>
+      {showTarget && (
+        <div style={{marginBottom:10}}>
+          <label style={{fontSize:11,fontWeight:600,color:"#374151",display:"block",marginBottom:3}}>Target %</label>
+          <input type="number" step="0.01" min="0" max="100" value={target}
+            onChange={e=>setTarget(e.target.value)}
+            style={{width:"100%",padding:"6px 8px",border:`0.5px solid ${sumOk?"#d1d5db":"#fca5a5"}`,borderRadius:6,fontSize:13,boxSizing:"border-box"}}
+          />
+          {!hideTargetSum && siblingTotal !== null && (
+            <div style={{fontSize:10,marginTop:3,color:sumOk?"#16a34a":"#dc2626"}}>
+              Siblings total: {siblingTotal.toFixed(2)}% {sumOk?"✓":"← must equal 100%"}
+            </div>
+          )}
+        </div>
+      )}
+      <div style={{marginBottom:6}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+          <label style={{fontSize:11,fontWeight:600,color:"#374151"}}>Band</label>
+          <span style={{fontSize:10,color:"#9ca3af"}}>% of target</span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:5}}>
+          <input type="number" step="0.5" min="0" max="100" value={band}
+            onChange={e=>setBand(e.target.value)}
+            style={{flex:1,padding:"6px 8px",border:"0.5px solid #d1d5db",borderRadius:6,fontSize:13,boxSizing:"border-box"}}
+          />
+          <span style={{fontSize:11,color:"#6b7280"}}>%</span>
+        </div>
+      </div>
+      <div style={{background:"#f9fafb",borderRadius:6,padding:"8px",marginBottom:4}}>
+        <div style={{fontSize:10,fontWeight:600,color:"#6b7280",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.05em"}}>Tolerance (absolute %)</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+          {[["Upper",upper,setUpperDirect],["Lower",lower,setLowerDirect]].map(([lbl,val,fn])=>(
+            <div key={lbl}>
+              <label style={{fontSize:10,fontWeight:600,color:"#374151",display:"block",marginBottom:2}}>{lbl} %</label>
+              <input type="number" step="0.01" min="0" value={val}
+                onChange={e=>fn(e.target.value)}
+                style={{width:"100%",padding:"4px 6px",border:"0.5px solid #d1d5db",borderRadius:4,fontSize:12,boxSizing:"border-box"}}
+              />
+              <div style={{fontSize:10,color:"#9ca3af",marginTop:1}}>
+                {lbl==="Upper"?`=${+(target+val).toFixed(2)}%`:`=${+(target-val).toFixed(2)}%`}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
 
-      {/* Header */}
-      <div style={{ background: "#0f172a", padding: "16px 28px", display: "flex", alignItems: "center", gap: 14 }}>
-        <div style={{ width: 34, height: 34, background: "#3b82f6", borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2V9M9 21H5a2 2 0 0 1-2-2V9m0 0h18"/></svg>
+// ── Children table row — target + band per child, fully independent ──
+
+function ChildRow({ child, onChange }) {
+  const [target, setTargetRaw] = useState(child.target ?? 0);
+  const [band,   setBandRaw]   = useState(child.band   ?? 0);
+  const [upper,  setUpper]     = useState(child.upper  ?? 0);
+  const [lower,  setLower]     = useState(child.lower  ?? 0);
+
+  function setTarget(raw) {
+    const t = parseFloat(raw) || 0;
+    setTargetRaw(t);
+    if (band > 0) { const a = +(t * band / 100).toFixed(2); setUpper(a); setLower(a); }
+  }
+  function setBand(raw) {
+    const b = parseFloat(raw) || 0;
+    setBandRaw(b);
+    const a = +(target * b / 100).toFixed(2);
+    setUpper(a); setLower(a);
+  }
+  function setUpperDirect(raw) {
+    const u = parseFloat(raw) || 0;
+    setUpper(u);
+    if (target > 0) setBandRaw(+(u / target * 100).toFixed(2));
+  }
+  function setLowerDirect(raw) { setLower(parseFloat(raw) || 0); }
+
+  useEffect(() => { onChange(child.id, { target, band, upper, lower }); }, [target, band, upper, lower]);
+
+  const col = NODE_COLORS[child.type] || NODE_COLORS.ss;
+  return (
+    <div style={{borderBottom:"0.5px solid #f0f0f0",paddingBottom:12,marginBottom:12}}>
+      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
+        <div style={{width:8,height:8,borderRadius:"50%",background:col.fill,border:`1.5px solid ${col.stroke}`,flexShrink:0}}/>
+        <span style={{fontSize:12,fontWeight:600,color:"#374151",lineHeight:1.3}}>{child.label}</span>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:6}}>
+        <div>
+          <label style={{fontSize:10,fontWeight:600,color:"#6b7280",display:"block",marginBottom:2}}>Target %</label>
+          <input type="number" step="0.01" min="0" max="100" value={target}
+            onChange={e=>setTarget(e.target.value)}
+            style={{width:"100%",padding:"5px 7px",border:"0.5px solid #d1d5db",borderRadius:5,fontSize:12,boxSizing:"border-box"}}
+          />
         </div>
         <div>
-          <div style={{ color: "white", fontWeight: 700, fontSize: 16 }}>Model Audit Tool</div>
-          <div style={{ color: "#94a3b8", fontSize: 11 }}>Orion Custom Indexing · Savvy</div>
+          <label style={{fontSize:10,fontWeight:600,color:"#6b7280",display:"block",marginBottom:2}}>Band %</label>
+          <input type="number" step="0.5" min="0" max="100" value={band}
+            onChange={e=>setBand(e.target.value)}
+            style={{width:"100%",padding:"5px 7px",border:"0.5px solid #d1d5db",borderRadius:5,fontSize:12,boxSizing:"border-box"}}
+          />
         </div>
-        {ready && (
-          <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
-            <div style={{ display: "flex", gap: 4, background: "#1e293b", borderRadius: 8, padding: 3 }}>
-              {[
-                { key: "default", label: "Default" },
-                { key: "issues",  label: "Issues First" },
-                { key: "clean",   label: "On Target First" },
-                { key: "missing", label: "Missing First" },
-              ].map(s => (
-                <button key={s.key} onClick={() => setSortBy(s.key)} style={{ padding: "4px 10px", borderRadius: 6, border: "none", fontSize: 11, fontWeight: 600, cursor: "pointer", background: sortBy === s.key ? "#3b82f6" : "transparent", color: sortBy === s.key ? "white" : "#94a3b8", transition: "all 0.15s" }}>
-                  {s.label}
-                </button>
-              ))}
-            </div>
-            <button onClick={allExpanded ? collapseAll : expandAll} style={{ padding: "6px 14px", borderRadius: 8, background: "#334155", border: "none", color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
-              {allExpanded ? "⊟ Collapse All" : "⊞ Expand All"}
-            </button>
-            <button onClick={() => setMappingOpen(true)} style={{ padding: "6px 14px", borderRadius: 8, background: "#1e40af", border: "none", color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
-              ⚙ Model Mappings {mappings.filter(m=>!m.masterModelId).length > 0 && `(${mappings.filter(m=>!m.masterModelId).length} unmatched)`}
-            </button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+        {[["Upper",upper,setUpperDirect],["Lower",lower,setLowerDirect]].map(([lbl,val,fn])=>(
+          <div key={lbl}>
+            <label style={{fontSize:10,fontWeight:600,color:"#6b7280",display:"block",marginBottom:2}}>{lbl} (abs %)</label>
+            <input type="number" step="0.01" min="0" value={val}
+              onChange={e=>fn(e.target.value)}
+              style={{width:"100%",padding:"5px 7px",border:"0.5px solid #d1d5db",borderRadius:5,fontSize:12,boxSizing:"border-box"}}
+            />
           </div>
-        )}
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Edit Panel ────────────────────────────────────────────────────────────────
+// Band semantics — each node's band controls the tier BELOW it:
+//   root band/upper/lower      → Category tolerance (written to Category Band/Range, Upper, Lower)
+//   category band/upper/lower  → Class tolerance    (written to Class Band/Range, Upper, Lower)
+//   class band/upper/lower     → SS tolerance       (written to SS Band/Range, Upper, Lower)
+//   ss                         → read-only, not editable
+
+const BAND_CONTROLS_LABEL = {
+  root:     "Category tolerance",
+  category: "Class tolerance",
+  class:    "Security Set tolerance",
+};
+
+function EditPanel({ node, onSave, onClose, siblingSum }) {
+  const isReadOnly = node.type === "ss";
+  const isParent   = node.type === "root" || node.type === "category";
+
+  // Own band state — this node's own Band/Range/Upper/Lower column
+  const ownState = useBandState(node.target, node.band, node.upper, node.lower);
+
+  // Child band state — only for class nodes; independently controls Security Set Band/Range
+  const childBandState = useBandState(node.target, node.childBand ?? 0, node.childUpper ?? 0, node.childLower ?? 0);
+
+  // Only non-SS children are editable in the children table
+  const editableChildren = (node.children||[]).filter(c => c.type !== "ss");
+
+  const [childEdits, setChildEdits] = useState(() => {
+    const m = {};
+    editableChildren.forEach(c => { m[c.id] = { target: c.target, band: c.band, upper: c.upper, lower: c.lower }; });
+    return m;
+  });
+
+  function handleChildChange(childId, vals) {
+    setChildEdits(prev => ({ ...prev, [childId]: vals }));
+  }
+
+  const childTotal = editableChildren.reduce((s,c) => s + (childEdits[c.id]?.target ?? c.target), 0);
+  const childSumOk = editableChildren.length === 0 || Math.abs(childTotal - 100) < 0.01;
+
+  const otherSum  = siblingSum - node.target;
+  const ownTotal  = +(otherSum + ownState.target).toFixed(4);
+  const ownSumOk  = Math.abs(ownTotal - 100) < 0.01;
+
+  const typeLabel      = { root:"Model", category:"Category", class:"Class", ss:"Security Set" }[node.type];
+  const childTypeName  = node.type === "root" ? "Categories" : "Classes";
+  const bandLabel      = BAND_CONTROLS_LABEL[node.type];
+
+  function handleSave() {
+    onSave({
+      ownVals: {
+        target: ownState.target, band: ownState.band, upper: ownState.upper, lower: ownState.lower,
+        childBand: childBandState.band, childUpper: childBandState.upper, childLower: childBandState.lower,
+      },
+      childEdits
+    });
+  }
+
+  return (
+    <div style={{
+      position:"absolute", top:0, right:0, width:310, background:"#fff",
+      border:"0.5px solid #e5e7eb", borderRadius:10, boxShadow:"0 4px 24px rgba(0,0,0,0.13)",
+      padding:"16px", zIndex:100, maxHeight:"80vh", overflowY:"auto"
+    }}>
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+        <div style={{fontSize:11,fontWeight:700,color:"#111827",textTransform:"uppercase",letterSpacing:"0.06em"}}>{typeLabel}</div>
+        <button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:16,lineHeight:1,padding:0}}>✕</button>
+      </div>
+      <div style={{fontSize:11,color:"#6b7280",marginBottom:12,lineHeight:1.4,wordBreak:"break-word",borderBottom:"0.5px solid #f3f4f6",paddingBottom:10}}>
+        {node.label}
       </div>
 
-      <div style={{ padding: "20px 28px", maxWidth: 1400, margin: "0 auto" }}>
-
-        {/* Upload + Settings row */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 260px", gap: 14, marginBottom: 16 }}>
-
-          <DropZone label="Master File" sublabel="Orion export — source of truth for model names & holdings"
-            accent="#3b82f6" loading={loadingM || storageLoading} error={errorM} dragging={masterDrop.dragging}
-            dropProps={masterDrop} onFiles={handleMasterFiles} hint="Drop or click · .xlsx">
-            {masterData && <>
-              <FileChip
-                name={masterData.fileName}
-                sub={`${masterData.models.length} models · ${masterData.holdings.length} rows · saved ${masterData.savedAt}`}
-                color="#3b82f6"
-                badge={masterFromCache ? { label: "Cached", color: "#16a34a", bg: "#f0fdf4" } : { label: "Updated", color: "#2563eb", bg: "#eff6ff" }}
-                onRemove={async () => { setMasterData(null); setMappings([]); setMasterFromCache(false); await clearMasterStorage(); }}
-              />
-              {masterFromCache && mappings.length > 0 && mappings.filter(m => !m.masterModelId).length > 0 && (
-                <div style={{ marginTop: 6, padding: "6px 10px", background: "#fff7ed", borderRadius: 7, fontSize: 11, color: "#92400e" }}>
-                  ⚠ {mappings.filter(m => !m.masterModelId).length} model(s) unmatched — master file may be stale. Re-upload to refresh.
-                </div>
-              )}
-            </>}
-          </DropZone>
-
-          <DropZone label="Target File" sublabel="Your model library — drop a new file to replace"
-            accent="#8b5cf6" loading={loadingT} error={errorT} dragging={targetDrop.dragging}
-            dropProps={targetDrop} onFiles={handleTargetFiles} hint="Drop or click · .xlsx">
-            {targetFileName && <FileChip name={targetFileName} sub={`${targetModels.length} models across ${[...new Set(targetModels.map(m=>m.sheetName))].length} tabs`} color="#8b5cf6" onRemove={() => { setTargetModels([]); setTargetFileName(null); setMappings([]); setFilters({}); setExcludedClasses([]); }} />}
-          </DropZone>
-
-          {/* Settings */}
-          <div style={{ background: "white", borderRadius: 12, padding: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", borderTop: "3px solid #0ea5e9" }}>
-            <div style={{ fontWeight: 700, fontSize: 13, color: "#0f172a", marginBottom: 12 }}>Audit Settings</div>
-            <div style={{ marginBottom: 14 }}>
-              <label style={lbl}>Tolerance (±%)</label>
-              <input type="number" step="0.01" min="0" value={threshold}
-                onChange={e => setThreshold(parseFloat(e.target.value)||0)}
-                style={{ width: "100%", padding: "7px 10px", borderRadius: 7, border: "1.5px solid #e2e8f0", fontSize: 13, color: "#0f172a", boxSizing: "border-box" }} />
-            </div>
-            {allAssetClasses.length > 0 && (
-              <div>
-                <label style={lbl}>Exclude Asset Classes</label>
-                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                  {allAssetClasses.map(cls => (
-                    <label key={cls} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: excludedClasses.includes(cls) ? "#dc2626" : "#334155" }}>
-                      <input type="checkbox" checked={excludedClasses.includes(cls)} onChange={() => toggleExclude(cls)} style={{ width: 14, height: 14, accentColor: "#dc2626" }} />
-                      {cls}
-                    </label>
-                  ))}
-                </div>
-                {excludedClasses.length > 0 && <div style={{ marginTop: 8, fontSize: 11, color: "#94a3b8" }}>Non-zero remaining targets re-weighted to 100%.</div>}
+      {/* ── Security Set: read-only reference ── */}
+      {isReadOnly && (
+        <div>
+          <div style={{fontSize:10,fontWeight:700,color:"#6b7280",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>
+            Reference only — built separately in Orion
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:6,marginBottom:14}}>
+            {[["SS Target %", node.target+"%"],["Band", node.band+"%"],["Upper %", node.upper+"%"],["Lower %", node.lower+"%"]].map(([lbl,val])=>(
+              <div key={lbl} style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:5,padding:"6px 8px"}}>
+                <div style={{fontSize:10,color:"#9ca3af",marginBottom:2}}>{lbl}</div>
+                <div style={{fontSize:13,fontWeight:600,color:"#6b7280"}}>{val}</div>
               </div>
+            ))}
+          </div>
+          <button onClick={onClose} style={{width:"100%",padding:"7px",border:"0.5px solid #d1d5db",borderRadius:6,background:"none",fontSize:12,cursor:"pointer",color:"#374151"}}>Close</button>
+        </div>
+      )}
+
+      {/* ── Category: read-only model-level allocation tiles ── */}
+      {node.type === "category" && (
+        <div style={{marginBottom:14,paddingBottom:14,borderBottom:"0.5px solid #e5e7eb"}}>
+          <div style={{fontSize:10,fontWeight:700,color:"#6b7280",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Model-level allocation</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5}}>
+            {[["Target",node.target+"%"],["Band",node.band+"%"],["Upper",node.upper+"%"],["Lower",node.lower+"%"]].map(([lbl,val])=>(
+              <div key={lbl} style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:5,padding:"5px 7px",textAlign:"center"}}>
+                <div style={{fontSize:9,color:"#9ca3af",marginBottom:2}}>{lbl}</div>
+                <div style={{fontSize:12,fontWeight:600,color:"#374151"}}>{val}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Root header for children table ── */}
+      {node.type === "root" && (
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <div style={{fontSize:11,fontWeight:700,color:"#374151"}}>{childTypeName}</div>
+          <div style={{fontSize:11,color:childSumOk?"#16a34a":"#dc2626",fontWeight:500}}>
+            {childTotal.toFixed(2)}% {childSumOk?"✓":"← needs 100%"}
+          </div>
+        </div>
+      )}
+
+      {/* ── Editable children table (target only — bands live on this node) ── */}
+      {!isReadOnly && editableChildren.length > 0 && (
+        <div style={{marginBottom:14}}>
+          {node.type === "category" && (
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#374151"}}>{childTypeName}</div>
+              <div style={{fontSize:11,color:childSumOk?"#16a34a":"#dc2626",fontWeight:500}}>
+                {childTotal.toFixed(2)}% {childSumOk?"✓":"← needs 100%"}
+              </div>
+            </div>
+          )}
+          {editableChildren.map(child => (
+            <ChildRow key={child.id} child={child} onChange={handleChildChange} />
+          ))}
+        </div>
+      )}
+
+      {/* ── Class: own target (its sibling allocation within the category) ── */}
+      {node.type === "class" && (
+        <div style={{marginBottom:12}}>
+          <label style={{fontSize:11,fontWeight:600,color:"#374151",display:"block",marginBottom:4}}>Class target %</label>
+          <input type="number" step="0.01" min="0" max="100" value={ownState.target}
+            onChange={e=>ownState.setTarget(e.target.value)}
+            style={{width:"100%",padding:"6px 8px",border:`0.5px solid ${ownSumOk?"#d1d5db":"#fca5a5"}`,borderRadius:6,fontSize:13,boxSizing:"border-box"}}
+          />
+          <div style={{fontSize:10,marginTop:3,color:ownSumOk?"#16a34a":"#dc2626"}}>
+            Siblings total: {ownTotal.toFixed(2)}% {ownSumOk?"✓":"← must equal 100%"}
+          </div>
+        </div>
+      )}
+
+      {/* ── Class: band/tolerance for Security Set tier — separate from class's own band ── */}
+      {node.type === "class" && (
+        <div style={{background:"#f8fafc",border:"0.5px solid #e2e8f0",borderRadius:7,padding:"10px",marginBottom:14}}>
+          <div style={{fontSize:10,fontWeight:700,color:"#0369a1",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>
+            Security Set tolerance
+          </div>
+          <div style={{marginBottom:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+              <label style={{fontSize:11,fontWeight:600,color:"#374151"}}>Band</label>
+              <span style={{fontSize:10,color:"#9ca3af"}}>% of target → sets Upper &amp; Lower</span>
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:5}}>
+              <input type="number" step="0.5" min="0" max="100" value={childBandState.band}
+                onChange={e=>childBandState.setBand(e.target.value)}
+                style={{flex:1,padding:"6px 8px",border:"0.5px solid #d1d5db",borderRadius:6,fontSize:13,boxSizing:"border-box"}}
+              />
+              <span style={{fontSize:11,color:"#6b7280"}}>%</span>
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+            {[["Upper",childBandState.upper,childBandState.setUpperDirect],["Lower",childBandState.lower,childBandState.setLowerDirect]].map(([lbl,val,fn])=>(
+              <div key={lbl}>
+                <label style={{fontSize:10,fontWeight:600,color:"#374151",display:"block",marginBottom:2}}>{lbl} (absolute %)</label>
+                <input type="number" step="0.01" min="0" value={val}
+                  onChange={e=>fn(e.target.value)}
+                  style={{width:"100%",padding:"4px 6px",border:"0.5px solid #d1d5db",borderRadius:4,fontSize:12,boxSizing:"border-box"}}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Save/Cancel */}
+      {!isReadOnly && (
+        <div style={{display:"flex",gap:8,position:"sticky",bottom:0,background:"#fff",paddingTop:8,borderTop:"0.5px solid #f3f4f6"}}>
+          <button onClick={onClose} style={{flex:1,padding:"7px",border:"0.5px solid #d1d5db",borderRadius:6,background:"none",fontSize:12,cursor:"pointer",color:"#374151"}}>Cancel</button>
+          <button onClick={handleSave} style={{flex:1,padding:"7px",border:"none",borderRadius:6,background:"#1a56db",fontSize:12,fontWeight:600,cursor:"pointer",color:"#fff"}}>Save</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Model Tree View ───────────────────────────────────────────────────────────
+
+function ModelTree({ modelName, rows, onRowsChange }) {
+  const [tree, setTree] = useState(()=>buildTree(modelName, rows));
+  const [selectedId, setSelectedId] = useState(null);
+  const [scrollLeft, setScrollLeft] = useState(0);
+  const containerRef = useRef();
+
+  const { all, minX, maxX, maxY, pad } = useMemo(()=>layoutTree(tree),[tree]);
+  const svgW = maxX - minX + pad*2 + NODE_R*2;
+  const svgH = maxY + pad*2 + NODE_R*2;
+  const ox = -minX + pad;
+
+  function getSiblingSum(node) {
+    let parent = null;
+    function findParent(n) {
+      if (n.children.some(c=>c.id===node.id)) { parent=n; return; }
+      n.children.forEach(findParent);
+    }
+    findParent(tree);
+    if (!parent) return 0;
+    return parent.children.reduce((s,c)=>s+c.target,0);
+  }
+
+  function handleSave(nodeId, payload) {
+    const { ownVals, childEdits } = payload;
+    function updateNode(n) {
+      if (n.id === nodeId) {
+        const updated = {
+          ...n,
+          target: ownVals.target, band: ownVals.band, upper: ownVals.upper, lower: ownVals.lower,
+          childBand: ownVals.childBand ?? n.childBand,
+          childUpper: ownVals.childUpper ?? n.childUpper,
+          childLower: ownVals.childLower ?? n.childLower,
+        };
+        if (childEdits && Object.keys(childEdits).length > 0) {
+          updated.children = n.children.map(c => {
+            const edit = childEdits[c.id];
+            return edit ? { ...c, target: edit.target, band: edit.band, upper: edit.upper, lower: edit.lower } : c;
+          });
+        }
+        return updated;
+      }
+      return { ...n, children: n.children.map(updateNode) };
+    }
+    const newTree = updateNode(tree);
+    setTree(newTree);
+    const newRows = applyTreeToRows(rows, newTree);
+    onRowsChange(newRows);
+    setSelectedId(null);
+  }
+
+  const selectedNode = all.find(n=>n.id===selectedId);
+  const siblingSum = selectedNode ? getSiblingSum(selectedNode) : 0;
+
+  // Validation: check if any sibling group doesn't sum to 100
+  function getValidation(node) {
+    if (node.type==="root"||node.type==="ss") return true;
+    if (node.children.length===0) return true;
+    const sum = node.children.reduce((s,c)=>s+c.target,0);
+    return Math.abs(sum-100)<0.5;
+  }
+
+  return (
+    <div style={{position:"relative"}}>
+      <div style={{fontSize:13,fontWeight:700,color:"#111827",marginBottom:8,display:"flex",alignItems:"center",gap:8}}>
+        {modelName}
+        <span style={{fontSize:11,fontWeight:400,color:"#6b7280"}}>Click any node to edit</span>
+      </div>
+      <div ref={containerRef} style={{overflowX:"auto",overflowY:"visible",background:"#0f172a",borderRadius:10,padding:"8px 0"}}>
+        <svg width={Math.max(svgW,400)} height={svgH} style={{display:"block"}}>
+          {/* Connector lines */}
+          {all.map(node =>
+            node.children.map(child => (
+              <line key={`${node.id}-${child.id}`}
+                x1={node._x+ox+NODE_R} y1={node._y+pad+NODE_R}
+                x2={child._x+ox+NODE_R} y2={child._y+pad}
+                stroke="#334155" strokeWidth="1.5"
+              />
+            ))
+          )}
+          {/* Nodes */}
+          {all.map(node => {
+            const cx = node._x+ox+NODE_R;
+            const cy = node._y+pad+NODE_R;
+            const col = NODE_COLORS[node.type]||NODE_COLORS.ss;
+            const isSelected = node.id===selectedId;
+            const valid = getValidation(node);
+            const shortLabel = node.label.length>14 ? node.label.slice(0,13)+"…" : node.label;
+            return (
+              <g key={node.id} style={{cursor:"pointer"}}
+                onClick={()=>{ setSelectedId(node.id===selectedId?null:node.id); }}>
+                {/* Outer ring for selection / error */}
+                <circle cx={cx} cy={cy} r={NODE_R+4}
+                  fill="none"
+                  stroke={isSelected?"#60a5fa":!valid?"#f87171":"transparent"}
+                  strokeWidth={isSelected?2:1.5}
+                />
+                <circle cx={cx} cy={cy} r={NODE_R} fill={col.fill} stroke={col.stroke} strokeWidth="2"/>
+                <text x={cx} y={cy-7} textAnchor="middle" fontSize="9.5" fontWeight="600" fill={col.text} fontFamily="system-ui">
+                  {shortLabel}
+                </text>
+                <text x={cx} y={cy+7} textAnchor="middle" fontSize="10" fontWeight="700" fill={col.text} fontFamily="system-ui">
+                  {node.target}%
+                </text>
+                {node.type!=="root" && node.type!=="ss" && (
+                  <text x={cx} y={cy+18} textAnchor="middle" fontSize="8.5" fill={col.text} fontFamily="system-ui" opacity="0.8">
+                    ±{node.band||node.upper}
+                  </text>
+                )}
+                {!valid && (
+                  <text x={cx+NODE_R-6} y={cy-NODE_R+6} textAnchor="middle" fontSize="12" fill="#f87171">!</text>
+                )}
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+
+      {/* Edit panel */}
+      {selectedNode && (
+        <EditPanel
+          key={selectedNode.id}
+          node={selectedNode}
+          siblingSum={siblingSum}
+          onSave={(vals)=>handleSave(selectedNode.id, vals)}
+          onClose={()=>setSelectedId(null)}
+        />
+      )}
+
+      {/* Legend */}
+      <div style={{display:"flex",gap:12,marginTop:8,flexWrap:"wrap"}}>
+        {[["root","Model"],["category","Category"],["class","Class"],["ss","Security Set"]].map(([type,lbl])=>(
+          <div key={type} style={{display:"flex",alignItems:"center",gap:5}}>
+            <div style={{width:12,height:12,borderRadius:"50%",background:NODE_COLORS[type].fill,border:`1.5px solid ${NODE_COLORS[type].stroke}`}}/>
+            <span style={{fontSize:11,color:"#6b7280"}}>{lbl}</span>
+          </div>
+        ))}
+        <div style={{display:"flex",alignItems:"center",gap:5}}>
+          <div style={{width:12,height:12,borderRadius:"50%",background:"transparent",border:"1.5px solid #f87171"}}/>
+          <span style={{fontSize:11,color:"#6b7280"}}>Targets don't sum to 100%</span>
+        </div>
+      </div>
+
+      {/* Band defaults reminder */}
+      <div style={{marginTop:10,display:"inline-flex",alignItems:"center",gap:0,background:"#f8fafc",border:"0.5px solid #e2e8f0",borderRadius:7,overflow:"hidden",fontSize:11}}>
+        <div style={{padding:"6px 10px",background:"#1a6fb5",color:"#e0f0ff",fontWeight:600,whiteSpace:"nowrap"}}>
+          Band defaults
+        </div>
+        {[
+          {label:"Category",detail:"5 absolute Upper/Lower",color:"#1a6fb5",bg:"#eef4fb"},
+          {label:"Class",detail:"25% band",color:"#8a7a00",bg:"#fdfbe8"},
+          {label:"Security Set",detail:"50% band",color:"#1240a8",bg:"#eef1fd"},
+        ].map(({label,detail,color,bg},i,arr)=>(
+          <div key={label} style={{display:"flex",alignItems:"center"}}>
+            <div style={{padding:"6px 12px",background:bg,color:"#374151",whiteSpace:"nowrap"}}>
+              <span style={{fontWeight:600,color}}>{label}</span>
+              <span style={{color:"#6b7280",marginLeft:4}}>{detail}</span>
+            </div>
+            {i < arr.length-1 && (
+              <div style={{color:"#94a3b8",fontSize:13,padding:"0 2px",background:"#f1f5f9",alignSelf:"stretch",display:"flex",alignItems:"center"}}>›</div>
             )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Excel output ──────────────────────────────────────────────────────────────
+
+function buildOutputRows(inputRows) {
+  return inputRows.map(r => {
+    const out = {};
+    TEMPLATE_COLS.forEach(col => {
+      const val = r[col];
+      out[col] = (val===undefined||val===null||val==="") ? null : val;
+    });
+    return out;
+  });
+}
+
+function downloadXlsx(rows, filename) {
+  const ws = XLSX.utils.json_to_sheet(rows, { header:TEMPLATE_COLS });
+  ws["!cols"] = TEMPLATE_COLS.map(c=>({ wch:Math.max(c.length+2,14) }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Sheet 1");
+  XLSX.writeFile(wb, filename);
+}
+
+function groupByModel(rows) {
+  const models = {};
+  rows.forEach(r => {
+    const name = r["* Model Name"]||"(unnamed)";
+    if (!models[name]) models[name]=[];
+    models[name].push(r);
+  });
+  return models;
+}
+
+// ── Model Library (targets) parsing ────────────────────────────────────────
+// The library workbook has one sheet per "portfolio family" (e.g. base vs.
+// Tax Aware). Each sheet is a matrix: rows are Category (ALL CAPS, no fund
+// name), Class (mixed case, no fund name), or Ticker (has a fund name —
+// security-level, ignored: this tool only updates Category/Class targets).
+// Columns after Ticker/Fund Name are model variants (e.g. "Conservative"),
+// each holding that variant's allocation as a fraction of the whole model.
+
+function normAlnum(s) {
+  return (s||"").toString().toUpperCase().replace(/[^A-Z0-9]/g,"");
+}
+
+function parseLibraryWorkbook(buffer) {
+  const wb = XLSX.read(buffer, { type:"array" });
+  const sheets = [];
+  wb.SheetNames.forEach(name => {
+    const ws = wb.Sheets[name];
+    const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
+    let headerIdx = -1;
+    for (let i=0; i<Math.min(raw.length,10); i++) {
+      const norm = (raw[i]||[]).map(c=>normalizeKey(c));
+      if (norm.includes("ticker")) { headerIdx=i; break; }
+    }
+    if (headerIdx===-1) return; // not a recognizable matrix sheet — skip it
+    const headerRow = raw[headerIdx];
+    const variantCols = [];
+    for (let c=2; c<headerRow.length; c++) {
+      const v = headerRow[c];
+      if (typeof v === "string" && v.trim()) variantCols.push({ idx:c, name:v.trim() });
+      else if (variantCols.length>0) break;
+    }
+    const rows = [];
+    let currentCategory = null;
+    for (let i=headerIdx+1; i<raw.length; i++) {
+      const row = raw[i];
+      if (!row) continue;
+      const label = row[0];
+      if (label===null || label===undefined || label==="") continue;
+      const labelStr = label.toString().trim();
+      if (!labelStr) continue;
+      const fundName = row[1];
+      const isTicker = fundName !== null && fundName !== undefined && fundName !== "";
+      if (isTicker) continue; // security/ticker level — not managed by this tool
+      const isCategory = labelStr === labelStr.toUpperCase() && labelStr !== labelStr.toLowerCase();
+      const values = {};
+      variantCols.forEach(({idx,name}) => {
+        const v = row[idx];
+        values[name] = (v===null||v===undefined||v==="") ? null : parseFloat(v);
+      });
+      if (isCategory) {
+        currentCategory = labelStr;
+        rows.push({ level:"category", label:labelStr, values });
+      } else {
+        // category tracks which category (by label) this class belongs to,
+        // based on the sheet's own row order — needed so exclusion rules
+        // (e.g. ex-USLC) know which classes are siblings of the excluded one.
+        rows.push({ level:"class", label:labelStr, values, category:currentCategory });
+      }
+    }
+    // Guard against unrelated sheets that also happen to have a "Ticker"
+    // column — e.g. a different fund family's own allocation matrix, or a
+    // flat ticker/allocation holdings list for a stock model. A genuine STP
+    // variant matrix always has at least one real ALL-CAPS category row
+    // (EQUITY, FIXED INCOME, etc.) and more than one variant column; sheets
+    // without that structural signature are skipped regardless of name, so
+    // this doesn't depend on guessing which sheet names to allow.
+    if (variantCols.length < 2 || !rows.some(r => r.level === "category")) return;
+
+    sheets.push({ name, variants: variantCols.map(v=>v.name), rows, isTaxAware: /tax/i.test(name) });
+  });
+  return sheets;
+}
+
+// Finds the library row whose label is contained within a Category/Class
+// SubModel Name — e.g. library "Commodities" inside "Savvy ... - Commodities",
+// or library "U.S. Investment Grade" inside "... U.S. Investment Grade FI".
+// Real-world naming isn't always an exact match, so containment (rather than
+// equality) is the rule. Ambiguous cases exist — e.g. "STP - All Equity -
+// Cash" contains both "EQUITY" and "CASH" — so among candidates the one
+// ending closest to the end of the string wins (the actual category/class
+// segment is always the trailing part of the name); ties go to the longer label.
+function matchLibraryLabel(sourceStr, libraryRows) {
+  const ns = normAlnum(sourceStr);
+  if (!ns) return null;
+  let best = null, bestEnd = -1, bestLen = 0;
+  libraryRows.forEach(row => {
+    const nl = normAlnum(row.label);
+    if (!nl) return;
+    const idx = ns.lastIndexOf(nl);
+    if (idx === -1) return;
+    const end = idx + nl.length;
+    if (end > bestEnd || (end === bestEnd && nl.length > bestLen)) {
+      best = row; bestEnd = end; bestLen = nl.length;
+    }
+  });
+  return best;
+}
+
+// Strips recognized modifier tags off a Model Name's trailing segments (in
+// any order/combination) and reports which ones were found. Tags can appear
+// either parenthesized ("(Tax Aware)") or as a bare trailing " - X" segment
+// ("... - Tax Aware", "... - Core Stock Model") — real files mix both styles.
+//   isTaxAware         → use the Tax Aware library sheet instead of the base one
+//   isExUslc           → excludes US Large Cap; see the flatten-and-rescale rule below
+//   isUsEquityOnly     → excludes non-US equity; US Small Cap keeps its normal
+//                        value, US Large Cap absorbs whatever's left
+//   holdingsAssetClass → a holdings substitution: "equity" (Core/Growth/
+//                        Value/Dividend Stock Model, Enhanced Dividend Stock)
+//                        or "fixedIncome" (Bond Ladder). Category/Class
+//                        targets are identical to the base variant — only the
+//                        holdings differ — but the substitute product name
+//                        sometimes replaces the category label too (e.g.
+//                        "Savvy Bond Ladder" instead of "...Fixed Income"),
+//                        so matching falls back to the known asset-class
+//                        token when the renamed label doesn't contain it.
+//                        Bond Ladder specifically collapses its whole category
+//                        into one row at 100% (verified: Category Target %
+//                        equals the base model's Fixed Income value, Class
+//                        Target % is always 100 — there's nothing else in it).
+//                        "Custom Model" is tagged the same way but with no
+//                        specific asset class, since it's only ever seen
+//                        alongside an otherwise-unrecognized name already
+//                        left alone.
+// Whatever's left after peeling should reduce to exactly "{prefix} - {variant}";
+// anything else (extra segments, unrecognized suffixes) is a genuine
+// derivative the library doesn't cover.
+function analyzeModelName(modelName) {
+  const core = (modelName||"").replace(/\([^)]*\)/g,"").replace(/\s{2,}/g," ").trim();
+  const segments = core.split(" - ").map(s=>s.trim()).filter(Boolean);
+  const flags = {
+    isTaxAware: /tax/i.test(modelName||""),
+    isExUslc: /ex[-\s]?uslc/i.test(modelName||""),
+    isUsEquityOnly: false,
+    holdingsAssetClass: null, // "equity" | "fixedIncome" | "other" | null
+  };
+  let changed = true;
+  while (changed && segments.length > 2) {
+    changed = false;
+    const last = segments[segments.length-1];
+    if (/^tax\s*aware$/i.test(last)) { flags.isTaxAware = true; segments.pop(); changed = true; }
+    else if (/^us\s+equity\s+only$/i.test(last)) { flags.isUsEquityOnly = true; segments.pop(); changed = true; }
+    else if (/^(core|growth|value|dividend)\s+stock\s+model$/i.test(last) || /^enhanced\s+dividend\s+stock$/i.test(last)) {
+      flags.holdingsAssetClass = "equity"; segments.pop(); changed = true;
+    }
+    else if (/^bond\s+ladder$/i.test(last)) { flags.holdingsAssetClass = "fixedIncome"; segments.pop(); changed = true; }
+    else if (/^custom\s+model$/i.test(last)) { flags.holdingsAssetClass = flags.holdingsAssetClass || "other"; segments.pop(); changed = true; }
+  }
+  return { segments, flags };
+}
+
+// Matches a Model Name to a specific {sheet, variant} (or blend of two
+// neighboring variants — see the risk-ladder note further down) in the
+// library, after peeling off any recognized modifier tags via analyzeModelName.
+// Returns { match, flags, reason }: match is null with a human-readable
+// reason when the library genuinely doesn't cover this model.
+function matchModelVariant(modelName, librarySheets) {
+  const { segments, flags } = analyzeModelName(modelName);
+  if (segments.length !== 2) {
+    return { match:null, flags, reason:`${segments.length} segment(s) left after removing recognized tags (${segments.join(" / ")||"none"}) — doesn't reduce to a single "{prefix} - {variant}" form` };
+  }
+  const candidate = segments[1];
+  const searchIn = librarySheets.filter(s => s.isTaxAware === flags.isTaxAware);
+  if (searchIn.length === 0) {
+    return { match:null, flags, reason:`no ${flags.isTaxAware?"Tax Aware":"base"} sheet found in the library file` };
+  }
+
+  for (const sheet of searchIn) {
+    const variant = sheet.variants.find(v => v.toLowerCase() === candidate.toLowerCase());
+    if (variant) return { match:{ kind:"single", sheet, variant }, flags, reason:null };
+  }
+
+  // 30/70-style blend: verified against real data as the average of the two
+  // neighboring risk-ladder variants — pair index = (firstNumber-10)/20 along
+  // the library's own column order (10/90=AllFixed+Conservative, 30/70=
+  // Conservative+ModConservative, 50/50=ModConservative+Moderate, 70/30=
+  // Moderate+ModAggressive).
+  const blendMatch = candidate.match(/^(\d{1,3})\s*\/\s*(\d{1,3})$/);
+  if (blendMatch) {
+    const n1 = parseInt(blendMatch[1],10), n2 = parseInt(blendMatch[2],10);
+    if (n1+n2 !== 100) {
+      return { match:null, flags, reason:`blend ratio "${candidate}" doesn't sum to 100 — can't place it on the risk ladder` };
+    }
+    const pairIndex = (n1-10)/20;
+    if (!Number.isInteger(pairIndex)) {
+      return { match:null, flags, reason:`blend ratio "${candidate}" doesn't align to the library's 20-point variant spacing` };
+    }
+    for (const sheet of searchIn) {
+      if (pairIndex>=0 && pairIndex+1 < sheet.variants.length) {
+        return { match:{ kind:"blend", sheet, lowerVariant: sheet.variants[pairIndex], upperVariant: sheet.variants[pairIndex+1] }, flags, reason:null };
+      }
+    }
+    return { match:null, flags, reason:`blend ratio "${candidate}" falls outside the library's variant range` };
+  }
+
+  return { match:null, flags, reason:`"${candidate}" doesn't match any library column name or a recognized blend ratio` };
+}
+
+// Reads a category/class row's fraction for whatever matched — a single
+// variant column, or the average of two neighboring variants for a blend
+// model. Blend averaging treats a missing/blank side as 0% (verified: 10/90's
+// Equity = avg(0, Conservative's 22) = 11, since All Fixed has no Equity row).
+function getMatchFrac(row, match) {
+  if (!row) return null;
+  if (match.kind === "single") return row.values[match.variant];
+  const a = row.values[match.lowerVariant], b = row.values[match.upperVariant];
+  if ((a===null||a===undefined) && (b===null||b===undefined)) return null;
+  return ((a??0) + (b??0)) / 2;
+}
+
+// Compares an existing-model export against the library and computes new
+// Category Target % / Class Target % values. Bands are never touched.
+//
+// Standard models:
+//   new Category Target % = category's fraction of the whole model × 100
+//   new Class Target %    = class's fraction of the whole model, re-based as
+//                            a share of its own category (so siblings still
+//                            sum to 100%) — matches how the existing file
+//                            already stores class-level targets.
+//
+// ex-USLC (confirmed rule; note this changes the file's current ex-USLC
+// numbers, which were built on an earlier whole-portfolio version):
+//   US Large Cap is excluded and its share is redistributed pro-rata among
+//   the *other classes in its own category (Equity) only* — Fixed Income,
+//   Alternatives, and Cash are untouched. Category Target % still reflects
+//   each class's true underlying category value (e.g. 62/32/5/1), even
+//   though the file's Category SubModel Name text is one flattened label
+//   shared across every row of the model.
+//
+// US Equity Only (verified against STP - Moderate - US Equity Only):
+//   Category Target %s are untouched. US Small Cap keeps its normal
+//   classFrac/catFrac value; US Large Cap = 100 - that Small Cap value
+//   (they're the only two classes left in the category).
+//
+// Differences within `tolerance` percentage points are treated as rounding
+// noise, not a real change — the original value is left exactly as-is.
+// Defaults to 0.05pp but is user-adjustable in the review screen.
+const DEFAULT_CHANGE_TOLERANCE = 0.05;
+
+function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_TOLERANCE) {
+  const updated = rows.map(r => ({...r}));
+  const changes = [];
+  const changeKeys = new Set();
+  const skippedModels = new Map(); // modelName -> reason
+  const matchedModels = new Set();
+  const unmatchedCategories = [];
+  const unmatchedClasses = [];
+  const modelMatchCache = {};
+
+  function recordChange(i, field, modelName, label, oldVal, newVal, note) {
+    if (Math.abs(newVal - (parseFloat(oldVal)||0)) > tolerance) {
+      // newVal is part of the key: ex-USLC rows can share the exact same
+      // Category label text across genuinely different underlying categories
+      // (the file flattens the label, not the number), so two rows with the
+      // same label but different correct values must NOT be deduped away.
+      const key = `${modelName}|${field}|${label}|${newVal}`;
+      if (!changeKeys.has(key)) {
+        changeKeys.add(key);
+        changes.push({ modelName, level: field==="Category Target %"?"Category":"Class", label, oldVal, newVal, note });
+      }
+      updated[i][field] = newVal;
+    }
+  }
+
+  rows.forEach((r, i) => {
+    const modelName = r["* Model Name"];
+    if (!modelName) return;
+    if (!(modelName in modelMatchCache)) modelMatchCache[modelName] = matchModelVariant(modelName, librarySheets);
+    const { match, flags, reason } = modelMatchCache[modelName];
+    if (!match) { skippedModels.set(modelName, reason); return; }
+    matchedModels.add(modelName);
+
+    const { sheet } = match;
+    const catRows = sheet.rows.filter(x=>x.level==="category");
+    const classRows = sheet.rows.filter(x=>x.level==="class");
+    const catSubName = r["Category SubModel Name"];
+    const classSubName = r["Class SubModel Name"];
+
+    if (flags.isExUslc) {
+      // Verified against real data: US Large Cap is excluded and its
+      // whole-model fraction is redistributed pro-rata across EVERY other
+      // class in the model (not just Equity) — new Class % = classFrac ×
+      // 1/(1-largeCapFrac) × 100. Category Target % is intentionally left
+      // untouched — the file's Category SubModel Name for these rows is a
+      // flattened placeholder, not real structured data.
+      const usLargeCapRow = matchLibraryLabel("US Large Cap", classRows);
+      const largeCapFrac = usLargeCapRow ? (getMatchFrac(usLargeCapRow, match) || 0) : 0;
+      const scale = largeCapFrac < 1 ? 1/(1-largeCapFrac) : 1;
+
+      if (classSubName) {
+        const classMatch = matchLibraryLabel(classSubName, classRows);
+        if (!classMatch) {
+          unmatchedClasses.push({ modelName, label: classSubName });
+        } else {
+          const classFrac = getMatchFrac(classMatch, match);
+          if (classFrac !== null && classFrac !== undefined) {
+            recordChange(i, "Class Target %", modelName, classSubName, r["Class Target %"], +(classFrac*scale*100).toFixed(2));
+          }
+        }
+      }
+      return;
+    }
+
+    let catMatch = catSubName ? matchLibraryLabel(catSubName, catRows) : null;
+    if (!catMatch && catSubName && flags.holdingsAssetClass === "equity") {
+      catMatch = matchLibraryLabel("EQUITY", catRows);
+    } else if (!catMatch && catSubName && flags.holdingsAssetClass === "fixedIncome") {
+      catMatch = matchLibraryLabel("FIXED INCOME", catRows);
+    }
+
+    if (catSubName) {
+      if (!catMatch) {
+        unmatchedCategories.push({ modelName, label: catSubName });
+      } else {
+        const frac = getMatchFrac(catMatch, match);
+        if (frac !== null && frac !== undefined) {
+          recordChange(i, "Category Target %", modelName, catSubName, r["Category Target %"], +(frac*100).toFixed(2));
+        }
+      }
+    }
+
+    if (classSubName) {
+      let classMatch = matchLibraryLabel(classSubName, classRows);
+      let forcedFullAllocation = false;
+      if (!classMatch && flags.holdingsAssetClass === "equity") {
+        // Substituted holdings row (stock model) stands in for US Large Cap.
+        classMatch = matchLibraryLabel("US Large Cap", classRows);
+      } else if (!classMatch && flags.holdingsAssetClass === "fixedIncome") {
+        // Bond Ladder collapses its whole category into this one row (verified: always 100%).
+        forcedFullAllocation = true;
+      }
+      if (!classMatch && !forcedFullAllocation) {
+        unmatchedClasses.push({ modelName, label: classSubName });
+      } else {
+        const catFrac = catMatch ? getMatchFrac(catMatch, match) : null;
+        let newVal = null;
+        if (forcedFullAllocation) {
+          newVal = 100;
+        } else if (flags.isUsEquityOnly && normAlnum(classMatch.label)==="USLARGECAP") {
+          const smallCapRow = matchLibraryLabel("US Small Cap", classRows);
+          const smallCapFrac = smallCapRow ? getMatchFrac(smallCapRow, match) : null;
+          if (smallCapFrac !== null && smallCapFrac !== undefined && catFrac) {
+            newVal = +(100 - +(smallCapFrac/catFrac*100).toFixed(2)).toFixed(2);
+          }
+        } else {
+          const classFrac = getMatchFrac(classMatch, match);
+          if (classFrac !== null && classFrac !== undefined && catFrac) newVal = +(classFrac/catFrac*100).toFixed(2);
+        }
+        if (newVal !== null) recordChange(i, "Class Target %", modelName, classSubName, r["Class Target %"], newVal);
+      }
+    }
+  });
+
+  return {
+    updatedRows: updated, changes,
+    skippedModels: [...skippedModels.entries()].map(([modelName, reason]) => ({ modelName, reason })),
+    matchedModelCount: matchedModels.size,
+    unmatchedCategories, unmatchedClasses,
+  };
+}
+
+function downloadXlsxWithHeaders(rows, headers, filename) {
+  const ws = XLSX.utils.json_to_sheet(rows, { header:headers });
+  ws["!cols"] = headers.map(c=>({ wch:Math.max((c||"").length+2,14) }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Sheet 1");
+  XLSX.writeFile(wb, filename);
+}
+
+// ── Update Existing Models Flow ─────────────────────────────────────────────
+// Two-file workflow: an existing Orion export (current state) + a model
+// library file (new targets). Matches models/categories/classes between them
+// and lets the user review every value that would change before exporting.
+
+function FilePickBox({ label, hint, file, onFile, accentColor="#1a56db" }) {
+  const ref = useRef();
+  const [dragging, setDragging] = useState(false);
+  return (
+    <div
+      onDragOver={e=>{e.preventDefault();setDragging(true);}}
+      onDragLeave={()=>setDragging(false)}
+      onDrop={e=>{e.preventDefault();setDragging(false);onFile(e.dataTransfer.files[0]);}}
+      onClick={()=>ref.current.click()}
+      style={{
+        border:`2px dashed ${dragging?accentColor:file?"#86efac":"#d1d5db"}`,
+        borderRadius:10, background:dragging?"#eff6ff":file?"#f0fdf4":"#f9fafb",
+        padding:"22px 16px", textAlign:"center", cursor:"pointer", transition:"all 0.15s", flex:1,
+      }}
+    >
+      <input ref={ref} type="file" accept=".xlsx,.xls" style={{display:"none"}}
+        onChange={e=>{onFile(e.target.files[0]);e.target.value="";}} />
+      <div style={{fontSize:13,fontWeight:600,color:"#374151",marginBottom:3}}>{label}</div>
+      <div style={{fontSize:11,color:"#9ca3af",marginBottom:10}}>{hint}</div>
+      {file ? (
+        <div style={{fontSize:12,color:"#16a34a",fontWeight:600}}>✓ {file.name}</div>
+      ) : (
+        <div style={{display:"inline-block",background:accentColor,color:"#fff",padding:"6px 16px",borderRadius:6,fontSize:12,fontWeight:500}}>
+          Choose file
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UpdateModelsFlow({ onBack }) {
+  const [stage, setStage] = useState("upload"); // upload | review | done
+  const [existingFile, setExistingFile] = useState(null);
+  const [existing, setExisting] = useState(null); // {headers, rows}
+  const [libraryFile, setLibraryFile] = useState(null);
+  const [library, setLibrary] = useState(null); // sheets[]
+  const [error, setError] = useState(null);
+  const [result, setResult] = useState(null);
+  const [lastDownload, setLastDownload] = useState("full"); // "full" | "changed"
+  const [tolerance, setTolerance] = useState(DEFAULT_CHANGE_TOLERANCE);
+
+  function handleExistingFile(file) {
+    if (!file) return;
+    setError(null); setExistingFile(file); setExisting(null);
+    const reader = new FileReader();
+    reader.onload = e => {
+      try {
+        const parsed = parseWorkbookRows(new Uint8Array(e.target.result));
+        if (parsed.rows.length===0) throw new Error("No data rows found in the current-model file.");
+        setExisting(parsed);
+      } catch(err) { setError(err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function handleLibraryFile(file) {
+    if (!file) return;
+    setError(null); setLibraryFile(file); setLibrary(null);
+    const reader = new FileReader();
+    reader.onload = e => {
+      try {
+        const sheets = parseLibraryWorkbook(new Uint8Array(e.target.result));
+        if (sheets.length===0) throw new Error("Couldn't find a model matrix sheet (looked for a row with a 'Ticker' column).");
+        setLibrary(sheets);
+      } catch(err) { setError(err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function runCompare() {
+    const res = computeLibraryUpdates(existing.rows, library, tolerance);
+    setResult(res);
+    setStage("review");
+  }
+
+  function handleToleranceChange(newTolerance) {
+    setTolerance(newTolerance);
+    if (existing && library) {
+      setResult(computeLibraryUpdates(existing.rows, library, newTolerance));
+    }
+  }
+
+  function handleDownload(changedOnly) {
+    const baseName = existingFile.name.replace(/\.[^.]+$/,"");
+    const changedModelNames = new Set(result.changes.map(c=>c.modelName));
+    const rowsToExport = changedOnly
+      ? result.updatedRows.filter(r => changedModelNames.has(r["* Model Name"]))
+      : result.updatedRows;
+    const suffix = changedOnly ? "_ChangedModelsOnly" : "_Updated";
+    downloadXlsxWithHeaders(rowsToExport, existing.headers, `${baseName}${suffix}.xlsx`);
+    setLastDownload(changedOnly ? "changed" : "full");
+    setStage("done");
+  }
+
+  function reset() {
+    setStage("upload"); setExistingFile(null); setExisting(null);
+    setLibraryFile(null); setLibrary(null); setError(null); setResult(null);
+  }
+
+  const bothReady = existing && library;
+
+  if (stage === "upload") {
+    return (
+      <div>
+        <div style={{display:"flex",gap:12,marginBottom:14}}>
+          <FilePickBox label="Current model export" hint="How the models are set up today (.xlsx)"
+            file={existingFile} onFile={handleExistingFile} />
+          <FilePickBox label="Model library / targets" hint="New targets to apply (.xlsx)"
+            file={libraryFile} onFile={handleLibraryFile} accentColor="#0aa89c" />
+        </div>
+        {error && <div style={{marginBottom:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
+        <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.6,marginBottom:16}}>
+          <strong style={{color:"#0369a1"}}>What this does:</strong> matches each model to its column in the library, recalculates Category and Class targets from it, and leaves bands, Security Sets, and anything the library doesn't cover untouched. You'll see every change before exporting.
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between"}}>
+          <button onClick={onBack} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
+          <button onClick={runCompare} disabled={!bothReady}
+            style={{background:bothReady?"#1a56db":"#93c5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:bothReady?"pointer":"default"}}>
+            Compare & review →
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (stage === "review") {
+    const { changes, skippedModels, matchedModelCount, unmatchedCategories, unmatchedClasses } = result;
+    const grouped = {};
+    changes.forEach(c => { (grouped[c.modelName] = grouped[c.modelName]||[]).push(c); });
+    const modelNames = Object.keys(grouped);
+
+    return (
+      <div>
+        <div style={{display:"flex",gap:16,marginBottom:16,alignItems:"stretch"}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,flex:1}}>
+            {[
+              ["Models matched", matchedModelCount, "#1a56db"],
+              ["Models skipped", skippedModels.length, "#9ca3af"],
+              ["Unmatched labels", unmatchedCategories.length+unmatchedClasses.length, unmatchedCategories.length+unmatchedClasses.length?"#dc2626":"#9ca3af"],
+            ].map(([lbl,val,color])=>(
+              <div key={lbl} style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px"}}>
+                <div style={{fontSize:19,fontWeight:700,color}}>{val}</div>
+                <div style={{fontSize:11,color:"#6b7280"}}>{lbl}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px",minWidth:150}}>
+            <label style={{fontSize:11,color:"#6b7280",display:"block",marginBottom:4}}>Change tolerance (pp)</label>
+            <input type="number" step="0.01" min="0" value={tolerance}
+              onChange={e=>{
+                const v = e.target.value === "" ? 0 : parseFloat(e.target.value);
+                if (!isNaN(v)) handleToleranceChange(v);
+              }}
+              style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"4px 8px",fontSize:14,fontWeight:700,color:"#111827"}} />
           </div>
         </div>
 
-        {/* Mapping modal */}
-        {mappingOpen && masterData && (
-          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center" }}
-            onClick={e => { if (e.target === e.currentTarget) setMappingOpen(false); }}>
-            <div style={{ background: "white", borderRadius: 16, padding: 28, maxWidth: 720, width: "90%", maxHeight: "80vh", overflowY: "auto" }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
-                <div>
-                  <div style={{ fontWeight: 700, fontSize: 16, color: "#0f172a" }}>Model Mappings</div>
-                  <div style={{ fontSize: 12, color: "#94a3b8" }}>Match each target model column to its Orion master model</div>
-                </div>
-                <button onClick={() => setMappingOpen(false)} style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: "#64748b" }}>×</button>
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {mappings.map(m => (
-                  <div key={m.targetKey} style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", gap: 10, alignItems: "center", padding: "10px 14px", background: m.masterModelId ? "#f8fafc" : "#fff7ed", borderRadius: 10, border: `1px solid ${m.masterModelId ? "#e2e8f0" : "#fed7aa"}` }}>
-                    <div>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: "#0f172a" }}>{m.targetLabel}</div>
-                      {m.confidence > 0 && <div style={{ fontSize: 10, color: "#94a3b8" }}>Confidence: {(m.confidence*100).toFixed(0)}%</div>}
-                    </div>
-                    <div style={{ fontSize: 16, color: "#94a3b8" }}>→</div>
-                    <select value={m.masterModelId || ""} onChange={e => updateMapping(m.targetKey, e.target.value)}
-                      style={{ padding: "6px 8px", borderRadius: 7, border: `1.5px solid ${m.masterModelId ? "#e2e8f0" : "#f97316"}`, fontSize: 12, color: "#0f172a", background: "white" }}>
-                      <option value="">— Not mapped —</option>
-                      <optgroup label="Active models">
-                        {masterData.models.filter(mod => mod.active).map(mod => (
-                          <option key={mod.id} value={mod.id}>{mod.name}</option>
-                        ))}
-                      </optgroup>
-                      <optgroup label="Inactive (no accounts)">
-                        {masterData.models.filter(mod => !mod.active).map(mod => (
-                          <option key={mod.id} value={mod.id}>{mod.name}</option>
-                        ))}
-                      </optgroup>
-                    </select>
-                  </div>
-                ))}
-              </div>
-              <div style={{ marginTop: 20, display: "flex", justifyContent: "flex-end" }}>
-                <button onClick={() => setMappingOpen(false)} style={{ padding: "8px 20px", borderRadius: 8, background: "#3b82f6", border: "none", color: "white", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
-                  Save & Close
-                </button>
-              </div>
-            </div>
+
+        {modelNames.length===0 && (
+          <div style={{background:"#f0fdf4",border:"0.5px solid #bbf7d0",borderRadius:8,padding:"14px",fontSize:13,color:"#166534",marginBottom:16}}>
+            No target values differ from what's already in the current model file — nothing to change.
           </div>
         )}
 
-        {/* Debug panel */}
-        {debugInfo && (
-          <details style={{ marginBottom: 12, background: "#0f172a", borderRadius: 10, padding: "10px 16px", fontSize: 11, color: "#94a3b8", fontFamily: "monospace" }}>
-            <summary style={{ cursor: "pointer", color: "#60a5fa", fontWeight: 600, marginBottom: 6 }}>
-              🔍 Parse Debug — {debugInfo.format} format · {debugInfo.parsedModels.length} models detected
+        {modelNames.map(name => (
+          <div key={name} style={{border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:10,overflow:"hidden"}}>
+            <div style={{background:"#f9fafb",padding:"8px 12px",fontSize:12,fontWeight:700,color:"#111827",borderBottom:"0.5px solid #e5e7eb"}}>{name}</div>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <tbody>
+                {grouped[name].map((c,i)=>{
+                  const delta = Math.abs(c.newVal - (parseFloat(c.oldVal)||0));
+                  const notable = delta > 0.5;
+                  return (
+                  <tr key={i} style={{borderTop:i>0?"0.5px solid #f3f4f6":"none", background:notable?"#fffbeb":"transparent"}}>
+                    <td style={{padding:"6px 12px",color:"#6b7280",width:70}}>{c.level}</td>
+                    <td style={{padding:"6px 12px",color:"#374151"}}>
+                      {c.label}
+                      {c.note && <span style={{marginLeft:6,fontSize:10,color:"#6b7280",fontStyle:"italic"}}>({c.note})</span>}
+                      {notable && <span style={{marginLeft:6,fontSize:9,fontWeight:700,color:"#b45309",background:"#fef3c7",borderRadius:4,padding:"1px 5px"}}>Δ {delta.toFixed(2)}pt</span>}
+                    </td>
+                    <td style={{padding:"6px 12px",color:"#dc2626",textAlign:"right",width:70}}>{c.oldVal ?? "—"}%</td>
+                    <td style={{padding:"6px 4px",color:"#9ca3af",width:20}}>→</td>
+                    <td style={{padding:"6px 12px",color:"#16a34a",fontWeight:700,textAlign:"right",width:70}}>{c.newVal}%</td>
+                  </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+        {(skippedModels.length>0 || unmatchedCategories.length>0 || unmatchedClasses.length>0) && (
+          <details style={{marginTop:8,marginBottom:20}}>
+            <summary style={{cursor:"pointer",fontSize:12,fontWeight:600,color:"#6b7280"}}>
+              Not updated — {skippedModels.length} model(s), {unmatchedCategories.length+unmatchedClasses.length} unmatched label(s)
             </summary>
-            <div style={{ marginTop: 8 }}>
-              <div style={{ color: "#e2e8f0", marginBottom: 6, fontWeight: 600 }}>Parsed models:</div>
-              {debugInfo.parsedModels.map((m, i) => (
-                <div key={i} style={{ color: m.positions === 0 ? "#f87171" : "#86efac" }}>
-                  {m.positions === 0 ? "✗" : "✓"} {m.label} → {m.positions} positions ({m.total}%)
+            <div style={{marginTop:8,padding:"10px 12px",background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,fontSize:11,color:"#6b7280",lineHeight:1.7}}>
+              {skippedModels.length>0 && (
+                <div style={{marginBottom:8}}>
+                  <strong style={{color:"#374151"}}>Not matched to the library</strong> (kept as-is):
+                  <ul style={{margin:"4px 0 0",paddingLeft:18}}>
+                    {skippedModels.map((s,i)=>(
+                      <li key={i} style={{marginBottom:2}}><strong style={{color:"#374151"}}>{s.modelName}</strong> — {s.reason}</li>
+                    ))}
+                  </ul>
                 </div>
-              ))}
-              <div style={{ color: "#e2e8f0", marginTop: 8, marginBottom: 6, fontWeight: 600 }}>Mappings:</div>
-              {debugInfo.mappings.map((m, i) => (
-                <div key={i} style={{ color: m.to === "UNMATCHED" ? "#f87171" : "#86efac" }}>
-                  {m.to === "UNMATCHED" ? "✗" : "✓"} {m.from} → {m.to}
+              )}
+              {unmatchedCategories.length>0 && (
+                <div style={{marginBottom:8}}>
+                  <strong style={{color:"#374151"}}>Category not found in library:</strong>{" "}
+                  {unmatchedCategories.map((u,i)=>`${u.modelName} → ${u.label}`).join("; ")}
                 </div>
-              ))}
+              )}
+              {unmatchedClasses.length>0 && (
+                <div>
+                  <strong style={{color:"#374151"}}>Class not found in library:</strong>{" "}
+                  {unmatchedClasses.map((u,i)=>`${u.modelName} → ${u.label}`).join("; ")}
+                </div>
+              )}
             </div>
           </details>
         )}
 
-        {/* Empty state */}
-        {!masterData && !targetModels.length && !storageLoading && <EmptyState icon text="Upload a Master File and Target File to begin the audit." />}
-        {!masterData && !targetModels.length && storageLoading && <EmptyState icon text="Loading saved master file…" />}
-        {masterData && !targetModels.length && <EmptyState text={`Master file loaded (${masterData.fileName}). Now upload your Target File to run the audit.`} />}
-        {!masterData && targetModels.length > 0 && <EmptyState text="Now upload the Master File from Orion to map models and run the audit." />}
-
-        {/* Results */}
-        {ready && sortedMappings.map(mapping => {
-          if (!mapping.masterModelId) return (
-            <div key={mapping.targetKey} style={{ background: "#fff7ed", borderRadius: 12, padding: "14px 20px", marginBottom: 10, display: "flex", alignItems: "center", gap: 12, border: "1px solid #fed7aa" }}>
-              <span style={{ fontSize: 13, color: "#92400e" }}>⚠ <b>{mapping.targetLabel}</b> — not mapped to a master model.</span>
-              <button onClick={() => setMappingOpen(true)} style={{ marginLeft: "auto", padding: "4px 12px", borderRadius: 6, background: "#f97316", border: "none", color: "white", fontSize: 12, cursor: "pointer" }}>Fix mapping</button>
-            </div>
-          );
-
-          const targetModel = targetModels.find(tm => tm.modelKey === mapping.targetKey);
-          if (!targetModel) return null;
-          const { rows, summary, excluded, sumIncluded } = runAudit(mapping, targetModel, masterData.holdings, excludedClasses, threshold);
-
-          const isOpen = expanded[mapping.targetKey] === true;
-          const filt = getFilter(mapping.targetKey);
-          const filtRows = filt === "ALL" ? rows : filt === "DISCREPANCY" ? rows.filter(r => r.status !== "MATCH") : rows.filter(r => r.status === filt);
-          const hasIssues = summary.over + summary.under + summary.missing > 0;
-
-          return (
-            <div key={mapping.targetKey} style={{ background: "white", borderRadius: 12, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", marginBottom: 10, overflow: "hidden" }}>
-              {/* Accordion header */}
-              <button onClick={() => toggleExpand(mapping.targetKey)} style={{ width: "100%", background: "none", border: "none", cursor: "pointer", padding: "13px 20px", display: "flex", alignItems: "center", gap: 12, textAlign: "left" }}>
-                <span style={{ fontSize: 13, transform: isOpen ? "rotate(90deg)" : "none", transition: "transform 0.2s", color: "#94a3b8", display: "inline-block" }}>▶</span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontWeight: 700, fontSize: 14, color: "#0f172a" }}>{mapping.masterModelName}</div>
-                  <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 1 }}>
-                    Target: <span style={{ color: "#64748b" }}>{mapping.targetLabel}</span>
-                    {excluded.length > 0 && ` · ${excluded.length} excluded`}
-                    {excludedClasses.length > 0 && sumIncluded > 0 && ` · re-weighted from ${sumIncluded.toFixed(1)}%`}
-                  </div>
-                </div>
-                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-                  {summary.over > 0    && <Pill label={`${summary.over} over`}    color="#dc2626" bg="#fef2f2" />}
-                  {summary.under > 0   && <Pill label={`${summary.under} under`}  color="#d97706" bg="#fffbeb" />}
-                  {summary.missing > 0 && <Pill label={`${summary.missing} missing`} color="#7c3aed" bg="#f5f3ff" />}
-                  {!hasIssues          && <Pill label="All on target" color="#16a34a" bg="#f0fdf4" />}
-                  <Pill label={`${summary.total} positions`} color="#64748b" bg="#f8fafc" />
-                </div>
-              </button>
-
-              {isOpen && (
-                <>
-                  {/* Filter bar */}
-                  <div style={{ padding: "0 20px 10px", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", borderBottom: "1px solid #f1f5f9" }}>
-                    {["ALL","DISCREPANCY","OVER","UNDER","MISSING_MASTER","MISSING_TARGET","MATCH"].map(f => {
-                      const active = filt === f;
-                      const count = f==="ALL" ? summary.total : f==="DISCREPANCY" ? (summary.total-summary.match) : f==="OVER" ? summary.over : f==="UNDER" ? summary.under : f==="MATCH" ? summary.match : rows.filter(r=>r.status===f).length;
-                      return (
-                        <button key={f} onClick={() => setFilter(mapping.targetKey, f)} style={{ padding: "4px 10px", borderRadius: 20, border: `1.5px solid ${active?"#3b82f6":"#e2e8f0"}`, background: active?"#eff6ff":"white", color: active?"#1d4ed8":"#64748b", fontWeight: active?600:400, fontSize: 11, cursor: "pointer" }}>
-                          {f==="DISCREPANCY"?"Issues":f==="ALL"?"All":STATUS[f]?.label||f}
-                          <span style={{ marginLeft: 4, background: active?"#3b82f6":"#e2e8f0", color: active?"white":"#64748b", borderRadius: 8, padding: "0 5px", fontSize: 10 }}>{count}</span>
-                        </button>
-                      );
-                    })}
-                    <span style={{ marginLeft: "auto", fontSize: 11, color: "#94a3b8" }}>±{threshold}% tolerance</span>
-                  </div>
-
-                  {/* Excluded notice */}
-                  {excluded.length > 0 && (
-                    <div style={{ margin: "6px 20px 0", padding: "7px 12px", background: "#fff7ed", borderRadius: 8, fontSize: 12, color: "#92400e" }}>
-                      ⊘ Excluded ({[...new Set(excluded.map(r=>r.assetClass))].join(", ")}): {excluded.map(r=>r.ticker).join(", ")}
-                    </div>
-                  )}
-
-                  {/* Table */}
-                  {filtRows.length > 0 ? (
-                    <div style={{ overflowX: "auto" }}>
-                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                        <thead>
-                          <tr style={{ background: "#f8fafc" }}>
-                            {["Status","Ticker","Security","Asset Class","Master Target %","Adj. Target %","Diff"].map(h => (
-                              <th key={h} style={{ padding: "9px 14px", textAlign: ["Master Target %","Adj. Target %","Diff"].includes(h)?"right":"left", fontSize: 10, fontWeight: 600, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.04em", borderBottom: "1px solid #e2e8f0", whiteSpace: "nowrap" }}>{h}</th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {filtRows.map((row, i) => {
-                            const s = STATUS[row.status];
-                            return (
-                              <tr key={row.ticker+i} style={{ background: i%2===0?"white":"#fafbfc", borderBottom: "1px solid #f1f5f9" }}>
-                                <td style={{ padding: "8px 14px", whiteSpace: "nowrap" }}>
-                                  <span style={{ display: "inline-flex", alignItems: "center", gap: 5, background: s.bg, color: s.color, padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>
-                                    <span style={{ width: 5, height: 5, borderRadius: "50%", background: s.dot, flexShrink: 0 }} />{s.label}
-                                  </span>
-                                </td>
-                                <td style={{ padding: "8px 14px", fontWeight: 600, color: "#0f172a", fontFamily: "monospace", fontSize: 12 }}>{row.ticker}</td>
-                                <td style={{ padding: "8px 14px", color: "#334155", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.name}</td>
-                                <td style={{ padding: "8px 14px", color: "#64748b", fontSize: 12, whiteSpace: "nowrap" }}>{row.assetClass}</td>
-                                <td style={{ padding: "8px 14px", textAlign: "right", fontVariantNumeric: "tabular-nums", color: "#0f172a" }}>
-                                  {row.masterTarget !== null ? `${row.masterTarget.toFixed(2)}%` : <span style={{ color: "#cbd5e1" }}>—</span>}
-                                </td>
-                                <td style={{ padding: "8px 14px", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-                                  {row.adjTarget !== null
-                                    ? <span title={row.rawTarget !== null ? `Raw: ${row.rawTarget.toFixed(2)}%` : ""} style={{ color: "#0f172a", cursor: row.rawTarget !== row.adjTarget ? "help" : "default", borderBottom: row.rawTarget !== row.adjTarget ? "1px dashed #94a3b8" : "none" }}>
-                                        {row.adjTarget.toFixed(2)}%
-                                      </span>
-                                    : <span style={{ color: "#cbd5e1" }}>—</span>}
-                                </td>
-                                <td style={{ padding: "8px 14px", textAlign: "right", fontWeight: 600, fontVariantNumeric: "tabular-nums", color: row.diff===null?"#cbd5e1":row.diff>0?"#dc2626":row.diff<0?"#d97706":"#16a34a" }}>
-                                  {row.diff===null ? "—" : `${row.diff>0?"+":""}${row.diff.toFixed(2)}%`}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <div style={{ padding: 24, textAlign: "center", color: "#94a3b8", fontSize: 13 }}>No holdings match this filter.</div>
-                  )}
-                </>
-              )}
-            </div>
-          );
-        })}
-        {/* Legend */}
-        {ready && (
-          <div style={{ marginTop: 8, display: "flex", gap: 14, flexWrap: "wrap", fontSize: 11, color: "#94a3b8" }}>
-            <span>● <b style={{ color:"#dc2626" }}>Overweight</b>: Master &gt; Adj. target beyond tolerance</span>
-            <span>● <b style={{ color:"#d97706" }}>Underweight</b>: Master &lt; Adj. target beyond tolerance</span>
-            <span>● <b style={{ color:"#7c3aed" }}>Not in Master</b>: In your targets, absent from Master</span>
-            <span>● <b style={{ color:"#64748b" }}>No Target Entry</b>: In Master, not in target file</span>
-            <span style={{ marginLeft: "auto" }}>Hover Adj. Target % to see raw pre-reweight value</span>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"0.5px solid #e5e7eb",paddingTop:16}}>
+          <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={()=>handleDownload(true)} disabled={modelNames.length===0}
+              style={{background:"none",border:`0.5px solid ${modelNames.length?"#1a56db":"#d1d5db"}`,borderRadius:6,padding:"8px 18px",fontSize:13,fontWeight:600,color:modelNames.length?"#1a56db":"#9ca3af",cursor:modelNames.length?"pointer":"default"}}>
+              Export changed models only ↓
+            </button>
+            <button onClick={()=>handleDownload(false)} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>
+              Export full file ↓
+            </button>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  // stage === "done"
+  return (
+    <div style={{textAlign:"center",padding:"48px 24px"}}>
+      <div style={{width:56,height:56,borderRadius:"50%",background:"#dcfce7",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px"}}>
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+      </div>
+      <div style={{fontSize:18,fontWeight:700,color:"#111827",marginBottom:6}}>File downloaded</div>
+      <div style={{fontSize:13,color:"#6b7280",marginBottom:6}}>
+        {lastDownload==="changed"
+          ? `Only the ${new Set(result.changes.map(c=>c.modelName)).size} model(s) with updated values were included.`
+          : `All ${result.matchedModelCount + result.skippedModels.length} models included, ${result.changes.length} value(s) updated.`}
+      </div>
+      <div style={{fontSize:13,color:"#6b7280",marginBottom:28}}>Ready to re-import into Orion Eclipse</div>
+      <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
+        <button onClick={()=>setStage("review")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back to review</button>
+        <button onClick={()=>handleDownload(true)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download changed only</button>
+        <button onClick={()=>handleDownload(false)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download full file</button>
+        <button onClick={reset} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"8px 18px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>Process another pair</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+
+export default function OrionImportBuilder() {
+  const [mode, setMode] = useState(null); // null | "import" | "update"
+  const [stage, setStage] = useState("upload");
+  const [allRows, setAllRows] = useState([]);
+  const [fileName, setFileName] = useState("");
+  const [error, setError] = useState(null);
+  const [dragging, setDragging] = useState(false);
+  const fileRef = useRef();
+
+  const processFile = useCallback((file) => {
+    if (!file) return;
+    setError(null);
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = parseExcel(new Uint8Array(e.target.result));
+        if (parsed.length===0) throw new Error("No data rows found.");
+        setAllRows(parsed);
+        setStage("edit");
+      } catch(err) { setError(err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  const onDrop = useCallback((e) => {
+    e.preventDefault(); setDragging(false);
+    processFile(e.dataTransfer.files[0]);
+  }, [processFile]);
+
+  const handleDownload = () => {
+    const out = buildOutputRows(allRows);
+    const baseName = fileName.replace(/\.[^.]+$/,"");
+    downloadXlsx(out, `${baseName}_ImportReady.xlsx`);
+    setStage("done");
+  };
+
+  const reset = () => { setStage("upload"); setAllRows([]); setFileName(""); setError(null); };
+
+  const modelGroups = groupByModel(allRows);
+  const modelCount = Object.keys(modelGroups).length;
+
+  // Validation across all groups
+  function hasWarnings() {
+    // check every category's children sum to 100, etc — quick check
+    return false; // tree components handle their own validation visually
+  }
+
+  const STEPS = [["1","Upload"],["2","Edit"],["3","Download"]];
+  const stageIdx = {upload:0,edit:1,done:2}[stage];
+
+  return (
+    <div style={{fontFamily:"system-ui,sans-serif",maxWidth:900,margin:"0 auto",padding:"24px 16px"}}>
+
+      {/* Header */}
+      <div style={{marginBottom:24}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+          <div style={{width:32,height:32,borderRadius:8,background:"linear-gradient(135deg,#1a56db,#0ea5e9)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+              <line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/>
+            </svg>
+          </div>
+          <div>
+            <div style={{fontSize:18,fontWeight:700,color:"#111827"}}>Orion Import Builder</div>
+            <div style={{fontSize:12,color:"#6b7280"}}>
+              {mode===null ? "Upload · visualize · edit · export" : mode==="import" ? "New import file" : "Update existing models"}
+            </div>
+          </div>
+        </div>
+        {mode!==null && (
+          <button onClick={()=>{setMode(null);setStage("upload");setAllRows([]);setFileName("");setError(null);}}
+            style={{fontSize:11,color:"#6b7280",background:"none",border:"none",cursor:"pointer",padding:0,textDecoration:"underline",marginBottom:4}}>
+            ← Choose a different workflow
+          </button>
+        )}
+        {mode==="import" && (
+        <div style={{display:"flex",alignItems:"center",gap:0}}>
+          {STEPS.map(([num,lbl],i)=>(
+            <div key={num} style={{display:"flex",alignItems:"center"}}>
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <div style={{width:22,height:22,borderRadius:"50%",background:i<stageIdx?"#1a56db":i===stageIdx?"#1a56db":"#e5e7eb",color:i<=stageIdx?"#fff":"#9ca3af",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center"}}>
+                  {i<stageIdx?"✓":num}
+                </div>
+                <span style={{fontSize:12,fontWeight:i===stageIdx?600:400,color:i===stageIdx?"#111827":i<stageIdx?"#6b7280":"#9ca3af"}}>{lbl}</span>
+              </div>
+              {i<2&&<div style={{width:32,height:1,background:"#e5e7eb",margin:"0 8px"}}/>}
+            </div>
+          ))}
+        </div>
         )}
       </div>
-    </div>
-  );
-}
 
-// ── Sub-components ────────────────────────────────────────────────────────────
-const lbl = { fontSize: 11, fontWeight: 600, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 6 };
-
-function DropZone({ label, sublabel, accent, loading, error, dragging, dropProps, onFiles, hint, children }) {
-  const hasChildren = Array.isArray(children) ? children.filter(Boolean).length > 0 : !!children;
-  return (
-    <div style={{ background: "white", borderRadius: 12, padding: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", borderTop: `3px solid ${accent}` }}>
-      <div style={{ marginBottom: 10 }}>
-        <div style={{ fontWeight: 700, fontSize: 13, color: "#0f172a" }}>{label}</div>
-        <div style={{ fontSize: 11, color: "#94a3b8" }}>{sublabel}</div>
-      </div>
-      {hasChildren && <div style={{ marginBottom: 8 }}>{children}</div>}
-      <label {...dropProps} style={{ display: "block", border: `1.5px dashed ${dragging?accent:"#e2e8f0"}`, borderRadius: 8, padding: 12, textAlign: "center", cursor: "pointer", background: dragging ? accent + "10" : "transparent", transition: "all 0.15s" }}>
-        <input type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={e => onFiles(Array.from(e.target.files))} />
-        {loading ? <span style={{ color: "#94a3b8", fontSize: 12 }}>Reading…</span>
-          : <span style={{ fontSize: 12, color: dragging?accent:"#64748b", fontWeight: dragging?600:400 }}>{dragging?"Release to upload":hasChildren?"+ Replace file":hint}</span>}
-      </label>
-      {error && <div style={{ marginTop: 6, fontSize: 11, color: "#dc2626" }}>{error}</div>}
-    </div>
-  );
-}
-
-function FileChip({ name, sub, color, badge, onRemove }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "#f8fafc", borderRadius: 7, padding: "7px 10px", gap: 8 }}>
-      <div style={{ minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 1 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: "#0f172a", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
-          {badge && <span style={{ fontSize: 10, fontWeight: 600, color: badge.color, background: badge.bg, padding: "1px 6px", borderRadius: 8, whiteSpace: "nowrap", flexShrink: 0 }}>{badge.label}</span>}
+      {/* ── Mode selection ── */}
+      {mode===null && (
+        <div style={{display:"flex",gap:16}}>
+          <div onClick={()=>setMode("import")}
+            style={{flex:1,border:"0.5px solid #e5e7eb",borderRadius:12,padding:"28px 20px",cursor:"pointer",background:"#fff",transition:"all 0.15s"}}
+            onMouseEnter={e=>e.currentTarget.style.borderColor="#1a56db"} onMouseLeave={e=>e.currentTarget.style.borderColor="#e5e7eb"}>
+            <div style={{width:36,height:36,borderRadius:9,background:"#eff6ff",display:"flex",alignItems:"center",justifyContent:"center",marginBottom:14}}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1a56db" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+            </div>
+            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Build new import file</div>
+            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload an Orion export, edit targets and bands on an interactive tree, and export a ready-to-import .xlsx.</div>
+          </div>
+          <div onClick={()=>setMode("update")}
+            style={{flex:1,border:"0.5px solid #e5e7eb",borderRadius:12,padding:"28px 20px",cursor:"pointer",background:"#fff",transition:"all 0.15s"}}
+            onMouseEnter={e=>e.currentTarget.style.borderColor="#0aa89c"} onMouseLeave={e=>e.currentTarget.style.borderColor="#e5e7eb"}>
+            <div style={{width:36,height:36,borderRadius:9,background:"#f0fdfa",display:"flex",alignItems:"center",justifyContent:"center",marginBottom:14}}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0aa89c" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+            </div>
+            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Update existing models</div>
+            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload your current model export plus a model library of new targets — get back an updated file with just the changed values.</div>
+          </div>
         </div>
-        <div style={{ fontSize: 11, color: "#94a3b8", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{sub}</div>
-      </div>
-      <button onClick={onRemove} style={{ flexShrink: 0, background: "none", border: "none", cursor: "pointer", color: "#94a3b8", fontSize: 16, lineHeight: 1, padding: "2px 4px" }}>×</button>
-    </div>
-  );
-}
+      )}
 
-function Pill({ label, color, bg }) {
-  return <span style={{ fontSize: 11, fontWeight: 600, color, background: bg, padding: "3px 8px", borderRadius: 10, whiteSpace: "nowrap" }}>{label}</span>;
-}
+      {/* ── Update Existing Models workflow ── */}
+      {mode==="update" && <UpdateModelsFlow onBack={()=>setMode(null)} />}
 
-function EmptyState({ text, icon }) {
-  return (
-    <div style={{ background: "white", borderRadius: 12, padding: 48, textAlign: "center" }}>
-      {icon && <div style={{ width: 44, height: 44, background: "#f1f5f9", borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 14px" }}><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5"><path d="M9 17v-2m3 2v-4m3 4v-6M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9l-6-6z"/></svg></div>}
-      <div style={{ fontSize: 13, color: "#64748b", maxWidth: 380, margin: "0 auto" }}>{text}</div>
+      {/* ── Import workflow (upload/edit/done) ── */}
+      {mode==="import" && (
+      <>
+      {/* ── Upload ── */}
+      {stage==="upload" && (
+        <div>
+          <div
+            onDragOver={e=>{e.preventDefault();setDragging(true);}}
+            onDragLeave={()=>setDragging(false)}
+            onDrop={onDrop}
+            onClick={()=>fileRef.current.click()}
+            style={{border:`2px dashed ${dragging?"#1a56db":"#d1d5db"}`,borderRadius:12,background:dragging?"#eff6ff":"#f9fafb",padding:"48px 24px",textAlign:"center",cursor:"pointer",transition:"all 0.15s"}}
+          >
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke={dragging?"#1a56db":"#9ca3af"} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{margin:"0 auto 12px",display:"block"}}>
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <div style={{fontSize:15,fontWeight:600,color:"#374151",marginBottom:4}}>Drop your Excel file here</div>
+            <div style={{fontSize:13,color:"#6b7280",marginBottom:16}}>or click to browse — any Orion model export (.xlsx)</div>
+            <div style={{display:"inline-block",background:"#1a56db",color:"#fff",padding:"8px 20px",borderRadius:6,fontSize:13,fontWeight:500}}>Choose file</div>
+          </div>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls" onChange={e=>{processFile(e.target.files[0]);e.target.value="";}} style={{display:"none"}}/>
+          {error&&<div style={{marginTop:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
+          <div style={{marginTop:20,background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.6}}>
+            <strong style={{color:"#0369a1"}}>What this tool does:</strong> Upload any Orion model Excel export. The tool parses all rows, shows an interactive node tree for each model, lets you edit targets and bands, then exports a ready-to-import .xlsx.
+          </div>
+        </div>
+      )}
+
+      {/* ── Edit / Tree View ── */}
+      {stage==="edit" && (
+        <div>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+            <div>
+              <span style={{fontSize:14,fontWeight:600,color:"#111827"}}>{modelCount} model{modelCount!==1?"s":""} · {allRows.length} rows</span>
+              <span style={{fontSize:12,color:"#6b7280",marginLeft:8}}>from {fileName}</span>
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={reset} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"7px 14px",fontSize:13,color:"#374151",cursor:"pointer"}}>
+                ← New file
+              </button>
+              <button onClick={handleDownload} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"7px 18px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>
+                Export import file ↓
+              </button>
+            </div>
+          </div>
+
+          {Object.entries(modelGroups).map(([name, rows]) => (
+            <div key={name} style={{marginBottom:36}}>
+              <ModelTree
+                modelName={name}
+                rows={rows}
+                onRowsChange={(updatedRows) => {
+                  // Replace this model's rows in allRows
+                  setAllRows(prev => {
+                    const out = [...prev];
+                    let ri = 0;
+                    prev.forEach((r,i)=>{
+                      if (r["* Model Name"]===name) {
+                        out[i]=updatedRows[ri++];
+                      }
+                    });
+                    return out;
+                  });
+                }}
+              />
+            </div>
+          ))}
+
+          <div style={{borderTop:"0.5px solid #e5e7eb",paddingTop:16,display:"flex",justifyContent:"flex-end"}}>
+            <button onClick={handleDownload} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"9px 24px",fontSize:14,fontWeight:600,color:"#fff",cursor:"pointer"}}>
+              Export import file ↓
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Done ── */}
+      {stage==="done" && (
+        <div style={{textAlign:"center",padding:"48px 24px"}}>
+          <div style={{width:56,height:56,borderRadius:"50%",background:"#dcfce7",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px"}}>
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div style={{fontSize:18,fontWeight:700,color:"#111827",marginBottom:6}}>File downloaded</div>
+          <div style={{fontSize:13,color:"#6b7280",marginBottom:28}}>{modelCount} model{modelCount!==1?"s":""} · {allRows.length} rows — ready to import into Orion Eclipse</div>
+          <div style={{display:"flex",gap:10,justifyContent:"center"}}>
+            <button onClick={()=>setStage("edit")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back to editor</button>
+            <button onClick={handleDownload} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download again</button>
+            <button onClick={reset} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"8px 18px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>Process another file</button>
+          </div>
+        </div>
+      )}
+      </>
+      )}
     </div>
   );
 }
