@@ -1656,9 +1656,12 @@ const ACM_STYLE = {
 // are left blank on ticker rows (relying on the colored bars above for
 // grouping, not repeated text) — merged across A:B on category/class summary
 // rows so it reads cleanly instead of looking staggered.
+// Single leftmost column serves double duty — a Category/Class header row's
+// name, or an actual ticker symbol — matching the reference file's layout
+// instead of separate columns that sit empty on every ticker row.
 function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extraCol) {
   const ws = wb.addWorksheet(sheetName.slice(0,31).replace(/[\\/*?:[\]]/g,""));
-  const fixedCols = ["Category","Class","Ticker","Label", ...(extraCol?[extraCol]:[])];
+  const fixedCols = ["Ticker","Label", ...(extraCol?[extraCol]:[])];
   const totalCols = fixedCols.length + models.length;
 
   ws.mergeCells(1,1,1,totalCols);
@@ -1680,13 +1683,13 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
   ws.getRow(headerRowIdx).height = 20;
 
   const modelColStart = fixedCols.length + 1;
+  const targetCol = extraCol ? 3 : null;
   const pctCell = (r,c,val) => { const cell = ws.getCell(r,c); cell.value = val; cell.numFmt = "0.0%"; cell.alignment = { horizontal:"center" }; };
   const fillRow = (r, argb) => { for (let c=1;c<=totalCols;c++) ws.getCell(r,c).fill = { type:"pattern", pattern:"solid", fgColor:{argb} }; };
 
   let r = headerRowIdx + 1;
   categories.forEach(cat => {
     fillRow(r, ACM_STYLE.categoryFill);
-    ws.mergeCells(r,1,r,2);
     const catCell = ws.getCell(r,1);
     catCell.value = cat.name;
     catCell.font = { name:"Arial", size:12, bold:true, color:{argb:ACM_STYLE.white} };
@@ -1696,32 +1699,30 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
     cat.classes.forEach(cls => {
       if (!cls.isDirect) {
         fillRow(r, ACM_STYLE.classFill);
-        const clsCell = ws.getCell(r,2);
+        const clsCell = ws.getCell(r,1);
         clsCell.value = cls.name;
         clsCell.font = { name:"Arial", size:10, bold:true, color:{argb:"FF000000"} };
-        if (extraCol) pctCell(r, modelColStart-1, cls.targetPct/100);
+        if (targetCol) pctCell(r, targetCol, cls.targetPct/100);
         models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"class", cat, cls, mi })));
         r++;
       }
       cls.tickers.forEach(t => {
-        // Category/Class cells intentionally blank here — the colored bars
-        // above already convey grouping; repeating the text looked staggered.
-        const tickerCell = ws.getCell(r,3);
+        const tickerCell = ws.getCell(r,1);
         tickerCell.value = t.ticker;
         tickerCell.alignment = { horizontal:"center" };
         tickerCell.border = { top:{style:"thin"}, bottom:{style:"thin"}, left:{style:"thin"}, right:{style:"thin"} };
-        ws.getCell(r,4).value = t.label;
-        if (extraCol) pctCell(r, modelColStart-1, t.targetPct/100);
+        ws.getCell(r,2).value = t.label;
+        if (targetCol) pctCell(r, targetCol, t.targetPct/100);
         models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"ticker", cat, cls, t, mi })));
         r++;
       });
     });
   });
 
-  ws.getColumn(1).width = 14; ws.getColumn(2).width = 20; ws.getColumn(3).width = 10; ws.getColumn(4).width = 26;
-  if (extraCol) ws.getColumn(5).width = 11;
+  ws.getColumn(1).width = 20; ws.getColumn(2).width = 26;
+  if (extraCol) ws.getColumn(3).width = 11;
   for (let mi=0; mi<models.length; mi++) ws.getColumn(modelColStart+mi).width = 13;
-  ws.views = [{ state:"frozen", xSplit: extraCol?5:4, ySplit:headerRowIdx }];
+  ws.views = [{ state:"frozen", xSplit: extraCol?3:2, ySplit:headerRowIdx }];
   return ws;
 }
 
@@ -1733,35 +1734,38 @@ async function downloadAcmDigest(familyTrees, advisorName) {
     const displayName = acmFamilyDisplayName(fam, advisorName);
     const { models, categories } = tree;
 
-    // Current tab — raw allocations + the editable Target % column (this is
-    // what the advisor edits; re-import reads Target % from here).
+    // Current tab — every level (category/class/ticker) expressed as a %
+    // of the WHOLE model, consistently, so a class's number visibly equals
+    // the sum of its tickers' numbers, and a category's equals the sum of
+    // its classes'. Plus the editable Target % column (this is what the
+    // advisor edits; re-import reads Target % from here).
     acmWriteSheet(wb, displayName, displayName, models, categories, ({level, cat, cls, t, mi}) => {
       if (level==="category") return cat.totals[mi]/100;
-      if (level==="class") return cat.totals[mi]>1e-9 ? cls.totals[mi]/cat.totals[mi] : 0;
+      if (level==="class") return cls.totals[mi]/100;
       return t.currentByModel[mi]/100;
     }, "Target %");
 
-    // Suggested tab — derived from Target % × the category's actual raw weight.
+    // Suggested tab — cascades down from the category's actual (unsmoothed)
+    // raw weight through each fixed Target % ratio, so every level still
+    // sums correctly: tickers under a class sum to that class's suggested
+    // %, classes under a category sum to the category's (unchanged) %.
     acmWriteSheet(wb, `${displayName} (Suggested)`, `${displayName} — Suggested`, models, categories, ({level, cat, cls, t, mi}) => {
-      if (level==="category") return cat.totals[mi]/100;
-      if (level==="class") return cat.totals[mi] * (cls.targetPct/100) / 100;
-      const parentTotals = cls.isDirect ? cat.totals : cls.totals;
-      return parentTotals[mi] * (t.targetPct/100) / 100;
+      const catPct = cat.totals[mi]/100;
+      if (level==="category") return catPct;
+      const clsPct = cls.isDirect ? catPct : catPct * (cls.targetPct/100);
+      if (level==="class") return clsPct;
+      return clsPct * (t.targetPct/100);
     });
 
     // Difference tab — Suggested minus Current, so the advisor can see the
     // magnitude of change at a glance without hunting across two tabs.
     acmWriteSheet(wb, `${displayName} Difference`, `${displayName} — Difference (Suggested − Current)`, models, categories, ({level, cat, cls, t, mi}) => {
+      const catPct = cat.totals[mi]/100;
       if (level==="category") return 0;
-      if (level==="class") {
-        const current = cat.totals[mi]>1e-9 ? cls.totals[mi]/cat.totals[mi] : 0;
-        const suggested = cat.totals[mi] * (cls.targetPct/100) / 100;
-        return suggested - current;
-      }
-      const parentTotals = cls.isDirect ? cat.totals : cls.totals;
-      const current = t.currentByModel[mi]/100;
-      const suggested = parentTotals[mi] * (t.targetPct/100) / 100;
-      return suggested - current;
+      const clsSuggested = cls.isDirect ? catPct : catPct * (cls.targetPct/100);
+      if (level==="class") return clsSuggested - cls.totals[mi]/100;
+      const suggested = clsSuggested * (t.targetPct/100);
+      return suggested - t.currentByModel[mi]/100;
     });
   });
 
@@ -1776,10 +1780,10 @@ async function downloadAcmDigest(familyTrees, advisorName) {
 
 // Re-imports a (possibly advisor-edited) digest file. Reads the "Current"
 // tabs specifically (skips any "(Suggested)"/"Difference" tabs, which are
-// derived reference-only). Category/Class cells are blank on ticker rows by
-// design (matching the reference file's clean look), so this tracks the most
-// recent Category/Class seen while scanning top-to-bottom — the same
-// "inherit until changed" convention used elsewhere for this kind of sheet.
+// derived reference-only). Category/Class/Ticker share one column, so row
+// type is inferred the same way the raw advisor file itself is parsed: ALL
+// CAPS with no Label = category, mixed-case with no Label = class, anything
+// else = a ticker row.
 function parseAcmDigestForReimport(buffer) {
   const wb = XLSX.read(buffer, { type:"array" });
   const families = {};
@@ -1791,19 +1795,15 @@ function parseAcmDigestForReimport(buffer) {
     // Row 0 is the merged title bar; the actual column headers are row 1.
     const header = raw[1].map(h=>(h||"").toString());
     const idx = {
-      category: header.indexOf("Category"), cls: header.indexOf("Class"),
       ticker: header.indexOf("Ticker"), label: header.indexOf("Label"),
       target: header.indexOf("Target %"),
     };
-    if (idx.category===-1 || idx.target===-1) return; // not a recognizable digest sheet
+    if (idx.ticker===-1 || idx.target===-1) return; // not a recognizable digest sheet
     const models = header.slice(idx.target+1).filter(Boolean);
     const modelColFor = (modelIdx) => idx.target + 1 + modelIdx;
     // Values are stored as fractions (0.6 with a "60.0%" display format) — ×100 to get plain percentages.
     const asPct = v => typeof v==="number" ? v*100 : 0;
 
-    // Category/Class cells are blank on ticker rows by design (clean look,
-    // matching the reference file) — track the most recent one seen while
-    // scanning top-to-bottom, resetting Class whenever a new Category starts.
     let currentCategory = null, currentClass = null;
     const categoryTotals = {}; // catName -> [val per model]
     const classTargets = {};   // catName -> { clsName -> targetPct }
@@ -1811,28 +1811,26 @@ function parseAcmDigestForReimport(buffer) {
 
     for (let r=2; r<raw.length; r++) {
       const row = raw[r]; if (!row) continue;
-      const cat = row[idx.category] ? row[idx.category].toString().trim() : "";
-      const cls = row[idx.cls] ? row[idx.cls].toString().trim() : "";
-      const ticker = row[idx.ticker] ? row[idx.ticker].toString().trim() : "";
+      const text = row[idx.ticker] ? row[idx.ticker].toString().trim() : "";
       const label = idx.label>=0 && row[idx.label] ? row[idx.label].toString().trim() : "";
       const target = asPct(row[idx.target]);
-      if (cat) { currentCategory = cat; currentClass = null; }
-      if (cls) currentClass = cls;
+      if (!text) continue;
 
-      if (!cls && !ticker) {
-        // Category summary row: pull each model's value as the true (unsmoothed) category total.
-        if (cat) categoryTotals[cat] = models.map((_,mi) => asPct(row[modelColFor(mi)]));
+      const isAllCaps = text === text.toUpperCase() && text !== text.toLowerCase();
+      if (isAllCaps && !label) {
+        // Category header row: pull each model's value as the true (unsmoothed) category total.
+        currentCategory = text; currentClass = null;
+        categoryTotals[text] = models.map((_,mi) => asPct(row[modelColFor(mi)]));
         continue;
       }
-      if (cls && !ticker) {
-        // Class summary row: Target % is that class's fixed share of its category.
+      if (!label) {
+        // Class header row: Target % is that class's fixed share of its category.
+        currentClass = text;
         classTargets[currentCategory] = classTargets[currentCategory] || {};
-        classTargets[currentCategory][cls] = target;
+        classTargets[currentCategory][text] = target;
         continue;
       }
-      if (ticker) {
-        tickers.push({ category: currentCategory, class: currentClass, ticker, label, targetPct: target });
-      }
+      tickers.push({ category: currentCategory, class: currentClass, ticker: text, label, targetPct: target });
     }
     families[sheetName] = { models, categoryTotals, classTargets, tickers };
   });
@@ -2031,10 +2029,11 @@ function AcmFlow({ onBack }) {
 
   if (stage === "categorize") {
     const categories = ["EQUITY","FIXED INCOME","ALTERNATIVES","CASH"];
+    const incomplete = categorized.filter(s => !s.ticker || !s.label);
     return (
       <div>
         <div style={{fontSize:13,color:"#374151",marginBottom:12}}>
-          Confirm or adjust each ticker's Category and Class before computing targets. Leave Class blank for tickers that roll up directly to their Category (typical for Fixed Income).
+          Confirm or adjust each ticker's Category and Class before computing targets. Leave Class blank for tickers that roll up directly to their Category (typical for Fixed Income). Every row needs both a Ticker and a Label — a blank Label would be misread as a Category/Class header.
         </div>
         <div style={{maxHeight:420,overflowY:"auto",border:"0.5px solid #e5e7eb",borderRadius:8}}>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
@@ -2047,14 +2046,18 @@ function AcmFlow({ onBack }) {
               </tr>
             </thead>
             <tbody>
-              {categorized.map((s,i)=>(
-                <tr key={i} style={{borderTop:"0.5px solid #f3f4f6",background:s.needsTicker?"#fffbeb":"transparent"}}>
+              {categorized.map((s,i)=>{
+                const rowIncomplete = !s.ticker || !s.label;
+                return (
+                <tr key={i} style={{borderTop:"0.5px solid #f3f4f6",background:rowIncomplete?"#fffbeb":"transparent"}}>
                   <td style={{padding:"6px 10px"}}>
-                    {s.needsTicker
-                      ? <input value={s.ticker} onChange={e=>updateCategorized(i,"ticker",e.target.value)} placeholder="ticker?" style={{width:70,border:"0.5px solid #fbbf24",borderRadius:4,padding:"3px 6px",fontSize:12}} />
-                      : <strong>{s.ticker}</strong>}
+                    <input value={s.ticker} onChange={e=>updateCategorized(i,"ticker",e.target.value)} placeholder="ticker?"
+                      style={{width:70,border:`0.5px solid ${s.ticker?"#d1d5db":"#fbbf24"}`,borderRadius:4,padding:"3px 6px",fontSize:12,fontWeight:s.needsTicker?400:700}} />
                   </td>
-                  <td style={{padding:"6px 10px",color:"#6b7280"}}>{s.label || "—"}</td>
+                  <td style={{padding:"6px 10px"}}>
+                    <input value={s.label} onChange={e=>updateCategorized(i,"label",e.target.value)} placeholder="label?"
+                      style={{width:150,border:`0.5px solid ${s.label?"#d1d5db":"#fbbf24"}`,borderRadius:4,padding:"3px 6px",fontSize:12,color:"#374151"}} />
+                  </td>
                   <td style={{padding:"6px 10px"}}>
                     <select value={s.category} onChange={e=>updateCategorized(i,"category",e.target.value)} style={{border:"0.5px solid #d1d5db",borderRadius:4,padding:"3px 6px",fontSize:12}}>
                       {categories.map(c=><option key={c} value={c}>{c}</option>)}
@@ -2064,13 +2067,20 @@ function AcmFlow({ onBack }) {
                     <input value={s.class||""} onChange={e=>updateCategorized(i,"class",e.target.value||null)} placeholder="(direct)" style={{width:130,border:"0.5px solid #d1d5db",borderRadius:4,padding:"3px 6px",fontSize:12}} />
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
+        {incomplete.length>0 && (
+          <div style={{marginTop:10,background:"#fffbeb",border:"0.5px solid #fbbf24",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#92400e"}}>
+            {incomplete.length} row{incomplete.length!==1?"s":""} still need{incomplete.length===1?"s":""} a Ticker and/or Label (highlighted above) before you can export.
+          </div>
+        )}
         <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
           <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-          <button onClick={computeAndExport} disabled={exporting} style={{background:exporting?"#c4b5fd":"#7c3aed",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:exporting?"default":"pointer"}}>
+          <button onClick={computeAndExport} disabled={exporting || incomplete.length>0}
+            style={{background:(exporting||incomplete.length>0)?"#c4b5fd":"#7c3aed",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:(exporting||incomplete.length>0)?"default":"pointer"}}>
             {exporting ? "Computing & exporting…" : "Compute targets & export digest ↓"}
           </button>
         </div>
