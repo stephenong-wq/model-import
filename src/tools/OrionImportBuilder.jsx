@@ -1650,101 +1650,119 @@ const ACM_STYLE = {
   black: "FF000000", white: "FFFFFFFF", categoryFill: "FF8F7E57", classFill: "FFC7BDA1",
 };
 
+// Writes one sheet's worth of rows (Category/Class/Ticker/Label + a value per
+// model) with the reference file's visual scheme: black header bar, brown
+// category rows, tan class rows, thin ticker borders. Category/Class cells
+// are left blank on ticker rows (relying on the colored bars above for
+// grouping, not repeated text) — merged across A:B on category/class summary
+// rows so it reads cleanly instead of looking staggered.
+function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extraCol) {
+  const ws = wb.addWorksheet(sheetName.slice(0,31).replace(/[\\/*?:[\]]/g,""));
+  const fixedCols = ["Category","Class","Ticker","Label", ...(extraCol?[extraCol]:[])];
+  const totalCols = fixedCols.length + models.length;
+
+  ws.mergeCells(1,1,1,totalCols);
+  const titleCell = ws.getCell(1,1);
+  titleCell.value = title;
+  titleCell.font = { name:"Arial", size:14, bold:true, color:{argb:ACM_STYLE.white} };
+  titleCell.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.black} };
+  titleCell.alignment = { horizontal:"left", vertical:"middle" };
+  ws.getRow(1).height = 22;
+
+  const headerRowIdx = 2;
+  [...fixedCols, ...models].forEach((h, ci) => {
+    const cell = ws.getCell(headerRowIdx, ci+1);
+    cell.value = h;
+    cell.font = { name:"Arial", size:10, bold:true, color:{argb:ACM_STYLE.white} };
+    cell.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.black} };
+    cell.alignment = { horizontal:"center", vertical:"middle" };
+  });
+  ws.getRow(headerRowIdx).height = 20;
+
+  const modelColStart = fixedCols.length + 1;
+  const pctCell = (r,c,val) => { const cell = ws.getCell(r,c); cell.value = val; cell.numFmt = "0.0%"; cell.alignment = { horizontal:"center" }; };
+  const fillRow = (r, argb) => { for (let c=1;c<=totalCols;c++) ws.getCell(r,c).fill = { type:"pattern", pattern:"solid", fgColor:{argb} }; };
+
+  let r = headerRowIdx + 1;
+  categories.forEach(cat => {
+    fillRow(r, ACM_STYLE.categoryFill);
+    ws.mergeCells(r,1,r,2);
+    const catCell = ws.getCell(r,1);
+    catCell.value = cat.name;
+    catCell.font = { name:"Arial", size:12, bold:true, color:{argb:ACM_STYLE.white} };
+    models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"category", cat, mi })));
+    r++;
+
+    cat.classes.forEach(cls => {
+      if (!cls.isDirect) {
+        fillRow(r, ACM_STYLE.classFill);
+        const clsCell = ws.getCell(r,2);
+        clsCell.value = cls.name;
+        clsCell.font = { name:"Arial", size:10, bold:true, color:{argb:"FF000000"} };
+        if (extraCol) pctCell(r, modelColStart-1, cls.targetPct/100);
+        models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"class", cat, cls, mi })));
+        r++;
+      }
+      cls.tickers.forEach(t => {
+        // Category/Class cells intentionally blank here — the colored bars
+        // above already convey grouping; repeating the text looked staggered.
+        const tickerCell = ws.getCell(r,3);
+        tickerCell.value = t.ticker;
+        tickerCell.alignment = { horizontal:"center" };
+        tickerCell.border = { top:{style:"thin"}, bottom:{style:"thin"}, left:{style:"thin"}, right:{style:"thin"} };
+        ws.getCell(r,4).value = t.label;
+        if (extraCol) pctCell(r, modelColStart-1, t.targetPct/100);
+        models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"ticker", cat, cls, t, mi })));
+        r++;
+      });
+    });
+  });
+
+  ws.getColumn(1).width = 14; ws.getColumn(2).width = 20; ws.getColumn(3).width = 10; ws.getColumn(4).width = 26;
+  if (extraCol) ws.getColumn(5).width = 11;
+  for (let mi=0; mi<models.length; mi++) ws.getColumn(modelColStart+mi).width = 13;
+  ws.views = [{ state:"frozen", xSplit: extraCol?5:4, ySplit:headerRowIdx }];
+  return ws;
+}
+
 async function downloadAcmDigest(familyTrees, advisorName) {
   const ExcelJS = (await import("exceljs")).default;
   const wb = new ExcelJS.Workbook();
 
   Object.entries(familyTrees).forEach(([fam, tree]) => {
     const displayName = acmFamilyDisplayName(fam, advisorName);
-    const ws = wb.addWorksheet(displayName.slice(0,31).replace(/[\\/*?:[\]]/g,""));
     const { models, categories } = tree;
-    const fixedCols = ["Category","Class","Ticker","Label","Target %"];
-    const modelHeaders = models.flatMap(m => [`${m} — Current %`, `${m} — Suggested %`, `${m} — Diff (pp)`]);
-    const totalCols = fixedCols.length + modelHeaders.length;
 
-    ws.mergeCells(1,1,1,totalCols);
-    const title = ws.getCell(1,1);
-    title.value = displayName;
-    title.font = { name:"Arial", size:14, bold:true, color:{argb:ACM_STYLE.white} };
-    title.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.black} };
-    title.alignment = { horizontal:"left", vertical:"middle" };
-    ws.getRow(1).height = 22;
+    // Current tab — raw allocations + the editable Target % column (this is
+    // what the advisor edits; re-import reads Target % from here).
+    acmWriteSheet(wb, displayName, displayName, models, categories, ({level, cat, cls, t, mi}) => {
+      if (level==="category") return cat.totals[mi]/100;
+      if (level==="class") return cat.totals[mi]>1e-9 ? cls.totals[mi]/cat.totals[mi] : 0;
+      return t.currentByModel[mi]/100;
+    }, "Target %");
 
-    const headerRowIdx = 2;
-    [...fixedCols, ...modelHeaders].forEach((h, ci) => {
-      const cell = ws.getCell(headerRowIdx, ci+1);
-      cell.value = h;
-      cell.font = { name:"Arial", size:10, bold:true, color:{argb:ACM_STYLE.white} };
-      cell.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.black} };
-      cell.alignment = { horizontal:"center", vertical:"middle" };
-    });
-    ws.getRow(headerRowIdx).height = 20;
-
-    const modelColStart = fixedCols.length + 1;
-    const pctCell = (r,c,val) => { const cell = ws.getCell(r,c); cell.value = val; cell.numFmt = "0.0%"; cell.alignment = { horizontal:"center" }; return cell; };
-    const fillRow = (r, argb) => { for (let c=1;c<=totalCols;c++) ws.getCell(r,c).fill = { type:"pattern", pattern:"solid", fgColor:{argb} }; };
-
-    let r = headerRowIdx + 1;
-    categories.forEach(cat => {
-      fillRow(r, ACM_STYLE.categoryFill);
-      const catCell = ws.getCell(r,1);
-      catCell.value = cat.name;
-      catCell.font = { name:"Arial", size:12, bold:true, color:{argb:ACM_STYLE.white} };
-      models.forEach((m,mi) => {
-        const base = modelColStart + mi*3;
-        pctCell(r, base, cat.totals[mi]/100);
-        pctCell(r, base+1, cat.totals[mi]/100);
-        pctCell(r, base+2, 0);
-      });
-      r++;
-
-      cat.classes.forEach(cls => {
-        if (!cls.isDirect) {
-          fillRow(r, ACM_STYLE.classFill);
-          const clsCell = ws.getCell(r,2);
-          clsCell.value = cls.name;
-          clsCell.font = { name:"Arial", size:10, bold:true, color:{argb:"FF000000"} };
-          pctCell(r, 5, cls.targetPct/100);
-          models.forEach((m,mi) => {
-            const base = modelColStart + mi*3;
-            const current = cat.totals[mi]>1e-9 ? cls.totals[mi]/cat.totals[mi] : 0;
-            const suggested = cat.totals[mi] * (cls.targetPct/100) / 100;
-            pctCell(r, base, current);
-            pctCell(r, base+1, suggested);
-            pctCell(r, base+2, suggested - cls.totals[mi]/100);
-          });
-          r++;
-        }
-        const parentTotals = cls.isDirect ? cat.totals : cls.totals;
-        cls.tickers.forEach(t => {
-          if (cls.isDirect) ws.getCell(r,1).value = cat.name;
-          else ws.getCell(r,2).value = cls.name;
-          const tickerCell = ws.getCell(r,3);
-          tickerCell.value = t.ticker;
-          tickerCell.alignment = { horizontal:"center" };
-          tickerCell.border = { top:{style:"thin"}, bottom:{style:"thin"}, left:{style:"thin"}, right:{style:"thin"} };
-          ws.getCell(r,4).value = t.label;
-          pctCell(r, 5, t.targetPct/100);
-          models.forEach((m,mi) => {
-            const base = modelColStart + mi*3;
-            const current = t.currentByModel[mi]/100;
-            const suggested = parentTotals[mi] * (t.targetPct/100) / 100;
-            pctCell(r, base, current);
-            pctCell(r, base+1, suggested);
-            pctCell(r, base+2, suggested - current);
-          });
-          r++;
-        });
-      });
+    // Suggested tab — derived from Target % × the category's actual raw weight.
+    acmWriteSheet(wb, `${displayName} (Suggested)`, `${displayName} — Suggested`, models, categories, ({level, cat, cls, t, mi}) => {
+      if (level==="category") return cat.totals[mi]/100;
+      if (level==="class") return cat.totals[mi] * (cls.targetPct/100) / 100;
+      const parentTotals = cls.isDirect ? cat.totals : cls.totals;
+      return parentTotals[mi] * (t.targetPct/100) / 100;
     });
 
-    ws.getColumn(1).width = 16; ws.getColumn(2).width = 20; ws.getColumn(3).width = 10; ws.getColumn(4).width = 26; ws.getColumn(5).width = 11;
-    for (let mi=0; mi<models.length; mi++) {
-      ws.getColumn(modelColStart+mi*3).width = 13;
-      ws.getColumn(modelColStart+mi*3+1).width = 13;
-      ws.getColumn(modelColStart+mi*3+2).width = 12;
-    }
-    ws.views = [{ state:"frozen", xSplit:5, ySplit:headerRowIdx }];
+    // Difference tab — Suggested minus Current, so the advisor can see the
+    // magnitude of change at a glance without hunting across two tabs.
+    acmWriteSheet(wb, `${displayName} Difference`, `${displayName} — Difference (Suggested − Current)`, models, categories, ({level, cat, cls, t, mi}) => {
+      if (level==="category") return 0;
+      if (level==="class") {
+        const current = cat.totals[mi]>1e-9 ? cls.totals[mi]/cat.totals[mi] : 0;
+        const suggested = cat.totals[mi] * (cls.targetPct/100) / 100;
+        return suggested - current;
+      }
+      const parentTotals = cls.isDirect ? cat.totals : cls.totals;
+      const current = t.currentByModel[mi]/100;
+      const suggested = parentTotals[mi] * (t.targetPct/100) / 100;
+      return suggested - current;
+    });
   });
 
   const buf = await wb.xlsx.writeBuffer();
@@ -1756,17 +1774,17 @@ async function downloadAcmDigest(familyTrees, advisorName) {
   URL.revokeObjectURL(url);
 }
 
-// Re-imports a (possibly advisor-edited) digest file. Reads three row kinds
-// per family sheet: Category summary rows (blank Class/Ticker — gives each
-// category's true per-model current %, since categories are never smoothed),
-// Class summary rows (Class present, blank Ticker — gives the class's fixed
-// Target %), and Ticker rows (gives each ticker's fixed Target %). The
-// Current/Suggested/Diff reference columns are ignored on re-import; only
-// Target % values (possibly advisor-edited) are read back.
+// Re-imports a (possibly advisor-edited) digest file. Reads the "Current"
+// tabs specifically (skips any "(Suggested)"/"Difference" tabs, which are
+// derived reference-only). Category/Class cells are blank on ticker rows by
+// design (matching the reference file's clean look), so this tracks the most
+// recent Category/Class seen while scanning top-to-bottom — the same
+// "inherit until changed" convention used elsewhere for this kind of sheet.
 function parseAcmDigestForReimport(buffer) {
   const wb = XLSX.read(buffer, { type:"array" });
   const families = {};
   wb.SheetNames.forEach(sheetName => {
+    if (/\(Suggested\)$/.test(sheetName) || / Difference$/.test(sheetName)) return; // reference-only tabs, skip
     const ws = wb.Sheets[sheetName];
     const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
     if (raw.length < 2) return;
@@ -1778,16 +1796,15 @@ function parseAcmDigestForReimport(buffer) {
       target: header.indexOf("Target %"),
     };
     if (idx.category===-1 || idx.target===-1) return; // not a recognizable digest sheet
-    const models = [];
-    for (let c=idx.target+1; c<header.length; c++) {
-      const m = header[c].match(/^(.*) — Current %$/);
-      if (m) models.push(m[1]);
-    }
-    const currentColFor = (modelIdx) => idx.target + 1 + modelIdx*3; // Current/Suggested/Diff triplet per model
+    const models = header.slice(idx.target+1).filter(Boolean);
+    const modelColFor = (modelIdx) => idx.target + 1 + modelIdx;
     // Values are stored as fractions (0.6 with a "60.0%" display format) — ×100 to get plain percentages.
     const asPct = v => typeof v==="number" ? v*100 : 0;
 
-    let currentCategory = null;
+    // Category/Class cells are blank on ticker rows by design (clean look,
+    // matching the reference file) — track the most recent one seen while
+    // scanning top-to-bottom, resetting Class whenever a new Category starts.
+    let currentCategory = null, currentClass = null;
     const categoryTotals = {}; // catName -> [val per model]
     const classTargets = {};   // catName -> { clsName -> targetPct }
     const tickers = [];        // { category, class, ticker, label, targetPct }
@@ -1799,11 +1816,12 @@ function parseAcmDigestForReimport(buffer) {
       const ticker = row[idx.ticker] ? row[idx.ticker].toString().trim() : "";
       const label = idx.label>=0 && row[idx.label] ? row[idx.label].toString().trim() : "";
       const target = asPct(row[idx.target]);
-      if (cat) currentCategory = cat;
+      if (cat) { currentCategory = cat; currentClass = null; }
+      if (cls) currentClass = cls;
 
       if (!cls && !ticker) {
-        // Category summary row: pull each model's Current % as the true (unsmoothed) category total.
-        if (cat) categoryTotals[cat] = models.map((_,mi) => asPct(row[currentColFor(mi)]));
+        // Category summary row: pull each model's value as the true (unsmoothed) category total.
+        if (cat) categoryTotals[cat] = models.map((_,mi) => asPct(row[modelColFor(mi)]));
         continue;
       }
       if (cls && !ticker) {
@@ -1813,7 +1831,7 @@ function parseAcmDigestForReimport(buffer) {
         continue;
       }
       if (ticker) {
-        tickers.push({ category: currentCategory, class: cls || null, ticker, label, targetPct: target });
+        tickers.push({ category: currentCategory, class: currentClass, ticker, label, targetPct: target });
       }
     }
     families[sheetName] = { models, categoryTotals, classTargets, tickers };
