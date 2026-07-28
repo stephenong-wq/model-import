@@ -1428,7 +1428,7 @@ function UpdateModelsFlow({ onBack }) {
 // pair. See engine notes inline — every rule here was verified against a
 // real advisor file (Fortify) before being generalized.
 
-const ACM_OUTLIER_Z = 2.5;
+const ACM_OUTLIER_Z = 2.4;
 const ACM_ROUNDING_FALLBACK_THRESHOLD = 0.024; // pp; above this, use 1% grid instead of 5%
 
 // Parses the standardized ACM import template: a header row with "Ticker",
