@@ -1432,11 +1432,12 @@ const ACM_OUTLIER_Z = 2.5;
 const ACM_ROUNDING_FALLBACK_THRESHOLD = 0.024; // pp; above this, use 1% grid instead of 5%
 
 // Parses the standardized ACM import template: a header row with "Ticker",
-// then N model columns (optionally in adjacent Reg/"X NQ" pairs — tax-status
-// variants can use different tickers entirely, e.g. munis only in NQ). Much
-// simpler than the old flexible advisor-file parser since this template is
-// pre-formatted by hand before upload — no labels, subtotals, or blank-ticker
-// rows to guess around; every row (including Cash) has a real ticker.
+// optional "Category"/"Class" columns (filled in directly, since that's now
+// the source of truth — no more guessing from a label or a remembered
+// lookup), then N model columns (optionally in adjacent Reg/"X NQ" pairs —
+// tax-status variants can use different tickers entirely, e.g. munis only
+// in NQ). No labels, subtotals, or blank-ticker rows to guess around; every
+// row (including Cash) has a real ticker.
 function parseAdvisorTemplate(buffer, sheetName) {
   const wb = XLSX.read(buffer, { type:"array" });
   const name = sheetName || wb.SheetNames[0];
@@ -1453,9 +1454,12 @@ function parseAdvisorTemplate(buffer, sheetName) {
   const headerRow = raw[headerIdx];
   const dataStart = headerIdx + 1;
 
+  const categoryCol = headerRow.findIndex(h => /^category$/i.test((h||"").toString().trim()));
+  const classCol = headerRow.findIndex(h => /^class$/i.test((h||"").toString().trim()));
+
   const modelCols = [];
   for (let i=0; i<headerRow.length; i++) {
-    if (i===tickerCol) continue;
+    if (i===tickerCol || i===categoryCol || i===classCol) continue;
     const h = headerRow[i];
     if (h===null || h===undefined || h==="") continue;
     modelCols.push({ i, h: h.toString().trim() });
@@ -1500,7 +1504,13 @@ function parseAdvisorTemplate(buffer, sheetName) {
       rawByFamily[fam] = {};
       cols.forEach(({model,col}) => { const v = row[col]; rawByFamily[fam][model] = typeof v==="number" ? v : 0; });
     }
-    securities.push({ ticker, raw:rawByFamily });
+    const categoryRaw = categoryCol>=0 && row[categoryCol] ? row[categoryCol].toString().trim() : "";
+    const classRaw = classCol>=0 && row[classCol] ? row[classCol].toString().trim() : "";
+    securities.push({
+      ticker, raw:rawByFamily,
+      category: categoryRaw ? categoryRaw.toUpperCase() : null,
+      class: classRaw || null,
+    });
   }
 
   const familyModelOrder = {};
@@ -1729,7 +1739,7 @@ async function downloadAcmTemplate() {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet("Template");
   const numPlaceholders = 16;
-  const totalCols = 2 + numPlaceholders; // Ticker + one example model + placeholders
+  const totalCols = 4 + numPlaceholders; // Ticker, Category, Class, one example model + placeholders
 
   ws.mergeCells(1,1,1,totalCols);
   const title = ws.getCell(1,1);
@@ -1739,15 +1749,17 @@ async function downloadAcmTemplate() {
   title.alignment = { horizontal:"left", vertical:"middle" };
   ws.getRow(1).height = 22;
 
-  const tickerHeader = ws.getCell(2,1);
-  tickerHeader.value = "TICKER";
-  tickerHeader.font = { name:"Arial", size:10, bold:true, color:{argb:ACM_STYLE.white} };
-  tickerHeader.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.categoryFill} };
-  tickerHeader.alignment = { horizontal:"center", vertical:"middle" };
+  ["TICKER","Category","Class"].forEach((h, i) => {
+    const cell = ws.getCell(2, i+1);
+    cell.value = h;
+    cell.font = { name:"Arial", size:10, bold:true, color:{argb:ACM_STYLE.white} };
+    cell.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.categoryFill} };
+    cell.alignment = { horizontal:"center", vertical:"middle" };
+  });
 
   const modelHeaders = ["STP - Moderate", ...Array(numPlaceholders).fill("ENTER MODEL")];
   modelHeaders.forEach((h, i) => {
-    const cell = ws.getCell(2, i+2);
+    const cell = ws.getCell(2, i+4);
     cell.value = h;
     cell.font = { name:"Arial", size:10, bold:true, color:{argb:"FF000000"} };
     cell.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.classFill} };
@@ -1755,17 +1767,19 @@ async function downloadAcmTemplate() {
   });
   ws.getRow(2).height = 20;
 
-  [["APPL",0.5],["IBIT",0.5]].forEach(([ticker,val], ri) => {
+  [["APPL","Equity","US Equity",0.5],["IBIT","Equity","US Equity",0.5]].forEach(([ticker,cat,cls,val], ri) => {
     const r = 3+ri;
     ws.getCell(r,1).value = ticker;
     ws.getCell(r,1).alignment = { horizontal:"center" };
     ws.getCell(r,1).border = { top:{style:"thin"}, bottom:{style:"thin"}, left:{style:"thin"}, right:{style:"thin"} };
-    ws.getCell(r,2).value = val;
+    ws.getCell(r,2).value = cat;
+    ws.getCell(r,3).value = cls;
+    ws.getCell(r,4).value = val;
   });
 
-  ws.getColumn(1).width = 10;
-  for (let i=0; i<modelHeaders.length; i++) ws.getColumn(i+2).width = 15;
-  ws.views = [{ state:"frozen", xSplit:1, ySplit:2 }];
+  ws.getColumn(1).width = 10; ws.getColumn(2).width = 14; ws.getColumn(3).width = 14;
+  for (let i=0; i<modelHeaders.length; i++) ws.getColumn(i+4).width = 15;
+  ws.views = [{ state:"frozen", xSplit:3, ySplit:2 }];
 
   const buf = await wb.xlsx.writeBuffer();
   const blob = new Blob([buf], { type:"application/octet-stream" });
@@ -2009,6 +2023,10 @@ function AcmFlow({ onBack }) {
         setParsed(result);
         const lookup = await loadTickerLookup();
         setCategorized(result.securities.map(s => {
+          // The template's own Category/Class (if filled in) is the source
+          // of truth; the remembered lookup only fills gaps for tickers the
+          // template left blank.
+          if (s.category) return { ...s, fromLookup: true };
           const known = lookup[s.ticker];
           return known
             ? { ...s, category: known.category, class: known.class ?? null, fromLookup: true }
@@ -2097,7 +2115,7 @@ function AcmFlow({ onBack }) {
     return (
       <div>
         <div style={{fontSize:13,color:"#374151",marginBottom:12}}>
-          Confirm or adjust each ticker's Category and Class before computing targets. Leave Class blank for tickers that roll up directly to their Category (typical for Fixed Income). Tickers already seen before are pre-filled from memory — new ones are highlighted below and only need categorizing once, ever.
+          Category and Class are read directly from the template if you filled them in. Anything left blank falls back to what's been remembered from a past import — genuinely new tickers are highlighted below and only need categorizing once, ever.
         </div>
         <div style={{maxHeight:420,overflowY:"auto",border:"0.5px solid #e5e7eb",borderRadius:8}}>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
@@ -2130,7 +2148,7 @@ function AcmFlow({ onBack }) {
         </div>
         {newCount>0 && (
           <div style={{marginTop:10,background:"#fffbeb",border:"0.5px solid #fbbf24",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#92400e"}}>
-            {newCount} new ticker{newCount!==1?"s":""} not seen before — double-check the Category/Class assignment above (highlighted). They'll be remembered automatically after this.
+            {newCount} new ticker{newCount!==1?"s":""} — not filled in on the template and not remembered from before (highlighted). They'll be remembered automatically after this.
           </div>
         )}
         <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
