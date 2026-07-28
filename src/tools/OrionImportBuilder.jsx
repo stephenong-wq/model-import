@@ -2141,17 +2141,6 @@ export default function OrionImportBuilder() {
       {/* ── Mode selection ── */}
       {mode===null && (
         <div style={{display:"flex",gap:16}}>
-          <div onClick={()=>setMode("import")}
-            style={{flex:1,border:"0.5px solid #e5e7eb",borderRadius:12,padding:"28px 20px",cursor:"pointer",background:"#fff",transition:"all 0.15s"}}
-            onMouseEnter={e=>e.currentTarget.style.borderColor="#1a56db"} onMouseLeave={e=>e.currentTarget.style.borderColor="#e5e7eb"}>
-            <div style={{width:36,height:36,borderRadius:9,background:"#eff6ff",display:"flex",alignItems:"center",justifyContent:"center",marginBottom:14}}>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1a56db" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
-              </svg>
-            </div>
-            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Build new import file</div>
-            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload an Orion export, edit targets and bands on an interactive tree, and export a ready-to-import .xlsx.</div>
-          </div>
           <div onClick={()=>setMode("update")}
             style={{flex:1,border:"0.5px solid #e5e7eb",borderRadius:12,padding:"28px 20px",cursor:"pointer",background:"#fff",transition:"all 0.15s"}}
             onMouseEnter={e=>e.currentTarget.style.borderColor="#0aa89c"} onMouseLeave={e=>e.currentTarget.style.borderColor="#e5e7eb"}>
@@ -2169,7 +2158,7 @@ export default function OrionImportBuilder() {
             onMouseEnter={e=>e.currentTarget.style.borderColor="#7c3aed"} onMouseLeave={e=>e.currentTarget.style.borderColor="#e5e7eb"}>
             <div style={{width:36,height:36,borderRadius:9,background:"#f5f3ff",display:"flex",alignItems:"center",justifyContent:"center",marginBottom:14}}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M3 3v18h18"/><path d="M18.7 8a5 5 0 0 0-9.4 2 5 5 0 0 0 4 8.9"/><circle cx="18" cy="18" r="3"/>
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
               </svg>
             </div>
             <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Build Advisor Custom Model</div>
