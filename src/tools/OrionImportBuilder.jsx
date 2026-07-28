@@ -1568,14 +1568,14 @@ function acmRoundAndReconcile(fractions, inc) {
   return result.map(v=>+v.toFixed(4));
 }
 function computeProportionalTargets(siblingRawArrays) {
-  if (siblingRawArrays.length===1) return [1];
+  if (siblingRawArrays.length===1) return { targets:[1], avgs:[1] };
   const rawMeans = acmRawGroupMeans(siblingRawArrays);
   const sum = rawMeans.reduce((a,b)=>a+b,0);
   const normalized = sum>0 ? rawMeans.map(t=>t/sum) : rawMeans.map(()=>1/siblingRawArrays.length);
   const rounded5 = normalized.map(f => Math.round(f/0.05)*0.05);
   const maxDeviation = Math.max(...normalized.map((f,i)=>Math.abs(f-rounded5[i])));
   const increment = maxDeviation > ACM_ROUNDING_FALLBACK_THRESHOLD ? 0.01 : 0.05;
-  return acmRoundAndReconcile(normalized, increment);
+  return { targets: acmRoundAndReconcile(normalized, increment), avgs: normalized };
 }
 
 // Builds the per-family Category > Class > Ticker tree with current (raw)
@@ -1583,7 +1583,8 @@ function computeProportionalTargets(siblingRawArrays) {
 // smoothed (they're the model's true risk-profile definition); Class and
 // Ticker levels get smoothed only when they have 2+ siblings under the same
 // parent — a single child just inherits 100% of its parent, no smoothing
-// possible or needed.
+// possible or needed. avgPct is the raw computed average *before* rounding —
+// kept alongside targetPct so it's visible for troubleshooting.
 function buildAcmFamilyTree(categorizedSecurities, models) {
   const byCategory = {};
   categorizedSecurities.forEach(s => {
@@ -1599,28 +1600,30 @@ function buildAcmFamilyTree(categorizedSecurities, models) {
     const catTotals = models.map((m) => allSecs.reduce((s,sec)=>s+(sec.raw[m]||0),0));
 
     const classNames = Object.keys(classes);
-    let classTargets = classNames.map(()=>1);
+    let classTargets = classNames.map(()=>1), classAvgs = classNames.map(()=>1);
     if (classNames.length>1 && classNames[0]!=="__direct__") {
       const classArrays = classNames.map(cn => models.map(m => classes[cn].reduce((s,sec)=>s+(sec.raw[m]||0),0)));
-      classTargets = computeProportionalTargets(classArrays);
+      ({ targets: classTargets, avgs: classAvgs } = computeProportionalTargets(classArrays));
     }
 
     const classNodes = classNames.map((cn, ci) => {
       const secs = classes[cn];
       const classTotals = models.map(m => secs.reduce((s,sec)=>s+(sec.raw[m]||0),0));
-      let tickerTargets = secs.map(()=>1);
+      let tickerTargets = secs.map(()=>1), tickerAvgs = secs.map(()=>1);
       if (secs.length>1) {
         const arrays = secs.map(s => models.map(m => s.raw[m]||0));
-        tickerTargets = computeProportionalTargets(arrays);
+        ({ targets: tickerTargets, avgs: tickerAvgs } = computeProportionalTargets(arrays));
       }
       return {
         name: cn==="__direct__" ? catName : cn,
         isDirect: cn==="__direct__",
         targetPct: classTargets[ci]*100,
+        avgPct: classAvgs[ci]*100,
         totals: classTotals,
         tickers: secs.map((s,ti) => ({
           ticker: s.ticker,
           targetPct: tickerTargets[ti]*100,
+          avgPct: tickerAvgs[ti]*100,
           currentByModel: models.map(m => s.raw[m]||0),
         })),
       };
@@ -1660,21 +1663,27 @@ const ACM_STYLE = {
 // Single leftmost column serves double duty — a Category/Class header row's
 // name, or an actual ticker symbol — matching the reference file's layout
 // instead of separate columns that sit empty on every ticker row.
-function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extraCol) {
+function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extraCols) {
   const ws = wb.addWorksheet(sheetName.slice(0,31).replace(/[\\/*?:[\]]/g,""));
-  const fixedCols = ["Ticker", ...(extraCol?[extraCol]:[])];
-  const totalCols = fixedCols.length + models.length;
+  extraCols = extraCols || []; // [{header, getValue({level,cat,cls,t,mi})}] — placed after the model columns
+  const totalCols = 1 + models.length + extraCols.length;
 
-  ws.mergeCells(1,1,1,totalCols);
+  // Title bar: filled across the full width but NOT merged (unmerged cells
+  // sort/filter more predictably in Excel) — text sits in A1 only.
+  for (let c=1; c<=totalCols; c++) {
+    const cell = ws.getCell(1,c);
+    cell.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.black} };
+  }
   const titleCell = ws.getCell(1,1);
   titleCell.value = title;
   titleCell.font = { name:"Arial", size:14, bold:true, color:{argb:ACM_STYLE.white} };
-  titleCell.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.black} };
   titleCell.alignment = { horizontal:"left", vertical:"middle" };
   ws.getRow(1).height = 22;
 
   const headerRowIdx = 2;
-  [...fixedCols, ...models].forEach((h, ci) => {
+  const modelColStart = 2;
+  const extraColStart = modelColStart + models.length;
+  ["Ticker", ...models, ...extraCols.map(c=>c.header)].forEach((h, ci) => {
     const cell = ws.getCell(headerRowIdx, ci+1);
     cell.value = h;
     cell.font = { name:"Arial", size:10, bold:true, color:{argb:ACM_STYLE.white} };
@@ -1683,11 +1692,9 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
   });
   ws.getRow(headerRowIdx).height = 20;
 
-  const modelColStart = fixedCols.length + 1;
-  const targetCol = extraCol ? 2 : null;
   const pctCell = (r,c,val) => { const cell = ws.getCell(r,c); cell.value = val; cell.numFmt = "0.0%"; cell.alignment = { horizontal:"center" }; };
   const fillRow = (r, argb) => { for (let c=1;c<=totalCols;c++) ws.getCell(r,c).fill = { type:"pattern", pattern:"solid", fgColor:{argb} }; };
-  let colAMaxLen = "Ticker".length;
+  const writeExtras = (r, ctx) => extraCols.forEach((ec,i) => pctCell(r, extraColStart+i, ec.getValue(ctx)/100));
 
   let r = headerRowIdx + 1;
   categories.forEach(cat => {
@@ -1695,7 +1702,6 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
     const catCell = ws.getCell(r,1);
     catCell.value = cat.name;
     catCell.font = { name:"Arial", size:12, bold:true, color:{argb:ACM_STYLE.white} };
-    colAMaxLen = Math.max(colAMaxLen, cat.name.length);
     models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"category", cat, mi })));
     r++;
 
@@ -1705,9 +1711,8 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
         const clsCell = ws.getCell(r,1);
         clsCell.value = cls.name;
         clsCell.font = { name:"Arial", size:10, bold:true, color:{argb:"FF000000"} };
-        colAMaxLen = Math.max(colAMaxLen, cls.name.length);
-        if (targetCol) pctCell(r, targetCol, cls.targetPct/100);
         models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"class", cat, cls, mi })));
+        writeExtras(r, { level:"class", cat, cls });
         r++;
       }
       cls.tickers.forEach(t => {
@@ -1715,20 +1720,20 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
         tickerCell.value = t.ticker;
         tickerCell.alignment = { horizontal:"center" };
         tickerCell.border = { top:{style:"thin"}, bottom:{style:"thin"}, left:{style:"thin"}, right:{style:"thin"} };
-        colAMaxLen = Math.max(colAMaxLen, t.ticker.length);
-        if (targetCol) pctCell(r, targetCol, t.targetPct/100);
         models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"ticker", cat, cls, t, mi })));
+        writeExtras(r, { level:"ticker", cat, cls, t });
         r++;
       });
     });
   });
 
-  ws.getColumn(1).width = colAMaxLen + 3; // approximates Excel's "double-click to autofit"
-  if (extraCol) ws.getColumn(2).width = 11;
+  ws.getColumn(1).width = 10;
   for (let mi=0; mi<models.length; mi++) ws.getColumn(modelColStart+mi).width = 13;
-  ws.views = [{ state:"frozen", xSplit: extraCol?2:1, ySplit:headerRowIdx }];
+  for (let i=0; i<extraCols.length; i++) ws.getColumn(extraColStart+i).width = 11;
+  ws.views = [{ state:"frozen", xSplit:1, ySplit:headerRowIdx }];
   return ws;
 }
+
 
 // Generates the standard blank ACM import template (Step 1's expected shape)
 // — a starter file to hand to whoever reformats an advisor's raw data, with
@@ -1801,13 +1806,17 @@ async function downloadAcmDigest(familyTrees, advisorName) {
     // Current tab — every level (category/class/ticker) expressed as a %
     // of the WHOLE model, consistently, so a class's number visibly equals
     // the sum of its tickers' numbers, and a category's equals the sum of
-    // its classes'. Plus the editable Target % column (this is what the
-    // advisor edits; re-import reads Target % from here).
+    // its classes'. Plus Target % (editable — this is what re-import reads
+    // back) and Avg % (the raw computed average *before* rounding to a
+    // clean increment, kept alongside for troubleshooting).
     acmWriteSheet(wb, displayName, displayName, models, categories, ({level, cat, cls, t, mi}) => {
       if (level==="category") return cat.totals[mi]/100;
       if (level==="class") return cls.totals[mi]/100;
       return t.currentByModel[mi]/100;
-    }, "Target %");
+    }, [
+      { header:"Target %", getValue: ({level,cls,t}) => level==="ticker" ? t.targetPct : (cls ? cls.targetPct : null) },
+      { header:"Avg %", getValue: ({level,cls,t}) => level==="ticker" ? t.avgPct : (cls ? cls.avgPct : null) },
+    ]);
 
     // Suggested tab — cascades down from the category's actual (unsmoothed)
     // raw weight through each fixed Target % ratio, so every level still
@@ -1855,12 +1864,12 @@ function parseAcmDigestForReimport(buffer) {
     const ws = wb.Sheets[sheetName];
     const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
     if (raw.length < 2) return;
-    // Row 0 is the merged title bar; the actual column headers are row 1.
+    // Row 0 is the title bar; the actual column headers are row 1.
     const header = raw[1].map(h=>(h||"").toString());
     const idx = { ticker: header.indexOf("Ticker"), target: header.indexOf("Target %") };
     if (idx.ticker===-1 || idx.target===-1) return; // not a recognizable digest sheet
-    const models = header.slice(idx.target+1).filter(Boolean);
-    const modelColFor = (modelIdx) => idx.target + 1 + modelIdx;
+    const models = header.slice(idx.ticker+1, idx.target).filter(Boolean);
+    const modelColFor = (modelIdx) => idx.ticker + 1 + modelIdx;
     // Values are stored as fractions (0.6 with a "60.0%" display format) — ×100 to get plain percentages.
     const asPct = v => typeof v==="number" ? v*100 : 0;
     const fillOf = (r) => {
@@ -1960,11 +1969,11 @@ function buildAcmFinalExport(reimportedFamilies) {
           modelRows.push({
             "* Model Name": fullModelName,
             "Category SubModel Name": `${fullModelName} - ${catName}`,
-            "Category Target %": +catTotal.toFixed(2),
+            "Category Target %": +(catTotal/100).toFixed(4),
             "Class SubModel Name": `${fullModelName} - ${clsName}`,
-            "Class Target %": +clsTargetPct.toFixed(2),
+            "Class Target %": +(clsTargetPct/100).toFixed(4),
             "* Security Set SubModel Name": ssName,
-            "* Security Set Target %": 100,
+            "* Security Set Target %": 1,
             "* Dynamic": 0,
           });
 
@@ -1972,8 +1981,8 @@ function buildAcmFinalExport(reimportedFamilies) {
             const key = familyName+"|"+ssName+"|"+t.ticker;
             if (!ssRowsByKey.has(key) && t.targetPct > 0) {
               ssRowsByKey.set(key, {
-                "Name": ssName, "Symbol": t.ticker, "Allocation %": +t.targetPct.toFixed(2),
-                "Fix Band %": 50, "Dynamic": 0,
+                "Name": ssName, "Symbol": t.ticker, "Allocation %": +(t.targetPct/100).toFixed(4),
+                "Fix Band %": 0.5, "Dynamic": 0,
                 "Security Set Do Not TLH": "false", "Security Do Not TLH": "false",
                 "Buy Priority": "Default", "Sell Priority": "Default",
               });
