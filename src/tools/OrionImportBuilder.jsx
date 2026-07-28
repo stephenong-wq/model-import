@@ -1632,48 +1632,128 @@ function buildAcmFamilyTree(categorizedSecurities, models) {
 }
 
 // ── Digest export (Step 2): current + suggested + difference, one sheet per
-// family. "Target %" is the single editable source of truth per ticker/class
-// (a fixed proportional share); Current/Suggested/Diff per model are
-// reference columns computed FROM that share × the category's actual raw
-// weight for that model, so re-importing just needs the Category/Class/
-// Ticker/Target % columns.
-function acmDigestSheetRows(familyTree) {
-  const { models, categories } = familyTree;
-  const rows = [];
-  const header = ["Category","Class","Ticker","Label","Target %",
-    ...models.flatMap(m => [`${m} — Current %`, `${m} — Suggested %`, `${m} — Diff (pp)`])];
-  rows.push(header);
-
-  categories.forEach(cat => {
-    rows.push([cat.name, "", "", "", "", ...models.map((m,mi)=>[cat.totals[mi],cat.totals[mi],0]).flat()]);
-    cat.classes.forEach(cls => {
-      if (!cls.isDirect) {
-        const classCurrent = models.map((m,mi)=> cat.totals[mi]>1e-9 ? (cls.totals[mi]/cat.totals[mi])*100 : 0);
-        const classSuggested = models.map((m,mi)=> cat.totals[mi] * (cls.targetPct/100));
-        rows.push(["", cls.name, "", "", +cls.targetPct.toFixed(2),
-          ...models.map((m,mi)=>[+classCurrent[mi].toFixed(2), +classSuggested[mi].toFixed(2), +(classSuggested[mi]-cls.totals[mi]).toFixed(2)]).flat()]);
-      }
-      cls.tickers.forEach(t => {
-        const parentTotals = cls.isDirect ? cat.totals : cls.totals;
-        const current = models.map((m,mi)=> t.currentByModel[mi]);
-        const suggested = models.map((m,mi)=> parentTotals[mi] * (t.targetPct/100));
-        rows.push([cls.isDirect?cat.name:"", cls.isDirect?"":cls.name, t.ticker, t.label, +t.targetPct.toFixed(2),
-          ...models.map((m,mi)=>[+current[mi].toFixed(2), +suggested[mi].toFixed(2), +(suggested[mi]-current[mi]).toFixed(2)]).flat()]);
-      });
-    });
-  });
-  return rows;
+// family — styled to match the advisor's own reference workbook (black
+// header bars, brown category shading, tan class shading, thin borders,
+// percent formatting). "Target %" is the single editable source of truth
+// per ticker/class; Current/Suggested/Diff per model are reference columns
+// computed FROM that share × the category's actual raw weight for that
+// model, so re-importing just needs the Category/Class/Ticker/Target %
+// columns. Families are named after the advisor, not "Reg"/"NQ" internally
+// (e.g. "Fortify Wealth" / "Fortify Wealth (NQ)").
+function acmFamilyDisplayName(fam, advisorName) {
+  const base = advisorName || "Advisor";
+  if (/^nq$/i.test(fam)) return `${base} (NQ)`;
+  return base;
 }
 
-function downloadAcmDigest(familyTrees, advisorName) {
-  const wb = XLSX.utils.book_new();
+const ACM_STYLE = {
+  black: "FF000000", white: "FFFFFFFF", categoryFill: "FF8F7E57", classFill: "FFC7BDA1",
+};
+
+async function downloadAcmDigest(familyTrees, advisorName) {
+  const ExcelJS = (await import("exceljs")).default;
+  const wb = new ExcelJS.Workbook();
+
   Object.entries(familyTrees).forEach(([fam, tree]) => {
-    const rows = acmDigestSheetRows(tree);
-    const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws["!cols"] = rows[0].map(h => ({ wch: Math.max((h||"").toString().length+2, 12) }));
-    XLSX.utils.book_append_sheet(wb, ws, fam.slice(0,31));
+    const displayName = acmFamilyDisplayName(fam, advisorName);
+    const ws = wb.addWorksheet(displayName.slice(0,31).replace(/[\\/*?:[\]]/g,""));
+    const { models, categories } = tree;
+    const fixedCols = ["Category","Class","Ticker","Label","Target %"];
+    const modelHeaders = models.flatMap(m => [`${m} — Current %`, `${m} — Suggested %`, `${m} — Diff (pp)`]);
+    const totalCols = fixedCols.length + modelHeaders.length;
+
+    ws.mergeCells(1,1,1,totalCols);
+    const title = ws.getCell(1,1);
+    title.value = displayName;
+    title.font = { name:"Arial", size:14, bold:true, color:{argb:ACM_STYLE.white} };
+    title.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.black} };
+    title.alignment = { horizontal:"left", vertical:"middle" };
+    ws.getRow(1).height = 22;
+
+    const headerRowIdx = 2;
+    [...fixedCols, ...modelHeaders].forEach((h, ci) => {
+      const cell = ws.getCell(headerRowIdx, ci+1);
+      cell.value = h;
+      cell.font = { name:"Arial", size:10, bold:true, color:{argb:ACM_STYLE.white} };
+      cell.fill = { type:"pattern", pattern:"solid", fgColor:{argb:ACM_STYLE.black} };
+      cell.alignment = { horizontal:"center", vertical:"middle" };
+    });
+    ws.getRow(headerRowIdx).height = 20;
+
+    const modelColStart = fixedCols.length + 1;
+    const pctCell = (r,c,val) => { const cell = ws.getCell(r,c); cell.value = val; cell.numFmt = "0.0%"; cell.alignment = { horizontal:"center" }; return cell; };
+    const fillRow = (r, argb) => { for (let c=1;c<=totalCols;c++) ws.getCell(r,c).fill = { type:"pattern", pattern:"solid", fgColor:{argb} }; };
+
+    let r = headerRowIdx + 1;
+    categories.forEach(cat => {
+      fillRow(r, ACM_STYLE.categoryFill);
+      const catCell = ws.getCell(r,1);
+      catCell.value = cat.name;
+      catCell.font = { name:"Arial", size:12, bold:true, color:{argb:ACM_STYLE.white} };
+      models.forEach((m,mi) => {
+        const base = modelColStart + mi*3;
+        pctCell(r, base, cat.totals[mi]/100);
+        pctCell(r, base+1, cat.totals[mi]/100);
+        pctCell(r, base+2, 0);
+      });
+      r++;
+
+      cat.classes.forEach(cls => {
+        if (!cls.isDirect) {
+          fillRow(r, ACM_STYLE.classFill);
+          const clsCell = ws.getCell(r,2);
+          clsCell.value = cls.name;
+          clsCell.font = { name:"Arial", size:10, bold:true, color:{argb:"FF000000"} };
+          pctCell(r, 5, cls.targetPct/100);
+          models.forEach((m,mi) => {
+            const base = modelColStart + mi*3;
+            const current = cat.totals[mi]>1e-9 ? cls.totals[mi]/cat.totals[mi] : 0;
+            const suggested = cat.totals[mi] * (cls.targetPct/100) / 100;
+            pctCell(r, base, current);
+            pctCell(r, base+1, suggested);
+            pctCell(r, base+2, suggested - cls.totals[mi]/100);
+          });
+          r++;
+        }
+        const parentTotals = cls.isDirect ? cat.totals : cls.totals;
+        cls.tickers.forEach(t => {
+          if (cls.isDirect) ws.getCell(r,1).value = cat.name;
+          else ws.getCell(r,2).value = cls.name;
+          const tickerCell = ws.getCell(r,3);
+          tickerCell.value = t.ticker;
+          tickerCell.alignment = { horizontal:"center" };
+          tickerCell.border = { top:{style:"thin"}, bottom:{style:"thin"}, left:{style:"thin"}, right:{style:"thin"} };
+          ws.getCell(r,4).value = t.label;
+          pctCell(r, 5, t.targetPct/100);
+          models.forEach((m,mi) => {
+            const base = modelColStart + mi*3;
+            const current = t.currentByModel[mi]/100;
+            const suggested = parentTotals[mi] * (t.targetPct/100) / 100;
+            pctCell(r, base, current);
+            pctCell(r, base+1, suggested);
+            pctCell(r, base+2, suggested - current);
+          });
+          r++;
+        });
+      });
+    });
+
+    ws.getColumn(1).width = 16; ws.getColumn(2).width = 20; ws.getColumn(3).width = 10; ws.getColumn(4).width = 26; ws.getColumn(5).width = 11;
+    for (let mi=0; mi<models.length; mi++) {
+      ws.getColumn(modelColStart+mi*3).width = 13;
+      ws.getColumn(modelColStart+mi*3+1).width = 13;
+      ws.getColumn(modelColStart+mi*3+2).width = 12;
+    }
+    ws.views = [{ state:"frozen", xSplit:5, ySplit:headerRowIdx }];
   });
-  XLSX.writeFile(wb, `${advisorName || "Advisor"}_ACM_Digest.xlsx`);
+
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], { type:"application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `${advisorName || "Advisor"}_ACM_Digest.xlsx`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // Re-imports a (possibly advisor-edited) digest file. Reads three row kinds
@@ -1689,8 +1769,9 @@ function parseAcmDigestForReimport(buffer) {
   wb.SheetNames.forEach(sheetName => {
     const ws = wb.Sheets[sheetName];
     const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
-    if (!raw.length) return;
-    const header = raw[0].map(h=>(h||"").toString());
+    if (raw.length < 2) return;
+    // Row 0 is the merged title bar; the actual column headers are row 1.
+    const header = raw[1].map(h=>(h||"").toString());
     const idx = {
       category: header.indexOf("Category"), cls: header.indexOf("Class"),
       ticker: header.indexOf("Ticker"), label: header.indexOf("Label"),
@@ -1703,34 +1784,36 @@ function parseAcmDigestForReimport(buffer) {
       if (m) models.push(m[1]);
     }
     const currentColFor = (modelIdx) => idx.target + 1 + modelIdx*3; // Current/Suggested/Diff triplet per model
+    // Values are stored as fractions (0.6 with a "60.0%" display format) — ×100 to get plain percentages.
+    const asPct = v => typeof v==="number" ? v*100 : 0;
 
     let currentCategory = null;
     const categoryTotals = {}; // catName -> [val per model]
     const classTargets = {};   // catName -> { clsName -> targetPct }
     const tickers = [];        // { category, class, ticker, label, targetPct }
 
-    for (let r=1; r<raw.length; r++) {
+    for (let r=2; r<raw.length; r++) {
       const row = raw[r]; if (!row) continue;
       const cat = row[idx.category] ? row[idx.category].toString().trim() : "";
       const cls = row[idx.cls] ? row[idx.cls].toString().trim() : "";
       const ticker = row[idx.ticker] ? row[idx.ticker].toString().trim() : "";
       const label = idx.label>=0 && row[idx.label] ? row[idx.label].toString().trim() : "";
-      const target = row[idx.target];
+      const target = asPct(row[idx.target]);
       if (cat) currentCategory = cat;
 
       if (!cls && !ticker) {
         // Category summary row: pull each model's Current % as the true (unsmoothed) category total.
-        if (cat) categoryTotals[cat] = models.map((_,mi) => { const v = row[currentColFor(mi)]; return typeof v==="number" ? v : 0; });
+        if (cat) categoryTotals[cat] = models.map((_,mi) => asPct(row[currentColFor(mi)]));
         continue;
       }
       if (cls && !ticker) {
         // Class summary row: Target % is that class's fixed share of its category.
         classTargets[currentCategory] = classTargets[currentCategory] || {};
-        classTargets[currentCategory][cls] = typeof target==="number" ? target : 0;
+        classTargets[currentCategory][cls] = target;
         continue;
       }
       if (ticker) {
-        tickers.push({ category: currentCategory, class: cls || null, ticker, label, targetPct: typeof target==="number" ? target : 0 });
+        tickers.push({ category: currentCategory, class: cls || null, ticker, label, targetPct: target });
       }
     }
     families[sheetName] = { models, categoryTotals, classTargets, tickers };
@@ -1767,12 +1850,14 @@ const ACM_SS_TEMPLATE_COLS = [
   "Group Equivalence Type 3","Group Equivalent 3","Group Buy Priority 3","Group Sell Priority 3",
 ];
 
-function buildAcmFinalExport(reimportedFamilies, advisorName) {
+function buildAcmFinalExport(reimportedFamilies) {
   const modelRows = [];
   const ssRowsByKey = new Map(); // one Security Set row per (family, class, ticker) — shared across models
 
   Object.entries(reimportedFamilies).forEach(([familyName, { models, categoryTotals, classTargets, tickers }]) => {
-    const famSuffix = familyName.toLowerCase()==="reg" || familyName.toLowerCase()==="standard" ? "" : ` (${familyName})`;
+    // familyName is already the full display name from the digest's sheet tab
+    // (e.g. "Fortify Wealth" or "Fortify Wealth (NQ)") — used directly, no
+    // separate advisor-name/suffix logic needed.
 
     // Group tickers by Category > Class for iteration.
     const byCategory = {};
@@ -1784,14 +1869,14 @@ function buildAcmFinalExport(reimportedFamilies, advisorName) {
     });
 
     models.forEach((modelName, mi) => {
-      const fullModelName = `${advisorName || "Advisor"} - ${modelName}${famSuffix}`;
+      const fullModelName = `${familyName} - ${modelName}`;
       Object.entries(byCategory).forEach(([catName, classes]) => {
         const catTotal = (categoryTotals[catName] && categoryTotals[catName][mi]) || 0;
         Object.entries(classes).forEach(([clsKey, tks]) => {
           const isDirect = clsKey === "__direct__";
           const clsName = isDirect ? catName : clsKey;
           const clsTargetPct = isDirect ? 100 : ((classTargets[catName] && classTargets[catName][clsName]) ?? 0);
-          const ssName = `${advisorName || "Advisor"} - ${clsName}${famSuffix}`;
+          const ssName = `${familyName} - ${clsName}`;
 
           modelRows.push({
             "* Model Name": fullModelName,
@@ -1830,7 +1915,7 @@ function buildAcmFinalExport(reimportedFamilies, advisorName) {
 }
 
 function downloadAcmFinalExport(reimportedFamilies, advisorName) {
-  const { modelRows, ssRows } = buildAcmFinalExport(reimportedFamilies, advisorName);
+  const { modelRows, ssRows } = buildAcmFinalExport(reimportedFamilies);
   downloadXlsxWithHeaders(modelRows, TEMPLATE_COLS, `${advisorName||"Advisor"}_ACM_Models.xlsx`);
   downloadXlsxWithHeaders(ssRows, ACM_SS_TEMPLATE_COLS, `${advisorName||"Advisor"}_ACM_SecuritySets.xlsx`);
 }
@@ -1868,14 +1953,22 @@ function AcmFlow({ onBack }) {
     setCategorized(prev => prev.map((s,idx) => idx===i ? { ...s, [field]: value } : s));
   }
 
-  function proceedToDigest() {
+  const [exporting, setExporting] = useState(false);
+
+  async function computeAndExport() {
     const trees = {};
     Object.entries(parsed.familyModelOrder).forEach(([fam, models]) => {
       const famSecurities = categorized.map(s => ({ ...s, raw: s.raw[fam] }));
       trees[fam] = buildAcmFamilyTree(famSecurities, models);
     });
     setFamilyTrees(trees);
-    setStage("digest");
+    setExporting(true);
+    try {
+      await downloadAcmDigest(trees, advisorName);
+    } finally {
+      setExporting(false);
+    }
+    setStage("reimport");
   }
 
   function handleReimportFile(file) {
@@ -1959,44 +2052,9 @@ function AcmFlow({ onBack }) {
         </div>
         <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
           <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-          <button onClick={proceedToDigest} style={{background:"#7c3aed",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>Compute targets & continue →</button>
-        </div>
-      </div>
-    );
-  }
-
-  if (stage === "digest") {
-    return (
-      <div>
-        <div style={{fontSize:13,color:"#374151",marginBottom:16}}>
-          Targets computed for {Object.keys(familyTrees).length} model famil{Object.keys(familyTrees).length===1?"y":"ies"} ({Object.keys(familyTrees).join(", ")}). Export the digest below, send it to the advisor for review if needed, then come back and re-upload it (edited or not) to build the final import files.
-        </div>
-        {Object.entries(familyTrees).map(([fam, tree]) => (
-          <div key={fam} style={{border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:10,overflow:"hidden"}}>
-            <div style={{background:"#f9fafb",padding:"8px 12px",fontSize:12,fontWeight:700,borderBottom:"0.5px solid #e5e7eb"}}>{fam} — {tree.models.length} models</div>
-            {tree.categories.map(cat => (
-              <div key={cat.name} style={{padding:"8px 12px",fontSize:12,borderTop:"0.5px solid #f3f4f6"}}>
-                <strong>{cat.name}</strong>
-                {cat.classes.map(cls => (
-                  <div key={cls.name} style={{marginLeft:14,marginTop:4}}>
-                    {!cls.isDirect && <div style={{color:"#7c3aed",fontWeight:600}}>{cls.name}: {cls.targetPct.toFixed(0)}%</div>}
-                    {cls.tickers.map(t => (
-                      <div key={t.ticker} style={{marginLeft:cls.isDirect?0:14,color:"#374151"}}>
-                        {t.ticker} <span style={{color:"#9ca3af"}}>({t.label})</span>: <strong>{t.targetPct.toFixed(0)}%</strong>
-                      </div>
-                    ))}
-                  </div>
-                ))}
-              </div>
-            ))}
-          </div>
-        ))}
-        <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
-          <button onClick={()=>setStage("categorize")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-          <div style={{display:"flex",gap:8}}>
-            <button onClick={()=>downloadAcmDigest(familyTrees, advisorName)} style={{background:"#7c3aed",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>Export digest ↓</button>
-            <button onClick={()=>setStage("reimport")} style={{background:"none",border:"0.5px solid #7c3aed",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#7c3aed",cursor:"pointer"}}>Skip to re-import →</button>
-          </div>
+          <button onClick={computeAndExport} disabled={exporting} style={{background:exporting?"#c4b5fd":"#7c3aed",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:exporting?"default":"pointer"}}>
+            {exporting ? "Computing & exporting…" : "Compute targets & export digest ↓"}
+          </button>
         </div>
       </div>
     );
@@ -2017,11 +2075,14 @@ function AcmFlow({ onBack }) {
           </div>
         )}
         <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
-          <button onClick={()=>setStage("digest")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-          <button onClick={finalize} disabled={!reimportedFamilies}
-            style={{background:reimportedFamilies?"#7c3aed":"#c4b5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:reimportedFamilies?"pointer":"default"}}>
-            Export final Model + Security Set files ↓
-          </button>
+          <button onClick={()=>setStage("categorize")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={()=>downloadAcmDigest(familyTrees, advisorName)} style={{background:"none",border:"0.5px solid #7c3aed",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#7c3aed",cursor:"pointer"}}>Download digest again</button>
+            <button onClick={finalize} disabled={!reimportedFamilies}
+              style={{background:reimportedFamilies?"#7c3aed":"#c4b5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:reimportedFamilies?"pointer":"default"}}>
+              Export final Model + Security Set files ↓
+            </button>
+          </div>
         </div>
       </div>
     );
