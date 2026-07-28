@@ -1617,13 +1617,13 @@ function buildAcmFamilyTree(categorizedSecurities, models) {
       return {
         name: cn==="__direct__" ? catName : cn,
         isDirect: cn==="__direct__",
-        targetPct: classTargets[ci]*100,
-        avgPct: classAvgs[ci]*100,
+        targetPct: classTargets[ci],
+        avgPct: classAvgs[ci],
         totals: classTotals,
         tickers: secs.map((s,ti) => ({
           ticker: s.ticker,
-          targetPct: tickerTargets[ti]*100,
-          avgPct: tickerAvgs[ti]*100,
+          targetPct: tickerTargets[ti],
+          avgPct: tickerAvgs[ti],
           currentByModel: models.map(m => s.raw[m]||0),
         })),
       };
@@ -1694,7 +1694,7 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
 
   const pctCell = (r,c,val) => { const cell = ws.getCell(r,c); cell.value = val; cell.numFmt = "0.0%"; cell.alignment = { horizontal:"center" }; };
   const fillRow = (r, argb) => { for (let c=1;c<=totalCols;c++) ws.getCell(r,c).fill = { type:"pattern", pattern:"solid", fgColor:{argb} }; };
-  const writeExtras = (r, ctx) => extraCols.forEach((ec,i) => pctCell(r, extraColStart+i, ec.getValue(ctx)/100));
+  const writeExtras = (r, ctx) => extraCols.forEach((ec,i) => pctCell(r, extraColStart+i, ec.getValue(ctx)));
 
   let r = headerRowIdx + 1;
   categories.forEach(cat => {
@@ -1810,9 +1810,9 @@ async function downloadAcmDigest(familyTrees, advisorName) {
     // back) and Avg % (the raw computed average *before* rounding to a
     // clean increment, kept alongside for troubleshooting).
     acmWriteSheet(wb, displayName, displayName, models, categories, ({level, cat, cls, t, mi}) => {
-      if (level==="category") return cat.totals[mi]/100;
-      if (level==="class") return cls.totals[mi]/100;
-      return t.currentByModel[mi]/100;
+      if (level==="category") return cat.totals[mi];
+      if (level==="class") return cls.totals[mi];
+      return t.currentByModel[mi];
     }, [
       { header:"Target %", getValue: ({level,cls,t}) => level==="ticker" ? t.targetPct : (cls ? cls.targetPct : null) },
       { header:"Avg %", getValue: ({level,cls,t}) => level==="ticker" ? t.avgPct : (cls ? cls.avgPct : null) },
@@ -1823,22 +1823,22 @@ async function downloadAcmDigest(familyTrees, advisorName) {
     // sums correctly: tickers under a class sum to that class's suggested
     // %, classes under a category sum to the category's (unchanged) %.
     acmWriteSheet(wb, `${displayName} (Suggested)`, `${displayName} — Suggested`, models, categories, ({level, cat, cls, t, mi}) => {
-      const catPct = cat.totals[mi]/100;
+      const catPct = cat.totals[mi];
       if (level==="category") return catPct;
-      const clsPct = cls.isDirect ? catPct : catPct * (cls.targetPct/100);
+      const clsPct = cls.isDirect ? catPct : catPct * cls.targetPct;
       if (level==="class") return clsPct;
-      return clsPct * (t.targetPct/100);
+      return clsPct * t.targetPct;
     });
 
     // Difference tab — Suggested minus Current, so the advisor can see the
     // magnitude of change at a glance without hunting across two tabs.
     acmWriteSheet(wb, `${displayName} Difference`, `${displayName} — Difference (Suggested − Current)`, models, categories, ({level, cat, cls, t, mi}) => {
-      const catPct = cat.totals[mi]/100;
+      const catPct = cat.totals[mi];
       if (level==="category") return 0;
-      const clsSuggested = cls.isDirect ? catPct : catPct * (cls.targetPct/100);
-      if (level==="class") return clsSuggested - cls.totals[mi]/100;
-      const suggested = clsSuggested * (t.targetPct/100);
-      return suggested - t.currentByModel[mi]/100;
+      const clsSuggested = cls.isDirect ? catPct : catPct * cls.targetPct;
+      if (level==="class") return clsSuggested - cls.totals[mi];
+      const suggested = clsSuggested * t.targetPct;
+      return suggested - t.currentByModel[mi];
     });
   });
 
@@ -1871,7 +1871,8 @@ function parseAcmDigestForReimport(buffer) {
     const models = header.slice(idx.ticker+1, idx.target).filter(Boolean);
     const modelColFor = (modelIdx) => idx.ticker + 1 + modelIdx;
     // Values are stored as fractions (0.6 with a "60.0%" display format) — ×100 to get plain percentages.
-    const asPct = v => typeof v==="number" ? v*100 : 0;
+    // Digest cells already store native fractions (0.5 = 50%) — read as-is.
+    const asPct = v => typeof v==="number" ? v : 0;
     const fillOf = (r) => {
       const cell = ws[XLSX.utils.encode_cell({ r, c: idx.ticker })];
       return cell && cell.s && cell.s.fgColor ? cell.s.fgColor.rgb : null;
@@ -1963,15 +1964,15 @@ function buildAcmFinalExport(reimportedFamilies) {
         Object.entries(classes).forEach(([clsKey, tks]) => {
           const isDirect = clsKey === "__direct__";
           const clsName = isDirect ? catName : clsKey;
-          const clsTargetPct = isDirect ? 100 : ((classTargets[catName] && classTargets[catName][clsName]) ?? 0);
+          const clsTargetPct = isDirect ? 1 : ((classTargets[catName] && classTargets[catName][clsName]) ?? 0);
           const ssName = `${familyName} - ${clsName}`;
 
           modelRows.push({
             "* Model Name": fullModelName,
             "Category SubModel Name": `${fullModelName} - ${catName}`,
-            "Category Target %": +(catTotal/100).toFixed(4),
+            "Category Target %": +catTotal.toFixed(4),
             "Class SubModel Name": `${fullModelName} - ${clsName}`,
-            "Class Target %": +(clsTargetPct/100).toFixed(4),
+            "Class Target %": +clsTargetPct.toFixed(4),
             "* Security Set SubModel Name": ssName,
             "* Security Set Target %": 1,
             "* Dynamic": 0,
@@ -1981,7 +1982,7 @@ function buildAcmFinalExport(reimportedFamilies) {
             const key = familyName+"|"+ssName+"|"+t.ticker;
             if (!ssRowsByKey.has(key) && t.targetPct > 0) {
               ssRowsByKey.set(key, {
-                "Name": ssName, "Symbol": t.ticker, "Allocation %": +(t.targetPct/100).toFixed(4),
+                "Name": ssName, "Symbol": t.ticker, "Allocation %": +t.targetPct.toFixed(4),
                 "Fix Band %": 0.5, "Dynamic": 0,
                 "Security Set Do Not TLH": "false", "Security Do Not TLH": "false",
                 "Buy Priority": "Default", "Sell Priority": "Default",
@@ -2011,7 +2012,7 @@ function downloadAcmFinalExport(reimportedFamilies, advisorName) {
 // ── ACM UI ───────────────────────────────────────────────────────────────────
 
 function AcmFlow({ onBack }) {
-  const [stage, setStage] = useState("upload"); // upload | categorize | digest | reimport | done
+  const [stage, setStage] = useState("upload"); // upload (parses, categorizes, computes, exports) | reimport | done
   const [advisorName, setAdvisorName] = useState("");
   const [rawFile, setRawFile] = useState(null);
   const [parsed, setParsed] = useState(null); // {securities, familyModelOrder}
@@ -2020,6 +2021,8 @@ function AcmFlow({ onBack }) {
   const [familyTrees, setFamilyTrees] = useState(null);
   const [reimportedFamilies, setReimportedFamilies] = useState(null);
   const [reimportFile, setReimportFile] = useState(null);
+
+  const [exporting, setExporting] = useState(false);
 
   function handleRawFile(file) {
     if (!file) return;
@@ -2030,46 +2033,44 @@ function AcmFlow({ onBack }) {
         const result = parseAdvisorTemplate(new Uint8Array(e.target.result));
         if (result.securities.length===0) throw new Error("No securities found — check that the sheet has a Ticker column.");
         setParsed(result);
+
         const lookup = await loadTickerLookup();
-        setCategorized(result.securities.map(s => {
+        const merged = result.securities.map(s => {
           // The template's own Category/Class (if filled in) is the source
           // of truth; the remembered lookup only fills gaps for tickers the
           // template left blank.
-          if (s.category) return { ...s, fromLookup: true };
+          if (s.category) return s;
           const known = lookup[s.ticker];
-          return known
-            ? { ...s, category: known.category, class: known.class ?? null, fromLookup: true }
-            : { ...s, category: "EQUITY", class: null, fromLookup: false };
-        }));
-        setStage("categorize");
+          return known ? { ...s, category: known.category, class: known.class ?? null } : s;
+        });
+        const missing = merged.filter(s => !s.category);
+        if (missing.length > 0) {
+          setCategorized(merged);
+          throw new Error(`${missing.length} ticker${missing.length!==1?"s":""} missing a Category (not filled in on the template, and not seen before): ${missing.map(s=>s.ticker).join(", ")}. Add Category/Class to the template and re-upload.`);
+        }
+        setCategorized(merged);
+
+        // Everything's categorized — go straight to compute + export, no
+        // review screen needed since Category/Class already came from the
+        // template itself.
+        const trees = {};
+        Object.entries(result.familyModelOrder).forEach(([fam, models]) => {
+          const famSecurities = merged.map(s => ({ ...s, raw: s.raw[fam] }));
+          trees[fam] = buildAcmFamilyTree(famSecurities, models);
+        });
+        setFamilyTrees(trees);
+        setExporting(true);
+        try {
+          merged.forEach(s => { lookup[s.ticker] = { category: s.category, class: s.class }; });
+          await saveTickerLookup(lookup);
+          await downloadAcmDigest(trees, advisorName);
+        } finally {
+          setExporting(false);
+        }
+        setStage("reimport");
       } catch (err) { setError(err.message); }
     };
     reader.readAsArrayBuffer(file);
-  }
-
-  function updateCategorized(i, field, value) {
-    setCategorized(prev => prev.map((s,idx) => idx===i ? { ...s, [field]: value } : s));
-  }
-
-  const [exporting, setExporting] = useState(false);
-
-  async function computeAndExport() {
-    const trees = {};
-    Object.entries(parsed.familyModelOrder).forEach(([fam, models]) => {
-      const famSecurities = categorized.map(s => ({ ...s, raw: s.raw[fam] }));
-      trees[fam] = buildAcmFamilyTree(famSecurities, models);
-    });
-    setFamilyTrees(trees);
-    setExporting(true);
-    try {
-      const lookup = await loadTickerLookup();
-      categorized.forEach(s => { lookup[s.ticker] = { category: s.category, class: s.class }; });
-      await saveTickerLookup(lookup);
-      await downloadAcmDigest(trees, advisorName);
-    } finally {
-      setExporting(false);
-    }
-    setStage("reimport");
   }
 
   function handleReimportFile(file) {
@@ -2105,67 +2106,15 @@ function AcmFlow({ onBack }) {
             Download template ↓
           </button>
         </div>
-        <FilePickBox hint="Ticker + model columns, reformatted from whatever the advisor sent (.xlsx)"
+        <FilePickBox hint="Ticker + Category/Class + model columns, reformatted from whatever the advisor sent (.xlsx)"
           file={rawFile} onFile={handleRawFile} accentColor="#7c3aed" />
+        {exporting && <div style={{marginTop:14,fontSize:13,color:"#7c3aed"}}>Computing targets & exporting digest…</div>}
         {error && <div style={{marginTop:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
         <div style={{marginTop:16,background:"#f5f3ff",border:"0.5px solid #ddd6fe",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#4c1d95",lineHeight:1.6}}>
-          Remembers every ticker's Category/Class after you confirm it once, so future imports (any advisor) auto-fill anything already seen — only new tickers need categorizing. Then computes a proportional target weight per group, excluding zero and statistically extreme models per your judgment call rather than strict stats.
+          Category/Class are read directly from the template — remembers any ticker's assignment after the first time, so future imports (any advisor) auto-fill anything already seen. Goes straight from upload to a computed, exported digest — no separate review step needed. Computes a proportional target weight per group, excluding zero and statistically extreme models per your judgment call rather than strict stats.
         </div>
         <div style={{marginTop:16}}>
           <button onClick={onBack} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-        </div>
-      </div>
-    );
-  }
-
-  if (stage === "categorize") {
-    const categories = ["EQUITY","FIXED INCOME","ALTERNATIVES","CASH"];
-    const newCount = categorized.filter(s => !s.fromLookup).length;
-    return (
-      <div>
-        <div style={{fontSize:13,color:"#374151",marginBottom:12}}>
-          Category and Class are read directly from the template if you filled them in. Anything left blank falls back to what's been remembered from a past import — genuinely new tickers are highlighted below and only need categorizing once, ever.
-        </div>
-        <div style={{maxHeight:420,overflowY:"auto",border:"0.5px solid #e5e7eb",borderRadius:8}}>
-          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-            <thead style={{position:"sticky",top:0,background:"#f9fafb"}}>
-              <tr>
-                <th style={{textAlign:"left",padding:"8px 10px"}}>Ticker</th>
-                <th style={{textAlign:"left",padding:"8px 10px"}}>Category</th>
-                <th style={{textAlign:"left",padding:"8px 10px"}}>Class (blank = direct)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {categorized.map((s,i)=>(
-                <tr key={i} style={{borderTop:"0.5px solid #f3f4f6",background:s.fromLookup?"transparent":"#fffbeb"}}>
-                  <td style={{padding:"6px 10px"}}>
-                    <strong>{s.ticker}</strong>
-                    {!s.fromLookup && <span style={{marginLeft:6,fontSize:9,fontWeight:700,color:"#b45309",background:"#fef3c7",borderRadius:4,padding:"1px 5px"}}>NEW</span>}
-                  </td>
-                  <td style={{padding:"6px 10px"}}>
-                    <select value={s.category} onChange={e=>updateCategorized(i,"category",e.target.value)} style={{border:"0.5px solid #d1d5db",borderRadius:4,padding:"3px 6px",fontSize:12}}>
-                      {categories.map(c=><option key={c} value={c}>{c}</option>)}
-                    </select>
-                  </td>
-                  <td style={{padding:"6px 10px"}}>
-                    <input value={s.class||""} onChange={e=>updateCategorized(i,"class",e.target.value||null)} placeholder="(direct)" style={{width:130,border:"0.5px solid #d1d5db",borderRadius:4,padding:"3px 6px",fontSize:12}} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        {newCount>0 && (
-          <div style={{marginTop:10,background:"#fffbeb",border:"0.5px solid #fbbf24",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#92400e"}}>
-            {newCount} new ticker{newCount!==1?"s":""} — not filled in on the template and not remembered from before (highlighted). They'll be remembered automatically after this.
-          </div>
-        )}
-        <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
-          <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-          <button onClick={computeAndExport} disabled={exporting}
-            style={{background:exporting?"#c4b5fd":"#7c3aed",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:exporting?"default":"pointer"}}>
-            {exporting ? "Computing & exporting…" : "Compute targets & export digest ↓"}
-          </button>
         </div>
       </div>
     );
@@ -2186,7 +2135,7 @@ function AcmFlow({ onBack }) {
           </div>
         )}
         <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
-          <button onClick={()=>setStage("categorize")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
+          <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
           <div style={{display:"flex",gap:8}}>
             <button onClick={()=>downloadAcmDigest(familyTrees, advisorName)} style={{background:"none",border:"0.5px solid #7c3aed",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#7c3aed",cursor:"pointer"}}>Download digest again</button>
             <button onClick={finalize} disabled={!reimportedFamilies}
