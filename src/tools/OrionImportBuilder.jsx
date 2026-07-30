@@ -2065,7 +2065,11 @@ function buildAcmFinalExport(reimportedFamilies) {
   // name) instead of each getting its own — this is exactly the point of a
   // shared Security Set: edit it once, every model that references it
   // updates together. Classes that genuinely differ (e.g. taxable vs. muni
-  // bond tickers) keep separate, family-specific Security Sets.
+  // bond tickers) keep separate, family-specific Security Sets. The Class
+  // (and, when every class in it is shared, the Category) SubModel Name
+  // follows the same shared/not-shared call, so the naming never implies a
+  // tax-status distinction that the underlying Security Set doesn't actually
+  // have.
   const classSignature = (catName, clsKey, tickers) => {
     const tks = tickers.filter(t => t.category===catName && (t.class||"__direct__")===clsKey);
     return tks.map(t => `${t.ticker}:${(+t.targetPct.toFixed(6))}`).sort().join(",");
@@ -2087,18 +2091,16 @@ function buildAcmFinalExport(reimportedFamilies) {
     });
   });
 
-  function ssNameFor(familyName, catName, clsKey, clsName, tickers) {
+  // Returns the shared base family name if 2+ families have this exact
+  // (Category, Class) composition, otherwise this family's own full name.
+  function sharedOrOwnFamilyName(familyName, catName, clsKey, tickers) {
     const sig = classSignature(catName, clsKey, tickers);
     const fullKey = `${catName}|${clsKey}|${sig}`;
     const sharingFamilies = sigToFamilies.get(fullKey);
-    // Only genuinely shared (2+ different families with this exact ticker+
-    // allocation composition) uses the stripped base name; otherwise this
-    // family's own name is kept as-is, suffix and all.
     if (sharingFamilies && sharingFamilies.size > 1) {
-      const canonicalFamily = [...sharingFamilies].sort()[0];
-      return `${acmBaseFamilyName(canonicalFamily)} - ${clsName}`;
+      return acmBaseFamilyName([...sharingFamilies].sort()[0]);
     }
-    return `${familyName} - ${clsName}`;
+    return familyName;
   }
 
   // ── Pass 2: build Model rows (Category/Class SubModel Names are
@@ -2121,18 +2123,31 @@ function buildAcmFinalExport(reimportedFamilies) {
       Object.entries(byCategory).forEach(([catName, classes]) => {
         const catTotal = (categoryTotals[catName] && categoryTotals[catName][mi]) || 0;
         const catDisplay = acmTitleCase(catName);
+        const classKeys = Object.keys(classes);
+        // Category is only shared (no family suffix) when EVERY class in it
+        // is independently shared too — a category with any genuinely
+        // family-specific class (like Fixed Income's differing bonds) keeps
+        // its own family-specific name.
+        const allClassesShared = classKeys.length>0 && classKeys.every(ck => {
+          const sig = classSignature(catName, ck, tickers);
+          const fam = sigToFamilies.get(`${catName}|${ck}|${sig}`);
+          return fam && fam.size > 1;
+        });
+        const categoryPrefix = allClassesShared ? acmBaseFamilyName(familyName) : familyName;
+
         Object.entries(classes).forEach(([clsKey, tks]) => {
           const isDirect = clsKey === "__direct__";
           const clsName = isDirect ? catName : clsKey;
           const clsDisplay = isDirect ? catDisplay : clsKey;
           const clsTargetPct = isDirect ? 1 : ((classTargets[catName] && classTargets[catName][clsName]) ?? 0);
-          const ssName = ssNameFor(familyName, catName, clsKey, clsName, tickers);
+          const classPrefix = sharedOrOwnFamilyName(familyName, catName, clsKey, tickers);
+          const ssName = `${classPrefix} - ${clsDisplay}`;
 
           modelRows.push({
             "* Model Name": fullModelName,
-            "Category SubModel Name": `${familyName} - ${catDisplay}`,
+            "Category SubModel Name": `${categoryPrefix} - ${catDisplay}`,
             "Category Target %": +catTotal.toFixed(4),
-            "Class SubModel Name": `${familyName} - ${clsDisplay}`,
+            "Class SubModel Name": `${classPrefix} - ${clsDisplay}`,
             "Class Target %": +clsTargetPct.toFixed(4),
             "* Security Set SubModel Name": ssName,
             "* Security Set Target %": 1,
