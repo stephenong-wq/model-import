@@ -1585,54 +1585,139 @@ function computeProportionalTargets(siblingRawArrays) {
 // parent — a single child just inherits 100% of its parent, no smoothing
 // possible or needed. avgPct is the raw computed average *before* rounding —
 // kept alongside targetPct so it's visible for troubleshooting.
-function buildAcmFamilyTree(categorizedSecurities, models) {
-  const byCategory = {};
-  categorizedSecurities.forEach(s => {
-    const cat = s.category || "UNCATEGORIZED";
-    const cls = s.class || "__direct__";
-    byCategory[cat] = byCategory[cat] || {};
-    byCategory[cat][cls] = byCategory[cat][cls] || [];
-    byCategory[cat][cls].push(s);
+//
+// Builds trees for ALL families at once (rather than one family in
+// isolation) so that Security Sets sharing the exact same ticker
+// composition across families (e.g. US Equity/International/Alternatives
+// usually hold identical funds regardless of tax status — only Fixed Income
+// commonly differs, e.g. munis-only in NQ) can pool their model data before
+// running the z-score/average computation. Small per-family sample sizes
+// (Reg's 9 models vs NQ's 8, say) were causing the exact same underlying
+// ratio to land on opposite sides of the outlier threshold depending only on
+// which family it was judged against — pooling gives one shared, more
+// statistically grounded answer instead, applied identically to every
+// family that has that same Security Set. Groups whose ticker composition
+// genuinely differs between families (different bond tickers, etc.) are
+// still computed independently per family, same as before.
+function buildAcmFamilyTrees(familyData) {
+  const famNames = Object.keys(familyData);
+  const tickerSig = secs => secs.map(s=>s.ticker).slice().sort().join("|");
+
+  const famGroups = {}; // famName -> { catName -> { clsKey -> [securities] } }
+  famNames.forEach(fam => {
+    const byCategory = {};
+    familyData[fam].securities.forEach(s => {
+      const cat = s.category || "UNCATEGORIZED";
+      const cls = s.class || "__direct__";
+      byCategory[cat] = byCategory[cat] || {};
+      byCategory[cat][cls] = byCategory[cat][cls] || [];
+      byCategory[cat][cls].push(s);
+    });
+    famGroups[fam] = byCategory;
   });
 
-  const categories = Object.entries(byCategory).map(([catName, classes]) => {
-    const allSecs = Object.values(classes).flat();
-    const catTotals = models.map((m) => allSecs.reduce((s,sec)=>s+(sec.raw[m]||0),0));
+  const allCatNames = new Set();
+  famNames.forEach(fam => Object.keys(famGroups[fam]).forEach(c=>allCatNames.add(c)));
 
-    const classNames = Object.keys(classes);
-    let classTargets = classNames.map(()=>1), classAvgs = classNames.map(()=>1);
-    if (classNames.length>1 && classNames[0]!=="__direct__") {
-      const classArrays = classNames.map(cn => models.map(m => classes[cn].reduce((s,sec)=>s+(sec.raw[m]||0),0)));
-      ({ targets: classTargets, avgs: classAvgs } = computeProportionalTargets(classArrays));
+  const trees = {};
+  famNames.forEach(fam => { trees[fam] = { models: familyData[fam].models, categories: [] }; });
+
+  allCatNames.forEach(catName => {
+    const famsWithCat = famNames.filter(f => famGroups[f][catName]);
+
+    // Class-level merge check: do all families with this category define
+    // the exact same set of class names?
+    const classNameSets = famsWithCat.map(f => Object.keys(famGroups[f][catName]).slice().sort().join("|"));
+    const classSetsMatch = famsWithCat.length>1 && classNameSets.every(s=>s===classNameSets[0]);
+    let classTargetsShared=null, classAvgsShared=null, classNamesOrdered=null;
+    if (classSetsMatch) {
+      classNamesOrdered = Object.keys(famGroups[famsWithCat[0]][catName]);
+      if (classNamesOrdered.length>1 && classNamesOrdered[0]!=="__direct__") {
+        const combinedArrays = classNamesOrdered.map(cn => {
+          let combined = [];
+          famsWithCat.forEach(f => {
+            const models = familyData[f].models;
+            const totals = models.map(m => famGroups[f][catName][cn].reduce((s,sec)=>s+(sec.raw[m]||0),0));
+            combined = combined.concat(totals);
+          });
+          return combined;
+        });
+        ({ targets: classTargetsShared, avgs: classAvgsShared } = computeProportionalTargets(combinedArrays));
+      }
     }
 
-    const classNodes = classNames.map((cn, ci) => {
-      const secs = classes[cn];
-      const classTotals = models.map(m => secs.reduce((s,sec)=>s+(sec.raw[m]||0),0));
-      let tickerTargets = secs.map(()=>1), tickerAvgs = secs.map(()=>1);
-      if (secs.length>1) {
-        const arrays = secs.map(s => models.map(m => s.raw[m]||0));
-        ({ targets: tickerTargets, avgs: tickerAvgs } = computeProportionalTargets(arrays));
-      }
-      return {
-        name: cn==="__direct__" ? catName : cn,
-        isDirect: cn==="__direct__",
-        targetPct: classTargets[ci],
-        avgPct: classAvgs[ci],
-        totals: classTotals,
-        tickers: secs.map((s,ti) => ({
-          ticker: s.ticker,
-          targetPct: tickerTargets[ti],
-          avgPct: tickerAvgs[ti],
-          currentByModel: models.map(m => s.raw[m]||0),
-        })),
-      };
-    });
+    famsWithCat.forEach(fam => {
+      const models = familyData[fam].models;
+      const classes = famGroups[fam][catName];
+      const classNames = Object.keys(classes);
+      const catTotals = models.map(m => Object.values(classes).flat().reduce((s,sec)=>s+(sec.raw[m]||0),0));
 
-    return { name: catName, totals: catTotals, classes: classNodes };
+      let classTargets, classAvgs;
+      if (classSetsMatch && classTargetsShared) {
+        classTargets = classTargetsShared; classAvgs = classAvgsShared;
+      } else if (classNames.length>1 && classNames[0]!=="__direct__") {
+        const classArrays = classNames.map(cn => models.map(m => classes[cn].reduce((s,sec)=>s+(sec.raw[m]||0),0)));
+        ({ targets: classTargets, avgs: classAvgs } = computeProportionalTargets(classArrays));
+      } else {
+        classTargets = classNames.map(()=>1); classAvgs = classNames.map(()=>1);
+      }
+
+      const classNodes = classNames.map((cn) => {
+        const classTargetIdx = (classSetsMatch && classTargetsShared) ? classNamesOrdered.indexOf(cn) : classNames.indexOf(cn);
+        const secs = classes[cn];
+        const classTotals = models.map(m => secs.reduce((s,sec)=>s+(sec.raw[m]||0),0));
+
+        // Ticker-level merge check: do all families that also have this
+        // exact class name share the exact same ticker set within it?
+        const famsWithThisClass = famsWithCat.filter(f => famGroups[f][catName][cn]);
+        const tickerSigs = famsWithThisClass.map(f => tickerSig(famGroups[f][catName][cn]));
+        const tickersMatch = famsWithThisClass.length>1 && tickerSigs.every(s=>s===tickerSigs[0]);
+
+        let tickerTargets, tickerAvgs, tickerNamesOrdered=null;
+        if (secs.length>1) {
+          if (tickersMatch) {
+            tickerNamesOrdered = famGroups[famsWithThisClass[0]][catName][cn].map(s=>s.ticker);
+            const combined = tickerNamesOrdered.map(()=>[]);
+            famsWithThisClass.forEach(f => {
+              const fModels = familyData[f].models;
+              const fSecs = famGroups[f][catName][cn];
+              tickerNamesOrdered.forEach((tname, ti) => {
+                const sec = fSecs.find(s=>s.ticker===tname);
+                combined[ti] = combined[ti].concat(fModels.map(m => sec.raw[m]||0));
+              });
+            });
+            ({ targets: tickerTargets, avgs: tickerAvgs } = computeProportionalTargets(combined));
+          } else {
+            const arrays = secs.map(s => models.map(m => s.raw[m]||0));
+            ({ targets: tickerTargets, avgs: tickerAvgs } = computeProportionalTargets(arrays));
+          }
+        } else {
+          tickerTargets = secs.map(()=>1); tickerAvgs = secs.map(()=>1);
+        }
+
+        return {
+          name: cn==="__direct__" ? catName : cn,
+          isDirect: cn==="__direct__",
+          targetPct: classTargets[classTargetIdx],
+          avgPct: classAvgs[classTargetIdx],
+          totals: classTotals,
+          tickers: secs.map((s,ti) => {
+            const tIdx = (tickersMatch && tickerNamesOrdered) ? tickerNamesOrdered.indexOf(s.ticker) : ti;
+            return {
+              ticker: s.ticker,
+              targetPct: tickerTargets[tIdx],
+              avgPct: tickerAvgs[tIdx],
+              currentByModel: models.map(m => s.raw[m]||0),
+            };
+          }),
+        };
+      });
+
+      trees[fam].categories.push({ name: catName, totals: catTotals, classes: classNodes });
+    });
   });
 
-  return { models, categories };
+  return trees;
 }
 
 // ── Digest export (Step 2): current + suggested + difference, one sheet per
@@ -2052,12 +2137,14 @@ function AcmFlow({ onBack }) {
 
         // Everything's categorized — go straight to compute + export, no
         // review screen needed since Category/Class already came from the
-        // template itself.
-        const trees = {};
+        // template itself. Build all families' trees together so Security
+        // Sets sharing identical tickers across families can pool their
+        // sample for the z-score/average computation.
+        const familyData = {};
         Object.entries(result.familyModelOrder).forEach(([fam, models]) => {
-          const famSecurities = merged.map(s => ({ ...s, raw: s.raw[fam] }));
-          trees[fam] = buildAcmFamilyTree(famSecurities, models);
+          familyData[fam] = { securities: merged.map(s => ({ ...s, raw: s.raw[fam] })), models };
         });
+        const trees = buildAcmFamilyTrees(familyData);
         setFamilyTrees(trees);
         setExporting(true);
         try {
