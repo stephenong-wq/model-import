@@ -1601,7 +1601,6 @@ function computeProportionalTargets(siblingRawArrays) {
 // still computed independently per family, same as before.
 function buildAcmFamilyTrees(familyData) {
   const famNames = Object.keys(familyData);
-  const tickerSig = secs => secs.map(s=>s.ticker).slice().sort().join("|");
 
   const famGroups = {}; // famName -> { catName -> { clsKey -> [securities] } }
   famNames.forEach(fam => {
@@ -1616,6 +1615,19 @@ function buildAcmFamilyTrees(familyData) {
     famGroups[fam] = byCategory;
   });
 
+  // A ticker/class present with 0% across every model in a family isn't
+  // really "in" that family — e.g. the template lists DFNM in both a Reg and
+  // NQ column pair, but if Reg's advisor never uses munis, DFNM is 0% there
+  // the whole way across. Treating it as a real (if small) sibling would
+  // both give it a nonsensical nonzero weight and falsely make the ticker
+  // set "look the same" across families for merge-eligibility purposes, so
+  // it's excluded from both — it just gets 0% directly, no averaging.
+  const secTotal = (fam, sec) => familyData[fam].models.reduce((s,m)=>s+(sec.raw[m]||0),0);
+  const isActiveSec = (fam, sec) => secTotal(fam, sec) > 1e-9;
+  const classTotal = (fam, catName, cn) => famGroups[fam][catName][cn].reduce((s,sec)=>s+secTotal(fam,sec),0);
+  const isActiveClass = (fam, catName, cn) => classTotal(fam, catName, cn) > 1e-9;
+  const tickerSig = (fam, secs) => secs.filter(s=>isActiveSec(fam,s)).map(s=>s.ticker).slice().sort().join("|");
+
   const allCatNames = new Set();
   famNames.forEach(fam => Object.keys(famGroups[fam]).forEach(c=>allCatNames.add(c)));
 
@@ -1626,12 +1638,13 @@ function buildAcmFamilyTrees(familyData) {
     const famsWithCat = famNames.filter(f => famGroups[f][catName]);
 
     // Class-level merge check: do all families with this category define
-    // the exact same set of class names?
-    const classNameSets = famsWithCat.map(f => Object.keys(famGroups[f][catName]).slice().sort().join("|"));
-    const classSetsMatch = famsWithCat.length>1 && classNameSets.every(s=>s===classNameSets[0]);
+    // the exact same set of ACTIVE (nonzero) class names?
+    const activeClassNameSets = famsWithCat.map(f =>
+      Object.keys(famGroups[f][catName]).filter(cn=>isActiveClass(f,catName,cn)).slice().sort().join("|"));
+    const classSetsMatch = famsWithCat.length>1 && activeClassNameSets.every(s=>s===activeClassNameSets[0]) && activeClassNameSets[0]!=="";
     let classTargetsShared=null, classAvgsShared=null, classNamesOrdered=null;
     if (classSetsMatch) {
-      classNamesOrdered = Object.keys(famGroups[famsWithCat[0]][catName]);
+      classNamesOrdered = Object.keys(famGroups[famsWithCat[0]][catName]).filter(cn=>isActiveClass(famsWithCat[0],catName,cn));
       if (classNamesOrdered.length>1 && classNamesOrdered[0]!=="__direct__") {
         const combinedArrays = classNamesOrdered.map(cn => {
           let combined = [];
@@ -1649,60 +1662,66 @@ function buildAcmFamilyTrees(familyData) {
     famsWithCat.forEach(fam => {
       const models = familyData[fam].models;
       const classes = famGroups[fam][catName];
-      const classNames = Object.keys(classes);
+      const allClassNames = Object.keys(classes);
+      const activeClassNames = allClassNames.filter(cn=>isActiveClass(fam,catName,cn));
       const catTotals = models.map(m => Object.values(classes).flat().reduce((s,sec)=>s+(sec.raw[m]||0),0));
 
       let classTargets, classAvgs;
       if (classSetsMatch && classTargetsShared) {
         classTargets = classTargetsShared; classAvgs = classAvgsShared;
-      } else if (classNames.length>1 && classNames[0]!=="__direct__") {
-        const classArrays = classNames.map(cn => models.map(m => classes[cn].reduce((s,sec)=>s+(sec.raw[m]||0),0)));
+      } else if (activeClassNames.length>1 && activeClassNames[0]!=="__direct__") {
+        const classArrays = activeClassNames.map(cn => models.map(m => classes[cn].reduce((s,sec)=>s+(sec.raw[m]||0),0)));
         ({ targets: classTargets, avgs: classAvgs } = computeProportionalTargets(classArrays));
       } else {
-        classTargets = classNames.map(()=>1); classAvgs = classNames.map(()=>1);
+        classTargets = activeClassNames.map(()=>1); classAvgs = activeClassNames.map(()=>1);
       }
+      const activeClassIdx = cn => (classSetsMatch && classTargetsShared) ? classNamesOrdered.indexOf(cn) : activeClassNames.indexOf(cn);
 
-      const classNodes = classNames.map((cn) => {
-        const classTargetIdx = (classSetsMatch && classTargetsShared) ? classNamesOrdered.indexOf(cn) : classNames.indexOf(cn);
+      const classNodes = allClassNames.map((cn) => {
         const secs = classes[cn];
         const classTotals = models.map(m => secs.reduce((s,sec)=>s+(sec.raw[m]||0),0));
+        const active = isActiveClass(fam, catName, cn);
+        const cIdx = activeClassIdx(cn);
+        const clsTargetPct = active && cIdx>=0 ? classTargets[cIdx] : 0;
+        const clsAvgPct = active && cIdx>=0 ? classAvgs[cIdx] : 0;
 
-        // Ticker-level merge check: do all families that also have this
-        // exact class name share the exact same ticker set within it?
-        const famsWithThisClass = famsWithCat.filter(f => famGroups[f][catName][cn]);
-        const tickerSigs = famsWithThisClass.map(f => tickerSig(famGroups[f][catName][cn]));
-        const tickersMatch = famsWithThisClass.length>1 && tickerSigs.every(s=>s===tickerSigs[0]);
+        // Ticker-level merge check, using only ACTIVE tickers per family.
+        const activeSecs = secs.filter(s=>isActiveSec(fam,s));
+        const famsWithThisClass = famNames.filter(f => famGroups[f][catName] && famGroups[f][catName][cn]);
+        const activeTickerSigs = famsWithThisClass.map(f => tickerSig(f, famGroups[f][catName][cn]));
+        const tickersMatch = famsWithThisClass.length>1 && activeTickerSigs.every(s=>s===activeTickerSigs[0]) && activeTickerSigs[0]!=="";
 
-        let tickerTargets, tickerAvgs, tickerNamesOrdered=null;
-        if (secs.length>1) {
+        let tickerTargets=[], tickerAvgs=[], tickerNamesOrdered=null;
+        if (activeSecs.length>1) {
           if (tickersMatch) {
-            tickerNamesOrdered = famGroups[famsWithThisClass[0]][catName][cn].map(s=>s.ticker);
+            tickerNamesOrdered = famGroups[famsWithThisClass[0]][catName][cn].filter(s=>isActiveSec(famsWithThisClass[0],s)).map(s=>s.ticker);
             const combined = tickerNamesOrdered.map(()=>[]);
             famsWithThisClass.forEach(f => {
               const fModels = familyData[f].models;
               const fSecs = famGroups[f][catName][cn];
               tickerNamesOrdered.forEach((tname, ti) => {
                 const sec = fSecs.find(s=>s.ticker===tname);
-                combined[ti] = combined[ti].concat(fModels.map(m => sec.raw[m]||0));
+                combined[ti] = combined[ti].concat(fModels.map(m => sec ? (sec.raw[m]||0) : 0));
               });
             });
             ({ targets: tickerTargets, avgs: tickerAvgs } = computeProportionalTargets(combined));
           } else {
-            const arrays = secs.map(s => models.map(m => s.raw[m]||0));
+            const arrays = activeSecs.map(s => models.map(m => s.raw[m]||0));
             ({ targets: tickerTargets, avgs: tickerAvgs } = computeProportionalTargets(arrays));
           }
-        } else {
-          tickerTargets = secs.map(()=>1); tickerAvgs = secs.map(()=>1);
+        } else if (activeSecs.length===1) {
+          tickerTargets = [1]; tickerAvgs = [1];
         }
 
         return {
           name: cn==="__direct__" ? catName : cn,
           isDirect: cn==="__direct__",
-          targetPct: classTargets[classTargetIdx],
-          avgPct: classAvgs[classTargetIdx],
+          targetPct: clsTargetPct,
+          avgPct: clsAvgPct,
           totals: classTotals,
-          tickers: secs.map((s,ti) => {
-            const tIdx = (tickersMatch && tickerNamesOrdered) ? tickerNamesOrdered.indexOf(s.ticker) : ti;
+          tickers: secs.map((s) => {
+            if (!isActiveSec(fam, s)) return { ticker: s.ticker, targetPct: 0, avgPct: 0, currentByModel: models.map(m=>s.raw[m]||0) };
+            const tIdx = (tickersMatch && tickerNamesOrdered) ? tickerNamesOrdered.indexOf(s.ticker) : activeSecs.indexOf(s);
             return {
               ticker: s.ticker,
               targetPct: tickerTargets[tIdx],
