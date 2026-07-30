@@ -2065,6 +2065,14 @@ function acmBaseFamilyName(familyName) {
 // default to the flat-band treatment. Class-level bands are always a flat
 // 25%-of-target relative band, and Security Set-level bands are always
 // Fix Band % = 50 (from the separate Security Set import).
+// Categories/classes that map to an already-existing Orion Security Set
+// (shared across every advisor, not created per-advisor) rather than a new
+// one this tool would normally generate — referenced by ID + its real bare
+// name, and never written to the Security Set import since it already exists.
+const ACM_EXISTING_SECURITY_SETS = {
+  "CASH": { id: 57, name: "Cash" },
+};
+
 const ACM_CATEGORY_META = {
   "EQUITY": { display: "Equity", bandType: "fixed5" },
   "FIXED INCOME": { display: "Fixed Income", bandType: "fixed5" },
@@ -2162,7 +2170,14 @@ function buildAcmFinalExport(reimportedFamilies) {
           const clsDisplay = isDirect ? catDisplay : clsKey;
           const clsTargetFrac = isDirect ? 1 : ((classTargets[catName] && classTargets[catName][clsName]) ?? 0);
           const classPrefix = sharedOrOwnFamilyName(familyName, catName, clsKey, tickers);
-          const ssName = `${classPrefix} - ${clsDisplay}`;
+
+          // Cash always uses Orion's existing shared "Cash" Security Set
+          // (ID 57) rather than creating a new advisor-specific one — the
+          // Category/Class SubModel Names stay advisor-specific as usual,
+          // only the Security Set reference points at the pre-built one.
+          const existing = ACM_EXISTING_SECURITY_SETS[catName];
+          const ssName = existing ? existing.name : `${classPrefix} - ${clsDisplay}`;
+          const ssId = existing ? existing.id : null;
 
           const catPct = +(catTotal*100).toFixed(2);
           const clsPct = +(clsTargetFrac*100).toFixed(2);
@@ -2172,6 +2187,7 @@ function buildAcmFinalExport(reimportedFamilies) {
 
           modelRows.push({
             "* Model Name": fullModelName,
+            "* Security Set ID": ssId,
             "Category SubModel Name": `${categoryPrefix} - ${catDisplay}`,
             "Category Asset Class Type": meta.display,
             "Category Namespace": "Default Team",
@@ -2195,16 +2211,18 @@ function buildAcmFinalExport(reimportedFamilies) {
             "* Name Space": "Default Team",
           });
 
-          tks.forEach(t => {
-            if (!ssRowsByName.has(ssName+"|"+t.ticker) && t.targetPct > 0) {
-              ssRowsByName.set(ssName+"|"+t.ticker, {
-                "Name": ssName, "Symbol": t.ticker, "Allocation %": +(t.targetPct*100).toFixed(2),
-                "Fix Band %": 50, "Dynamic": 0,
-                "Security Set Do Not TLH": "false", "Security Do Not TLH": "false",
-                "Buy Priority": "Default", "Sell Priority": "Default",
-              });
-            }
-          });
+          if (!existing) {
+            tks.forEach(t => {
+              if (!ssRowsByName.has(ssName+"|"+t.ticker) && t.targetPct > 0) {
+                ssRowsByName.set(ssName+"|"+t.ticker, {
+                  "Name": ssName, "Symbol": t.ticker, "Allocation %": +(t.targetPct*100).toFixed(2),
+                  "Fix Band %": 50, "Dynamic": 0,
+                  "Security Set Do Not TLH": "false", "Security Do Not TLH": "false",
+                  "Buy Priority": "Default", "Sell Priority": "Default",
+                });
+              }
+            });
+          }
         });
       });
     });
