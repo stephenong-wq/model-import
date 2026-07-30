@@ -2043,16 +2043,65 @@ const ACM_SS_TEMPLATE_COLS = [
   "Group Equivalence Type 3","Group Equivalent 3","Group Buy Priority 3","Group Sell Priority 3",
 ];
 
+// Strips a family's tax-status suffix (e.g. "(NQ)") to get its base name —
+// used when two families' Security Sets turn out identical, so the shared
+// name doesn't awkwardly carry one family's suffix.
+function acmBaseFamilyName(familyName) {
+  return familyName.replace(/\s*\(NQ\)\s*$/i, "").trim();
+}
+
 function buildAcmFinalExport(reimportedFamilies) {
   const modelRows = [];
-  const ssRowsByKey = new Map(); // one Security Set row per (family, class, ticker) — shared across models
+
+  // ── Pass 1: determine, per (Category, Class), whether its ticker+
+  // allocation composition is IDENTICAL across 2+ families. If so, every
+  // family shares ONE Security Set (named after the base/stripped family
+  // name) instead of each getting its own — this is exactly the point of a
+  // shared Security Set: edit it once, every model that references it
+  // updates together. Classes that genuinely differ (e.g. taxable vs. muni
+  // bond tickers) keep separate, family-specific Security Sets.
+  const classSignature = (catName, clsKey, tickers) => {
+    const tks = tickers.filter(t => t.category===catName && (t.class||"__direct__")===clsKey);
+    return tks.map(t => `${t.ticker}:${(+t.targetPct.toFixed(6))}`).sort().join(",");
+  };
+
+  const sigToFamilies = new Map(); // "catName|clsKey|signature" -> Set of families sharing that exact signature
+
+  Object.entries(reimportedFamilies).forEach(([familyName, { tickers }]) => {
+    const seen = new Set();
+    tickers.forEach(t => {
+      const clsKey = t.class || "__direct__";
+      const key = `${t.category}|${clsKey}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      const sig = classSignature(t.category, clsKey, tickers);
+      const fullKey = `${key}|${sig}`;
+      if (!sigToFamilies.has(fullKey)) sigToFamilies.set(fullKey, new Set());
+      sigToFamilies.get(fullKey).add(familyName);
+    });
+  });
+
+  function ssNameFor(familyName, catName, clsKey, clsName, tickers) {
+    const sig = classSignature(catName, clsKey, tickers);
+    const fullKey = `${catName}|${clsKey}|${sig}`;
+    const sharingFamilies = sigToFamilies.get(fullKey);
+    // Only genuinely shared (2+ different families with this exact ticker+
+    // allocation composition) uses the stripped base name; otherwise this
+    // family's own name is kept as-is, suffix and all.
+    if (sharingFamilies && sharingFamilies.size > 1) {
+      const canonicalFamily = [...sharingFamilies].sort()[0];
+      return `${acmBaseFamilyName(canonicalFamily)} - ${clsName}`;
+    }
+    return `${familyName} - ${clsName}`;
+  }
+
+  // ── Pass 2: build Model rows (Category/Class SubModel Names are
+  // family-specific but NOT model-specific — the number varies per model
+  // row already, the name doesn't need to) and Security Set rows (deduped
+  // by their final consolidated name).
+  const ssRowsByName = new Map();
 
   Object.entries(reimportedFamilies).forEach(([familyName, { models, categoryTotals, classTargets, tickers }]) => {
-    // familyName is already the full display name from the digest's sheet tab
-    // (e.g. "Fortify Wealth" or "Fortify Wealth (NQ)") — used directly, no
-    // separate advisor-name/suffix logic needed.
-
-    // Group tickers by Category > Class for iteration.
     const byCategory = {};
     tickers.forEach(t => {
       byCategory[t.category] = byCategory[t.category] || {};
@@ -2069,13 +2118,13 @@ function buildAcmFinalExport(reimportedFamilies) {
           const isDirect = clsKey === "__direct__";
           const clsName = isDirect ? catName : clsKey;
           const clsTargetPct = isDirect ? 1 : ((classTargets[catName] && classTargets[catName][clsName]) ?? 0);
-          const ssName = `${familyName} - ${clsName}`;
+          const ssName = ssNameFor(familyName, catName, clsKey, clsName, tickers);
 
           modelRows.push({
             "* Model Name": fullModelName,
-            "Category SubModel Name": `${fullModelName} - ${catName}`,
+            "Category SubModel Name": `${familyName} - ${catName}`,
             "Category Target %": +catTotal.toFixed(4),
-            "Class SubModel Name": `${fullModelName} - ${clsName}`,
+            "Class SubModel Name": `${familyName} - ${clsName}`,
             "Class Target %": +clsTargetPct.toFixed(4),
             "* Security Set SubModel Name": ssName,
             "* Security Set Target %": 1,
@@ -2083,9 +2132,8 @@ function buildAcmFinalExport(reimportedFamilies) {
           });
 
           tks.forEach(t => {
-            const key = familyName+"|"+ssName+"|"+t.ticker;
-            if (!ssRowsByKey.has(key) && t.targetPct > 0) {
-              ssRowsByKey.set(key, {
+            if (!ssRowsByName.has(ssName+"|"+t.ticker) && t.targetPct > 0) {
+              ssRowsByName.set(ssName+"|"+t.ticker, {
                 "Name": ssName, "Symbol": t.ticker, "Allocation %": +t.targetPct.toFixed(4),
                 "Fix Band %": 0.5, "Dynamic": 0,
                 "Security Set Do Not TLH": "false", "Security Do Not TLH": "false",
@@ -2098,7 +2146,7 @@ function buildAcmFinalExport(reimportedFamilies) {
     });
   });
 
-  const ssRowsFull = [...ssRowsByKey.values()].map(partial => {
+  const ssRowsFull = [...ssRowsByName.values()].map(partial => {
     const full = {};
     ACM_SS_TEMPLATE_COLS.forEach(c => full[c] = partial[c] !== undefined ? partial[c] : null);
     return full;
@@ -2198,6 +2246,34 @@ function AcmFlow({ onBack }) {
     setStage("done");
   }
 
+  // Builds the exact same shape parseAcmDigestForReimport would produce,
+  // straight from the already-computed tree — skips the export/re-upload
+  // round trip entirely, for when no advisor edits are needed (or a review
+  // is still pending and shouldn't hold up finalizing for now).
+  function skipToFinalize() {
+    const families = {};
+    Object.entries(familyTrees).forEach(([fam, tree]) => {
+      const displayName = acmFamilyDisplayName(fam, advisorName);
+      const categoryTotals = {}, classTargets = {}, tickers = [];
+      tree.categories.forEach(cat => {
+        categoryTotals[cat.name] = cat.totals;
+        cat.classes.forEach(cls => {
+          if (!cls.isDirect) {
+            classTargets[cat.name] = classTargets[cat.name] || {};
+            classTargets[cat.name][cls.name] = cls.targetPct;
+          }
+          cls.tickers.forEach(t => {
+            tickers.push({ category: cat.name, class: cls.isDirect ? null : cls.name, ticker: t.ticker, targetPct: t.targetPct });
+          });
+        });
+      });
+      families[displayName] = { models: tree.models, categoryTotals, classTargets, tickers };
+    });
+    setReimportedFamilies(families);
+    downloadAcmFinalExport(families, advisorName);
+    setStage("done");
+  }
+
   if (stage === "upload") {
     return (
       <div>
@@ -2230,7 +2306,7 @@ function AcmFlow({ onBack }) {
     return (
       <div>
         <div style={{fontSize:13,color:"#374151",marginBottom:16}}>
-          Upload the digest file — edited by the advisor or not — to build the final Model and Security Set import files.
+          Upload the digest file — edited by the advisor or not — to build the final Model and Security Set import files. Or skip waiting on that entirely and finalize straight from what's already been computed.
         </div>
         <FilePickBox label="Digest file" hint="The exported digest (.xlsx), possibly with Target % adjusted"
           file={reimportFile} onFile={handleReimportFile} accentColor="#7c3aed" />
@@ -2244,6 +2320,7 @@ function AcmFlow({ onBack }) {
           <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
           <div style={{display:"flex",gap:8}}>
             <button onClick={()=>downloadAcmDigest(familyTrees, advisorName)} style={{background:"none",border:"0.5px solid #7c3aed",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#7c3aed",cursor:"pointer"}}>Download digest again</button>
+            <button onClick={skipToFinalize} style={{background:"none",border:"0.5px solid #9ca3af",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#4b5563",cursor:"pointer"}}>Skip — finalize as computed →</button>
             <button onClick={finalize} disabled={!reimportedFamilies}
               style={{background:reimportedFamilies?"#7c3aed":"#c4b5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:reimportedFamilies?"pointer":"default"}}>
               Export final Model + Security Set files ↓
