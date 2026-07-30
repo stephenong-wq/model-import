@@ -2056,6 +2056,25 @@ function acmBaseFamilyName(familyName) {
   return familyName.replace(/\s*\(NQ\)\s*$/i, "").trim();
 }
 
+// Reference fields confirmed against a real Orion export: Category-level
+// bands follow a fixed business rule by category type — Equity/Fixed Income
+// (the main categories) always get a flat ±5 percentage-point band
+// regardless of target size, while Alternatives/Cash (smaller satellite
+// categories) get a "100% of target" relative band instead (so a 3% target
+// gets a ±3pt band, a 1% target gets ±1pt). Unrecognized/custom categories
+// default to the flat-band treatment. Class-level bands are always a flat
+// 25%-of-target relative band, and Security Set-level bands are always
+// Fix Band % = 50 (from the separate Security Set import).
+const ACM_CATEGORY_META = {
+  "EQUITY": { display: "Equity", bandType: "fixed5" },
+  "FIXED INCOME": { display: "Fixed Income", bandType: "fixed5" },
+  "ALTERNATIVES": { display: "Alternatives", bandType: "relative100" },
+  "CASH": { display: "Cash & Cash Equivalents", bandType: "relative100" },
+};
+function acmCategoryMeta(catKey) {
+  return ACM_CATEGORY_META[catKey] || { display: acmTitleCase(catKey), bandType: "fixed5" };
+}
+
 function buildAcmFinalExport(reimportedFamilies) {
   const modelRows = [];
 
@@ -2139,26 +2158,46 @@ function buildAcmFinalExport(reimportedFamilies) {
           const isDirect = clsKey === "__direct__";
           const clsName = isDirect ? catName : clsKey;
           const clsDisplay = isDirect ? catDisplay : clsKey;
-          const clsTargetPct = isDirect ? 1 : ((classTargets[catName] && classTargets[catName][clsName]) ?? 0);
+          const clsTargetFrac = isDirect ? 1 : ((classTargets[catName] && classTargets[catName][clsName]) ?? 0);
           const classPrefix = sharedOrOwnFamilyName(familyName, catName, clsKey, tickers);
           const ssName = `${classPrefix} - ${clsDisplay}`;
+
+          const catPct = +(catTotal*100).toFixed(2);
+          const clsPct = +(clsTargetFrac*100).toFixed(2);
+          const meta = acmCategoryMeta(catName);
+          const catBand = meta.bandType==="relative100" ? { band:100, upper:catPct, lower:catPct } : { band:null, upper:5, lower:5 };
+          const clsBand = { band:25, upper:+(clsPct*0.25).toFixed(2), lower:+(clsPct*0.25).toFixed(2) };
 
           modelRows.push({
             "* Model Name": fullModelName,
             "Category SubModel Name": `${categoryPrefix} - ${catDisplay}`,
-            "Category Target %": +catTotal.toFixed(4),
+            "Category Asset Class Type": meta.display,
+            "Category Namespace": "Default Team",
+            "Category Target %": catPct,
+            "Category Band/Range": catBand.band,
+            "Category Upper %": catBand.upper,
+            "Category Lower %": catBand.lower,
             "Class SubModel Name": `${classPrefix} - ${clsDisplay}`,
-            "Class Target %": +clsTargetPct.toFixed(4),
+            "Class Namespace": "Default Team",
+            "Class Target %": clsPct,
+            "Class Band/Range": clsBand.band,
+            "Class Upper %": clsBand.upper,
+            "Class Lower %": clsBand.lower,
+            "Subclass Namespace": "Default Team",
             "* Security Set SubModel Name": ssName,
-            "* Security Set Target %": 1,
-            "* Dynamic": 0,
+            "* Security Set Target %": 100,
+            "Security Set Band/Range": 25,
+            "Security Set Upper %": 25,
+            "Security Set Lower %": 25,
+            "* Dynamic": "NO",
+            "* Name Space": "Default Team",
           });
 
           tks.forEach(t => {
             if (!ssRowsByName.has(ssName+"|"+t.ticker) && t.targetPct > 0) {
               ssRowsByName.set(ssName+"|"+t.ticker, {
-                "Name": ssName, "Symbol": t.ticker, "Allocation %": +t.targetPct.toFixed(4),
-                "Fix Band %": 0.5, "Dynamic": 0,
+                "Name": ssName, "Symbol": t.ticker, "Allocation %": +(t.targetPct*100).toFixed(2),
+                "Fix Band %": 50, "Dynamic": 0,
                 "Security Set Do Not TLH": "false", "Security Do Not TLH": "false",
                 "Buy Priority": "Default", "Sell Priority": "Default",
               });
