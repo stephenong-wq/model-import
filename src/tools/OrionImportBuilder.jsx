@@ -2046,6 +2046,12 @@ const ACM_SS_TEMPLATE_COLS = [
 // Strips a family's tax-status suffix (e.g. "(NQ)") to get its base name —
 // used when two families' Security Sets turn out identical, so the shared
 // name doesn't awkwardly carry one family's suffix.
+// Categories are stored internally as ALL CAPS (EQUITY, FIXED INCOME) for
+// matching/grouping — this is purely for display in the final export.
+function acmTitleCase(s) {
+  return (s||"").toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+}
+
 function acmBaseFamilyName(familyName) {
   return familyName.replace(/\s*\(NQ\)\s*$/i, "").trim();
 }
@@ -2114,17 +2120,19 @@ function buildAcmFinalExport(reimportedFamilies) {
       const fullModelName = `${familyName} - ${modelName}`;
       Object.entries(byCategory).forEach(([catName, classes]) => {
         const catTotal = (categoryTotals[catName] && categoryTotals[catName][mi]) || 0;
+        const catDisplay = acmTitleCase(catName);
         Object.entries(classes).forEach(([clsKey, tks]) => {
           const isDirect = clsKey === "__direct__";
           const clsName = isDirect ? catName : clsKey;
+          const clsDisplay = isDirect ? catDisplay : clsKey;
           const clsTargetPct = isDirect ? 1 : ((classTargets[catName] && classTargets[catName][clsName]) ?? 0);
           const ssName = ssNameFor(familyName, catName, clsKey, clsName, tickers);
 
           modelRows.push({
             "* Model Name": fullModelName,
-            "Category SubModel Name": `${familyName} - ${catName}`,
+            "Category SubModel Name": `${familyName} - ${catDisplay}`,
             "Category Target %": +catTotal.toFixed(4),
-            "Class SubModel Name": `${familyName} - ${clsName}`,
+            "Class SubModel Name": `${familyName} - ${clsDisplay}`,
             "Class Target %": +clsTargetPct.toFixed(4),
             "* Security Set SubModel Name": ssName,
             "* Security Set Target %": 1,
@@ -2246,34 +2254,6 @@ function AcmFlow({ onBack }) {
     setStage("done");
   }
 
-  // Builds the exact same shape parseAcmDigestForReimport would produce,
-  // straight from the already-computed tree — skips the export/re-upload
-  // round trip entirely, for when no advisor edits are needed (or a review
-  // is still pending and shouldn't hold up finalizing for now).
-  function skipToFinalize() {
-    const families = {};
-    Object.entries(familyTrees).forEach(([fam, tree]) => {
-      const displayName = acmFamilyDisplayName(fam, advisorName);
-      const categoryTotals = {}, classTargets = {}, tickers = [];
-      tree.categories.forEach(cat => {
-        categoryTotals[cat.name] = cat.totals;
-        cat.classes.forEach(cls => {
-          if (!cls.isDirect) {
-            classTargets[cat.name] = classTargets[cat.name] || {};
-            classTargets[cat.name][cls.name] = cls.targetPct;
-          }
-          cls.tickers.forEach(t => {
-            tickers.push({ category: cat.name, class: cls.isDirect ? null : cls.name, ticker: t.ticker, targetPct: t.targetPct });
-          });
-        });
-      });
-      families[displayName] = { models: tree.models, categoryTotals, classTargets, tickers };
-    });
-    setReimportedFamilies(families);
-    downloadAcmFinalExport(families, advisorName);
-    setStage("done");
-  }
-
   if (stage === "upload") {
     return (
       <div>
@@ -2297,6 +2277,9 @@ function AcmFlow({ onBack }) {
         </div>
         <div style={{marginTop:16}}>
           <button onClick={onBack} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
+          <button onClick={()=>{setError(null);setStage("reimport");}} style={{marginLeft:12,background:"none",border:"none",fontSize:12,color:"#7c3aed",cursor:"pointer",textDecoration:"underline"}}>
+            Already have a digest file? Skip to upload it →
+          </button>
         </div>
       </div>
     );
@@ -2306,7 +2289,7 @@ function AcmFlow({ onBack }) {
     return (
       <div>
         <div style={{fontSize:13,color:"#374151",marginBottom:16}}>
-          Upload the digest file — edited by the advisor or not — to build the final Model and Security Set import files. Or skip waiting on that entirely and finalize straight from what's already been computed.
+          Upload the digest file — edited by the advisor or not — to build the final Model and Security Set import files.
         </div>
         <FilePickBox label="Digest file" hint="The exported digest (.xlsx), possibly with Target % adjusted"
           file={reimportFile} onFile={handleReimportFile} accentColor="#7c3aed" />
@@ -2319,8 +2302,7 @@ function AcmFlow({ onBack }) {
         <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
           <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
           <div style={{display:"flex",gap:8}}>
-            <button onClick={()=>downloadAcmDigest(familyTrees, advisorName)} style={{background:"none",border:"0.5px solid #7c3aed",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#7c3aed",cursor:"pointer"}}>Download digest again</button>
-            <button onClick={skipToFinalize} style={{background:"none",border:"0.5px solid #9ca3af",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#4b5563",cursor:"pointer"}}>Skip — finalize as computed →</button>
+            {familyTrees && <button onClick={()=>downloadAcmDigest(familyTrees, advisorName)} style={{background:"none",border:"0.5px solid #7c3aed",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#7c3aed",cursor:"pointer"}}>Download digest again</button>}
             <button onClick={finalize} disabled={!reimportedFamilies}
               style={{background:reimportedFamilies?"#7c3aed":"#c4b5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:reimportedFamilies?"pointer":"default"}}>
               Export final Model + Security Set files ↓
