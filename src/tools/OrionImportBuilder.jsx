@@ -2138,9 +2138,11 @@ function buildAcmFinalExport(reimportedFamilies) {
     });
 
     models.forEach((modelName, mi) => {
-      const fullModelName = `${familyName} - ${modelName}`;
+      const isNQFamily = /\(NQ\)/i.test(familyName);
+      const fullModelName = `Strategic Advisor Model - ${acmBaseFamilyName(familyName)} ${modelName}${isNQFamily ? " (NQ)" : ""}`;
       Object.entries(byCategory).forEach(([catName, classes]) => {
         const catTotal = (categoryTotals[catName] && categoryTotals[catName][mi]) || 0;
+        if (catTotal <= 1e-9) return; // 0% category for this model — nothing to allocate, skip entirely
         const catDisplay = acmTitleCase(catName);
         const classKeys = Object.keys(classes);
         // Category is only shared (no family suffix) when EVERY class in it
