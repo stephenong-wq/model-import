@@ -1764,13 +1764,33 @@ const ACM_STYLE = {
 // are left blank on ticker rows (relying on the colored bars above for
 // grouping, not repeated text) — merged across A:B on category/class summary
 // rows so it reads cleanly instead of looking staggered.
-// Single leftmost column serves double duty — a Category/Class header row's
-// name, or an actual ticker symbol — matching the reference file's layout
-// instead of separate columns that sit empty on every ticker row.
+function acmColLetter(n) { // 1-indexed column number -> Excel column letter
+  let s = "";
+  while (n > 0) { const m = (n-1)%26; s = String.fromCharCode(65+m)+s; n = Math.floor((n-1)/26); }
+  return s;
+}
+
+// Writes one sheet's worth of rows (Category/Class/Ticker + a value per
+// model) with the reference file's visual scheme: black header bar, brown
+// category rows, tan class rows, thin ticker borders. Category/Class cells
+// are left blank on ticker rows (relying on the colored bars above for
+// grouping, not repeated text) — merged across A:B on category/class summary
+// rows so it reads cleanly instead of looking staggered.
+//
+// getValue may return either a plain fraction, or a {formula, result} object
+// for a live Excel formula (result is the cached fallback value shown before
+// any recalculation). The context passed to getValue includes selfCatRow/
+// selfClsRow — the row numbers already written for this category/class
+// *within this same sheet* — so a caller building a formula-based sheet can
+// self-reference rows just written above without needing an external map.
+// The returned rowMap (keyed "cat", "cat|cls", or "cat|cls|ticker") lets a
+// *later* sheet build cross-sheet formulas pointing back at this one.
 function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extraCols) {
   const ws = wb.addWorksheet(sheetName.slice(0,31).replace(/[\\/*?:[\]]/g,""));
   extraCols = extraCols || []; // [{header, getValue({level,cat,cls,t,mi})}] — placed after the model columns
   const totalCols = 1 + models.length + extraCols.length;
+  const modelColStart = 2;
+  const extraColStart = modelColStart + models.length;
 
   // Title bar: filled across the full width but NOT merged (unmerged cells
   // sort/filter more predictably in Excel) — text sits in A1 only.
@@ -1785,8 +1805,6 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
   ws.getRow(1).height = 22;
 
   const headerRowIdx = 2;
-  const modelColStart = 2;
-  const extraColStart = modelColStart + models.length;
   ["Ticker", ...models, ...extraCols.map(c=>c.header)].forEach((h, ci) => {
     const cell = ws.getCell(headerRowIdx, ci+1);
     cell.value = h;
@@ -1796,9 +1814,16 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
   });
   ws.getRow(headerRowIdx).height = 20;
 
-  const pctCell = (r,c,val) => { const cell = ws.getCell(r,c); cell.value = val; cell.numFmt = "0.0%"; cell.alignment = { horizontal:"center" }; };
+  const pctCell = (r,c,val) => {
+    const cell = ws.getCell(r,c);
+    if (val && typeof val==="object" && "formula" in val) cell.value = { formula: val.formula, result: val.result };
+    else cell.value = val;
+    cell.numFmt = "0.0%";
+    cell.alignment = { horizontal:"center" };
+  };
   const fillRow = (r, argb) => { for (let c=1;c<=totalCols;c++) ws.getCell(r,c).fill = { type:"pattern", pattern:"solid", fgColor:{argb} }; };
   const writeExtras = (r, ctx) => extraCols.forEach((ec,i) => pctCell(r, extraColStart+i, ec.getValue(ctx)));
+  const rowMap = new Map();
 
   let r = headerRowIdx + 1;
   categories.forEach(cat => {
@@ -1806,16 +1831,21 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
     const catCell = ws.getCell(r,1);
     catCell.value = cat.name;
     catCell.font = { name:"Arial", size:12, bold:true, color:{argb:ACM_STYLE.white} };
-    models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"category", cat, mi })));
+    const catRow = r;
+    rowMap.set(cat.name, catRow);
+    models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"category", cat, mi, selfCatRow:catRow })));
     r++;
 
     cat.classes.forEach(cls => {
+      let clsRow = catRow; // isDirect: the "class row" is the category row itself
       if (!cls.isDirect) {
         fillRow(r, ACM_STYLE.classFill);
         const clsCell = ws.getCell(r,1);
         clsCell.value = cls.name;
         clsCell.font = { name:"Arial", size:10, bold:true, color:{argb:"FF000000"} };
-        models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"class", cat, cls, mi })));
+        clsRow = r;
+        rowMap.set(`${cat.name}|${cls.name}`, clsRow);
+        models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"class", cat, cls, mi, selfCatRow:catRow })));
         writeExtras(r, { level:"class", cat, cls });
         r++;
       }
@@ -1824,7 +1854,8 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
         tickerCell.value = t.ticker;
         tickerCell.alignment = { horizontal:"center" };
         tickerCell.border = { top:{style:"thin"}, bottom:{style:"thin"}, left:{style:"thin"}, right:{style:"thin"} };
-        models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"ticker", cat, cls, t, mi })));
+        rowMap.set(`${cat.name}|${cls.name}|${t.ticker}`, r);
+        models.forEach((m,mi) => pctCell(r, modelColStart+mi, getValue({ level:"ticker", cat, cls, t, mi, selfCatRow:catRow, selfClsRow:clsRow })));
         writeExtras(r, { level:"ticker", cat, cls, t });
         r++;
       });
@@ -1835,7 +1866,7 @@ function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extra
   for (let mi=0; mi<models.length; mi++) ws.getColumn(modelColStart+mi).width = 13;
   for (let i=0; i<extraCols.length; i++) ws.getColumn(extraColStart+i).width = 11;
   ws.views = [{ state:"frozen", xSplit:1, ySplit:headerRowIdx }];
-  return ws;
+  return { ws, sheetName: ws.name, rowMap, modelColStart, extraColStart, headerRowIdx };
 }
 
 
@@ -1906,14 +1937,15 @@ async function downloadAcmDigest(familyTrees, advisorName) {
   Object.entries(familyTrees).forEach(([fam, tree]) => {
     const displayName = acmFamilyDisplayName(fam, advisorName);
     const { models, categories } = tree;
+    const ref = (sheetName, col, row) => `'${sheetName}'!${col}${row}`;
 
     // Current tab — every level (category/class/ticker) expressed as a %
     // of the WHOLE model, consistently, so a class's number visibly equals
     // the sum of its tickers' numbers, and a category's equals the sum of
     // its classes'. Plus Target % (editable — this is what re-import reads
-    // back) and Avg % (the raw computed average *before* rounding to a
-    // clean increment, kept alongside for troubleshooting).
-    acmWriteSheet(wb, displayName, displayName, models, categories, ({level, cat, cls, t, mi}) => {
+    // back, and what the Suggested/Difference formulas below key off of) and
+    // Avg % (the raw computed average before rounding, for troubleshooting).
+    const current = acmWriteSheet(wb, displayName, displayName, models, categories, ({level, cat, cls, t, mi}) => {
       if (level==="category") return cat.totals[mi];
       if (level==="class") return cls.totals[mi];
       return t.currentByModel[mi];
@@ -1921,29 +1953,63 @@ async function downloadAcmDigest(familyTrees, advisorName) {
       { header:"Target %", getValue: ({level,cls,t}) => level==="ticker" ? t.targetPct : (cls ? cls.targetPct : null) },
       { header:"Avg %", getValue: ({level,cls,t}) => level==="ticker" ? t.avgPct : (cls ? cls.avgPct : null) },
     ]);
+    const targetColLetter = acmColLetter(current.extraColStart);
+    const modelColLetter = mi => acmColLetter(current.modelColStart+mi);
 
-    // Suggested tab — cascades down from the category's actual (unsmoothed)
-    // raw weight through each fixed Target % ratio, so every level still
-    // sums correctly: tickers under a class sum to that class's suggested
-    // %, classes under a category sum to the category's (unchanged) %.
-    acmWriteSheet(wb, `${displayName} (Suggested)`, `${displayName} — Suggested`, models, categories, ({level, cat, cls, t, mi}) => {
-      const catPct = cat.totals[mi];
-      if (level==="category") return catPct;
-      const clsPct = cls.isDirect ? catPct : catPct * cls.targetPct;
-      if (level==="class") return clsPct;
-      return clsPct * t.targetPct;
-    });
+    // Suggested tab — LIVE FORMULAS cascading from the category's actual
+    // (unsmoothed) raw weight in the Current tab through each Target % cell
+    // there, so editing a Target % on the Current tab (e.g. to adjust
+    // rounding) recalculates this tab automatically, no re-export needed.
+    // Class rows reference Current's category row × Current's own Target %
+    // for that class; ticker rows reference either Current's category row
+    // (if the class is "direct") or *this sheet's own* just-written class
+    // row (self-reference) × Current's Target % for that ticker.
+    const suggested = acmWriteSheet(wb, `${displayName} (Suggested)`, `${displayName} — Suggested`, models, categories,
+      ({level, cat, cls, t, mi, selfClsRow}) => {
+        const catRow = current.rowMap.get(cat.name);
+        const catRef = ref(current.sheetName, modelColLetter(mi), catRow);
+        const catResult = cat.totals[mi];
+        if (level==="category") return { formula: catRef, result: catResult };
 
-    // Difference tab — Suggested minus Current, so the advisor can see the
-    // magnitude of change at a glance without hunting across two tabs.
-    acmWriteSheet(wb, `${displayName} Difference`, `${displayName} — Difference (Suggested − Current)`, models, categories, ({level, cat, cls, t, mi}) => {
-      const catPct = cat.totals[mi];
-      if (level==="category") return 0;
-      const clsSuggested = cls.isDirect ? catPct : catPct * cls.targetPct;
-      if (level==="class") return clsSuggested - cls.totals[mi];
-      const suggested = clsSuggested * t.targetPct;
-      return suggested - t.currentByModel[mi];
-    });
+        if (level==="class") {
+          if (cls.isDirect) return { formula: catRef, result: catResult };
+          const targetRow = current.rowMap.get(`${cat.name}|${cls.name}`);
+          const targetRef = ref(current.sheetName, targetColLetter, targetRow);
+          return { formula: `${catRef}*${targetRef}`, result: catResult*cls.targetPct };
+        }
+
+        // ticker
+        const clsResult = cls.isDirect ? catResult : catResult*cls.targetPct;
+        const parentRef = cls.isDirect ? catRef : `${modelColLetter(mi)}${selfClsRow}`; // self-sheet ref when not direct
+        const tickerTargetRow = current.rowMap.get(`${cat.name}|${cls.name}|${t.ticker}`);
+        const tickerTargetRef = ref(current.sheetName, targetColLetter, tickerTargetRow);
+        return { formula: `${parentRef}*${tickerTargetRef}`, result: clsResult*t.targetPct };
+      });
+
+    // Difference tab — LIVE FORMULA, Suggested minus Current, so it also
+    // updates automatically when Target % changes.
+    acmWriteSheet(wb, `${displayName} Difference`, `${displayName} — Difference (Suggested − Current)`, models, categories,
+      ({level, cat, cls, t, mi}) => {
+        if (level==="category") return { formula: "0", result: 0 };
+
+        const key = cls.isDirect ? cat.name : `${cat.name}|${cls.name}`;
+        const catResult = cat.totals[mi];
+        const clsSuggested = cls.isDirect ? catResult : catResult*cls.targetPct;
+
+        if (level==="class") {
+          const sugRow = suggested.rowMap.get(key), curRow = current.rowMap.get(key);
+          const sugRef = ref(suggested.sheetName, modelColLetter(mi), sugRow);
+          const curRef = ref(current.sheetName, modelColLetter(mi), curRow);
+          return { formula: `${sugRef}-${curRef}`, result: clsSuggested - cls.totals[mi] };
+        }
+
+        // ticker
+        const tKey = `${cat.name}|${cls.name}|${t.ticker}`;
+        const sugRow = suggested.rowMap.get(tKey), curRow = current.rowMap.get(tKey);
+        const sugRef = ref(suggested.sheetName, modelColLetter(mi), sugRow);
+        const curRef = ref(current.sheetName, modelColLetter(mi), curRow);
+        return { formula: `${sugRef}-${curRef}`, result: clsSuggested*t.targetPct - t.currentByModel[mi] };
+      });
   });
 
   const buf = await wb.xlsx.writeBuffer();
