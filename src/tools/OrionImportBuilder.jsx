@@ -1785,8 +1785,26 @@ function acmColLetter(n) { // 1-indexed column number -> Excel column letter
 // self-reference rows just written above without needing an external map.
 // The returned rowMap (keyed "cat", "cat|cls", or "cat|cls|ticker") lets a
 // *later* sheet build cross-sheet formulas pointing back at this one.
-function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extraCols) {
-  const ws = wb.addWorksheet(sheetName.slice(0,31).replace(/[\\/*?:[\]]/g,""));
+// Excel sheet names are capped at 31 characters, so a long advisor/family
+// name plus a " (Suggested)"/" Difference"/" (NQ)" suffix can truncate down
+// to the exact same string for what were meant to be different sheets —
+// exceljs throws "Worksheet name already exists" in that case. This
+// guarantees uniqueness by shortening further and appending a disambiguator
+// (~2, ~3, ...) rather than just hoping names stay short enough.
+function acmUniqueSheetName(rawName, usedNames) {
+  const base = rawName.replace(/[\\/*?:[\]]/g,"");
+  const first = base.slice(0,31);
+  if (!usedNames.has(first)) { usedNames.add(first); return first; }
+  for (let i=2; i<1000; i++) {
+    const suffix = `~${i}`;
+    const candidate = base.slice(0, 31-suffix.length) + suffix;
+    if (!usedNames.has(candidate)) { usedNames.add(candidate); return candidate; }
+  }
+  throw new Error(`Could not generate a unique sheet name for "${rawName}" — too many collisions.`);
+}
+
+function acmWriteSheet(wb, sheetName, title, models, categories, getValue, extraCols, usedNames) {
+  const ws = wb.addWorksheet(acmUniqueSheetName(sheetName, usedNames || new Set()));
   extraCols = extraCols || []; // [{header, getValue({level,cat,cls,t,mi})}] — placed after the model columns
   const totalCols = 1 + models.length + extraCols.length;
   const modelColStart = 2;
@@ -1933,6 +1951,7 @@ async function downloadAcmTemplate() {
 async function downloadAcmDigest(familyTrees, advisorName) {
   const ExcelJS = (await import("exceljs")).default;
   const wb = new ExcelJS.Workbook();
+  const usedNames = new Set(); // shared across every sheet in this workbook, so truncated names never collide
 
   Object.entries(familyTrees).forEach(([fam, tree]) => {
     const displayName = acmFamilyDisplayName(fam, advisorName);
@@ -1952,7 +1971,7 @@ async function downloadAcmDigest(familyTrees, advisorName) {
     }, [
       { header:"Target %", getValue: ({level,cls,t}) => level==="ticker" ? t.targetPct : (cls ? cls.targetPct : null) },
       { header:"Avg %", getValue: ({level,cls,t}) => level==="ticker" ? t.avgPct : (cls ? cls.avgPct : null) },
-    ]);
+    ], usedNames);
     const targetColLetter = acmColLetter(current.extraColStart);
     const modelColLetter = mi => acmColLetter(current.modelColStart+mi);
 
@@ -1984,7 +2003,7 @@ async function downloadAcmDigest(familyTrees, advisorName) {
         const tickerTargetRow = current.rowMap.get(`${cat.name}|${cls.name}|${t.ticker}`);
         const tickerTargetRef = ref(current.sheetName, targetColLetter, tickerTargetRow);
         return { formula: `${parentRef}*${tickerTargetRef}`, result: clsResult*t.targetPct };
-      });
+      }, null, usedNames);
 
     // Difference tab — LIVE FORMULA, Suggested minus Current, so it also
     // updates automatically when Target % changes.
@@ -2009,7 +2028,7 @@ async function downloadAcmDigest(familyTrees, advisorName) {
         const sugRef = ref(suggested.sheetName, modelColLetter(mi), sugRow);
         const curRef = ref(current.sheetName, modelColLetter(mi), curRow);
         return { formula: `${sugRef}-${curRef}`, result: clsSuggested*t.targetPct - t.currentByModel[mi] };
-      });
+      }, null, usedNames);
   });
 
   const buf = await wb.xlsx.writeBuffer();
