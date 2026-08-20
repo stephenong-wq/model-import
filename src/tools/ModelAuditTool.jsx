@@ -712,6 +712,39 @@ function parseP6Format(wb) {
 function parseTargetFile(wb, masterModels = []) {
   // Build set of master model names for existence filtering
   const masterNameSet = new Set(masterModels.map(m => m.name.toLowerCase()));
+
+  // Fast-path: Flat format — same structure as master file
+  // Detected by header containing "Target Percent" + "Model Aggregation Name"
+  const firstWs  = wb.Sheets[wb.SheetNames[0]];
+  const firstRaw = XLSX.utils.sheet_to_json(firstWs, { header: 1, defval: null });
+  const h0 = (firstRaw[0] || []).map(c => String(c || "").toLowerCase());
+  if (h0.some(v => v.includes("target percent")) && h0.some(v => v.includes("model aggregation name"))) {
+    const rows = XLSX.utils.sheet_to_json(firstWs, { defval: null });
+    if (rows.length) {
+      const keys        = Object.keys(rows[0]);
+      const findCol     = (...cs) => keys.find(k => cs.some(c => k.toLowerCase().includes(c.toLowerCase())));
+      const tickerCol   = findCol("ticker", "symbol");
+      const nameCol     = findCol("product name", "name", "security");
+      const targetCol   = findCol("target percent", "target");
+      const modelCol    = findCol("model aggregation name", "model name");
+
+      const byModel = {};
+      for (const r of rows) {
+        const ticker    = String(r[tickerCol] || "").trim().toUpperCase();
+        const modelName = String(r[modelCol]  || "").trim();
+        const target    = parseFloat(r[targetCol]) || 0;
+        if (!ticker || !modelName || target <= 0) continue;
+        if (!byModel[modelName]) byModel[modelName] = [];
+        byModel[modelName].push({ ticker, name: String(r[nameCol] || "").trim(), target, assetClass: "Equity", subSection: "" });
+      }
+
+      return Object.entries(byModel).map(([modelName, positions]) => ({
+        modelKey: `flat__${modelName}`, modelLabel: modelName,
+        sheetName: wb.SheetNames[0], colLabel: null, positions: dedupePositions(positions),
+      }));
+    }
+  }
+
   // Fast-path: Paragon security-set format
   if (isParagonFormat(wb)) return parseParagonFormat(wb);
   // Fast-path: P6 sleeve model format
@@ -889,18 +922,18 @@ function parseTargetFile(wb, masterModels = []) {
     }
   }
 
-  // ── Derive all STP variants from base models ───────────────────────────────
+  // ── Derive all STP variants dynamically from master model list ────────────
   const hasSTP = results.some(r => r.modelLabel.includes("Savvy Total Portfolios"));
-  if (hasSTP) {
+  if (hasSTP && masterModels.length) {
 
-    // Parse stock model tabs → holdings map
+    // Parse stock model tabs
     const stockModelTabs = {
       "Core Stock Model":     "Savvy Core S&P 500 Stock Model",
       "Growth Stock Model":   "Savvy LC Growth Stock Model",
       "Dividend Stock Model": "Savvy Dividend Stock Model",
       "Value Stock Model":    "Savvy Value Stock Model",
     };
-    const stockModelHoldings = {}; // variantName → [{ticker, name, weight (normalised to sum=1)}]
+    const stockModelHoldings = {};
     for (const [variantName, tabName] of Object.entries(stockModelTabs)) {
       const ws2 = wb.Sheets[tabName];
       if (!ws2) continue;
@@ -909,183 +942,155 @@ function parseTargetFile(wb, masterModels = []) {
       for (let ri = 1; ri < raw2.length; ri++) {
         const row = raw2[ri];
         if (!row) continue;
-        // Format A: ticker(0) name(1) alloc(2)  OR  ticker in col 0, weight in col 2
         const ticker = String(row[0] || "").trim().toUpperCase();
         if (!ticker || ticker.length > 6) continue;
         const weight = parseFloat(row[2]);
         if (isNaN(weight) || weight <= 0) continue;
         holdings.push({ ticker, name: String(row[1] || "").trim(), weight });
       }
-      // Normalise to sum=1
       const total = holdings.reduce((s, h) => s + h.weight, 0);
       if (total > 0) for (const h of holdings) h.weight /= total;
       stockModelHoldings[variantName] = holdings;
     }
 
-    // Helper: get positions from a named result
-    function getBase(modelLabel) {
-      return results.find(r => r.modelLabel === modelLabel);
-    }
-
-    // Helper: build a derived model from a base + transformation
-    function makeVariant(label, baseLabel, transform) {
-      const base = getBase(baseLabel);
-      if (!base) return null;
-      const positions = transform(base.positions);
-      if (!positions || !positions.length) return null;
-      return { modelKey: `derived__${label}`, modelLabel: label, sheetName: "Derived", colLabel: null, positions };
-    }
-
-    // Transformation helpers
-    function reweight(positions) {
-      const total = positions.reduce((s, p) => s + p.target, 0);
-      if (total <= 0) return positions;
-      return positions.map(p => ({ ...p, target: (p.target / total) * 100 }));
-    }
-
-    function excludeSubSection(positions, ...sections) {
-      return reweight(positions.filter(p => !sections.some(s => (p.subSection || "").includes(s))));
-    }
-
-    function keepSubSections(positions, ...sections) {
-      return reweight(positions.filter(p => sections.some(s => (p.subSection || "").includes(s))));
-    }
-
     function substituteUSLC(positions, stockVariant) {
       const stockHoldings = stockModelHoldings[stockVariant];
       if (!stockHoldings) return positions;
-      // Sum weight of US Large Cap positions
-      const ulcWeight = positions
-        .filter(p => (p.subSection || "").includes("us large cap"))
-        .reduce((s, p) => s + p.target, 0);
-      // Remove US Large Cap ETFs, add stock model holdings scaled to ulcWeight
-      const without = positions.filter(p => !(p.subSection || "").includes("us large cap"));
-      const stocks = stockHoldings.map(h => ({
-        ticker: h.ticker, name: h.name,
-        target: h.weight * ulcWeight,
-        assetClass: "Equity", subSection: "us large cap"
-      }));
+      const ulcWeight = positions.filter(p => (p.subSection||"").includes("us large cap")).reduce((s,p)=>s+p.target,0);
+      const without   = positions.filter(p => !(p.subSection||"").includes("us large cap"));
+      const stocks    = stockHoldings.map(h => ({ ticker: h.ticker, name: h.name, target: h.weight * ulcWeight, assetClass: "Equity", subSection: "us large cap" }));
       return dedupePositions([...without, ...stocks]);
     }
 
-    // Base risk level labels (regular sheet)
-    const BASE_LABELS = [
-      "All Fixed", "Conservative", "Moderately Conservative",
-      "Moderate", "Moderately Aggressive", "Aggressive", "All Equity"
-    ];
-    const STP_SHEET    = "Savvy Total Portfolios";
+    function reweightAll(positions) {
+      const total = positions.reduce((s,p)=>s+p.target,0);
+      return total > 0 ? positions.map(p=>({...p, target: p.target/total*100})) : positions;
+    }
+
+    function excludeSS(positions, ...sections) {
+      return reweightAll(positions.filter(p => !sections.some(s => (p.subSection||"").toLowerCase().includes(s.toLowerCase()))));
+    }
+
+    const STP_SHEET     = "Savvy Total Portfolios";
     const STP_TAX_SHEET = "Savvy Total Portfolios (Tax Awa";
 
-    const derived = [];
-
-    for (const risk of BASE_LABELS) {
-      const regKey  = `${STP_SHEET} — ${risk}`;
-      const taxKey  = `${STP_TAX_SHEET} — ${risk}`;
-      const regName = `STP - ${risk}`;  // base — already in results
-      const taxName = `STP - ${risk} (Tax Aware)`;
-
-      // ex-USLC regular
-      if (!["All Fixed"].includes(risk)) {
-        derived.push(makeVariant(`STP - ${risk} (ex-USLC)`, regKey,
-          p => excludeSubSection(p, "us large cap")));
-        // ex-USLC Tax Aware
-        derived.push(makeVariant(`STP - ${risk} (ex-USLC) - Tax Aware`, taxKey,
-          p => excludeSubSection(p, "us large cap")));
-      }
-
-      // US Equity Only — small cap stays as-is, international/emerging excluded,
-      // their weight is redistributed pro-rata to US Large Cap holdings only
-      if (!["All Fixed"].includes(risk)) {
-        const usEquityOnly = p => {
-          const isUSLargeCap = pos => (pos.subSection || "").includes("us large cap");
-          const isUSSmallCap = pos => (pos.subSection || "").includes("us small cap");
-          const isIntlOrEM   = pos => {
-            const ss = pos.subSection || "";
-            return ss.includes("intl developed") || ss.includes("emerging");
-          };
-
-          // Weight being removed (intl + emerging)
-          const removedWeight = p.filter(isIntlOrEM).reduce((s, pos) => s + pos.target, 0);
-          // Current US Large Cap total weight
-          const ulcWeight = p.filter(isUSLargeCap).reduce((s, pos) => s + pos.target, 0);
-
-          const result = p
-            .filter(pos => !isIntlOrEM(pos))
-            .map(pos => {
-              if (isUSLargeCap(pos) && ulcWeight > 0) {
-                // Scale each US Large Cap holding up by (ulcWeight + removedWeight) / ulcWeight
-                return { ...pos, target: pos.target * (ulcWeight + removedWeight) / ulcWeight };
-              }
-              return pos; // small cap, FI, alts, cash — unchanged
-            });
-          return dedupePositions(result);
-        };
-        derived.push(makeVariant(`STP - ${risk} - US Equity Only`, regKey, usEquityOnly));
-        derived.push(makeVariant(`STP - ${risk} - US Equity Only (Tax Aware)`, taxKey, usEquityOnly));
-      }
-
-      // Stock model substitutions (replace US Large Cap with individual stocks)
-      for (const [variantName] of Object.entries(stockModelTabs)) {
-        const suffix = variantName; // e.g. "Core Stock Model"
-        derived.push(makeVariant(`STP - ${risk} - ${suffix}`, regKey,
-          p => substituteUSLC(p, variantName)));
-        derived.push(makeVariant(`STP - ${risk} (Tax Aware) - ${suffix}`, taxKey,
-          p => substituteUSLC(p, variantName)));
-      }
+    // Base risk → source model label in results
+    const BASE_RISK_MAP = {};
+    const TAX_RISK_MAP  = {};
+    const BASE_ORDER = ["All Fixed","All Equity","Moderately Conservative","Moderately Aggressive","Conservative","Moderate","Aggressive"];
+    for (const risk of BASE_ORDER) {
+      BASE_RISK_MAP[risk] = `${STP_SHEET} — ${risk}`;
+      TAX_RISK_MAP[risk]  = `${STP_TAX_SHEET} — ${risk}`;
     }
 
-    // Filter out nulls, avoid duplicates, and ONLY keep models that exist in master
-    // This prevents generating variants that have no master counterpart
-    const existingKeys = new Set(results.map(r => r.modelLabel));
-    for (const d of derived) {
-      if (d && !existingKeys.has(d.modelLabel) &&
-          (masterNameSet.size === 0 || masterNameSet.has(d.modelLabel.toLowerCase()))) {
-        results.push(d);
-        existingKeys.add(d.modelLabel);
+    // Build midpoints and add to maps
+    function avgPositions(lp, rp) {
+      const ri = {};
+      for (const p of rp) ri[normalizeTicker(p.ticker)] = p;
+      const b = {};
+      for (const p of lp) {
+        const k = normalizeTicker(p.ticker);
+        b[k] = { ...p, target: (p.target + (ri[k]?ri[k].target:0)) / 2 };
       }
+      for (const p of rp) {
+        const k = normalizeTicker(p.ticker);
+        if (!b[k]) b[k] = { ...p, target: p.target / 2 };
+      }
+      return dedupePositions(Object.values(b).filter(p=>p.target>0));
     }
 
-    // ── Midpoint models ────────────────────────────────────────────────────────
-    function avgPositions(leftPos, rightPos) {
-      const rightIdx = {};
-      for (const p of rightPos) rightIdx[normalizeTicker(p.ticker)] = p;
-      const blended = {};
-      for (const p of leftPos) {
-        const key = normalizeTicker(p.ticker);
-        const rt = rightIdx[key] ? rightIdx[key].target : 0;
-        blended[key] = { ...p, target: (p.target + rt) / 2 };
-      }
-      for (const p of rightPos) {
-        const key = normalizeTicker(p.ticker);
-        if (!blended[key]) blended[key] = { ...p, target: p.target / 2 };
-      }
-      return dedupePositions(Object.values(blended).filter(p => p.target > 0));
+    const MIDPOINT_NEIGHBORS = {
+      "10/90": ["All Fixed","Conservative"],
+      "30/70": ["Conservative","Moderately Conservative"],
+      "50/50": ["Moderately Conservative","Moderate"],
+      "70/30": ["Moderate","Moderately Aggressive"],
+    };
+    const midpointCache = {}; // ratio → {reg: positions, tax: positions}
+    for (const [ratio, [left, right]] of Object.entries(MIDPOINT_NEIGHBORS)) {
+      const lReg = results.find(r=>r.modelLabel===BASE_RISK_MAP[left]);
+      const rReg = results.find(r=>r.modelLabel===BASE_RISK_MAP[right]);
+      const lTax = results.find(r=>r.modelLabel===TAX_RISK_MAP[left]);
+      const rTax = results.find(r=>r.modelLabel===TAX_RISK_MAP[right]);
+      midpointCache[ratio] = {
+        reg: lReg && rReg ? avgPositions(lReg.positions, rReg.positions) : null,
+        tax: lTax && rTax ? avgPositions(lTax.positions, rTax.positions) : null,
+      };
+      if (midpointCache[ratio].reg) BASE_RISK_MAP[ratio] = `__mp_reg_${ratio}`;
+      if (midpointCache[ratio].tax) TAX_RISK_MAP[ratio]  = `__mp_tax_${ratio}`;
     }
 
-    function makeMidpoint(label, leftKey, rightKey) {
-      const leftModel  = results.find(r => r.modelLabel === leftKey);
-      const rightModel = results.find(r => r.modelLabel === rightKey);
-      if (!leftModel || !rightModel) return null;
-      const positions = avgPositions(leftModel.positions, rightModel.positions);
-      return positions.length ? { modelKey: `midpoint__${label}`, modelLabel: label, sheetName: "Midpoint", colLabel: null, positions } : null;
+    function getBasePositions(base, taxAware) {
+      const map = taxAware ? TAX_RISK_MAP : BASE_RISK_MAP;
+      const key = map[base];
+      if (!key) return null;
+      if (key.startsWith("__mp_reg_")) return midpointCache[base]?.reg || null;
+      if (key.startsWith("__mp_tax_")) return midpointCache[base]?.tax || null;
+      const model = results.find(r=>r.modelLabel===key);
+      return model ? model.positions : null;
     }
 
-    const STP_MIDPOINTS = [
-      { label: "STP - 30/70",              left: `${STP_SHEET} — Conservative`,            right: `${STP_SHEET} — Moderately Conservative` },
-      { label: "STP - 50/50",              left: `${STP_SHEET} — Moderately Conservative`, right: `${STP_SHEET} — Moderate` },
-      { label: "STP - 70/30",              left: `${STP_SHEET} — Moderate`,                right: `${STP_SHEET} — Moderately Aggressive` },
-      { label: "STP - 10/90 (Tax Aware)",  left: `${STP_TAX_SHEET} — All Fixed`,               right: `${STP_TAX_SHEET} — Conservative` },
-      { label: "STP - 50/50 (Tax Aware)",  left: `${STP_TAX_SHEET} — Moderately Conservative`, right: `${STP_TAX_SHEET} — Moderate` },
-      { label: "STP - 70/30 (Tax Aware)",  left: `${STP_TAX_SHEET} — Moderate`,                right: `${STP_TAX_SHEET} — Moderately Aggressive` },
-    ];
-
-    for (const mp of STP_MIDPOINTS) {
-      const generated = makeMidpoint(mp.label, mp.left, mp.right);
-      if (generated && !existingKeys.has(generated.modelLabel) &&
-          (masterNameSet.size === 0 || masterNameSet.has(generated.modelLabel.toLowerCase()))) {
-        results.push(generated);
-        existingKeys.add(generated.modelLabel);
+    // Decode STP model name
+    function decodeSTPName(name) {
+      let base = null;
+      const allBases = [...BASE_ORDER, ...Object.keys(MIDPOINT_NEIGHBORS)];
+      // Sort longest first to avoid partial matches (Moderately Conservative before Conservative)
+      const sorted = allBases.sort((a,b)=>b.length-a.length);
+      for (const b of sorted) {
+        if (name.includes(`STP - ${b}`)) { base = b; break; }
       }
+      return {
+        base,
+        taxAware:     /\(Tax Aware\)/i.test(name),
+        exUslc:       /\(ex-USLC\)|\(Ex-USLC\)/i.test(name) && !/Ex-Int Dev/i.test(name),
+        exAll:        /Ex-USLC, Ex-Int Dev, Ex-EM/i.test(name),
+        usEquityOnly: /US Equity Only/i.test(name),
+        stockVariant: Object.keys(stockModelTabs).find(sv=>name.includes(sv)) || null,
+        isDotE:       name.endsWith(".e"),
+      };
+    }
+
+    // Apply all transformations to a set of positions
+    function applyTransforms(pos, d) {
+      // ex-USLC: remove US LC, reweight all remaining pro-rata
+      if (d.exUslc || d.exAll) pos = excludeSS(pos, "us large cap");
+      // ex-All: also remove intl + emerging
+      if (d.exAll) pos = excludeSS(pos, "intl developed", "emerging");
+      // US Equity Only: remove intl/emerging, freed weight goes to US LC (or pro-rata if no US LC)
+      if (d.usEquityOnly) {
+        const removedWt = pos.filter(p=>(p.subSection||"").match(/intl|emerging/i)).reduce((s,p)=>s+p.target,0);
+        const ulcWt     = pos.filter(p=>(p.subSection||"").includes("us large cap")).reduce((s,p)=>s+p.target,0);
+        if (ulcWt > 0) {
+          const sf = (ulcWt + removedWt) / ulcWt;
+          pos = dedupePositions(pos
+            .filter(p=>!(p.subSection||"").match(/intl|emerging/i))
+            .map(p=>(p.subSection||"").includes("us large cap") ? {...p,target:p.target*sf} : p));
+        } else {
+          pos = reweightAll(pos.filter(p=>!(p.subSection||"").match(/intl|emerging/i)));
+        }
+      }
+      // Stock substitution: replace US LC with individual stocks
+      if (d.stockVariant) pos = substituteUSLC(pos, d.stockVariant);
+      return dedupePositions(pos);
+    }
+
+    const existingKeys = new Set(results.map(r=>r.modelLabel));
+
+    // Iterate every STP model in master and derive positions
+    for (const masterModel of masterModels) {
+      const name = masterModel.name;
+      if (!name.startsWith("STP - ")) continue;
+      if (existingKeys.has(name)) continue;
+      const d = decodeSTPName(name);
+      if (!d.base || d.isDotE) continue;
+
+      const basePos = getBasePositions(d.base, d.taxAware);
+      if (!basePos || !basePos.length) continue;
+
+      const positions = applyTransforms([...basePos], d);
+      if (!positions.length) continue;
+
+      results.push({ modelKey: `derived__${name}`, modelLabel: name, sheetName: "Derived", colLabel: null, positions });
+      existingKeys.add(name);
     }
   }
 
