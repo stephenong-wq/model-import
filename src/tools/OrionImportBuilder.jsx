@@ -18,6 +18,7 @@ const TEMPLATE_COLS = [
 
 const COL_ALIASES = {
   "model id":"Model ID","* model name":"* Model Name","model name":"* Model Name",
+  "model aggregation name":"* Model Name","* model aggregation name":"* Model Name",
   "model description":"Model Description","* security set id":"* Security Set ID",
   "security set id":"* Security Set ID","* security set submodel name":"* Security Set SubModel Name",
   "security set submodel name":"* Security Set SubModel Name",
@@ -59,7 +60,7 @@ function parseWorkbookRows(buffer) {
   let headerIdx = -1;
   for (let i = 0; i < Math.min(raw.length, 15); i++) {
     const norm = (raw[i]||[]).map(c => normalizeKey(c));
-    if (norm.includes("model id")||norm.includes("* model name")||norm.includes("model name")) { headerIdx=i; break; }
+    if (norm.includes("model id")||norm.includes("* model name")||norm.includes("model name")||norm.includes("model aggregation name")) { headerIdx=i; break; }
   }
   if (headerIdx===-1) throw new Error("Could not find a header row with 'Model ID' or 'Model Name'.");
   const headers = raw[headerIdx].map(c => COL_ALIASES[normalizeKey(c)] || (c?c.toString().trim():null));
