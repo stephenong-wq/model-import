@@ -924,7 +924,7 @@ function analyzeModelName(modelName) {
     isTaxAware: /tax/i.test(modelName||""),
     isExUslc: /ex[-\s]?uslc/i.test(modelName||""),
     isExFI: /\bex[-\s]?fi\b/i.test(modelName||""),
-    isUsEquityOnly: false,
+    isUsEquityOnly: /us\s+equity\s+only/i.test(modelName||""),
     holdingsAssetClass: null, // "equity" | "fixedIncome" | "other" | null
   };
   let changed = true;
@@ -1082,13 +1082,33 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
       const largeCapFrac = usLargeCapRow ? (getMatchFrac(usLargeCapRow, match) || 0) : 0;
       const fixedIncomeCatRow = flags.isExFI ? matchLibraryLabel("FIXED INCOME", catRows) : null;
       const fixedIncomeFrac = fixedIncomeCatRow ? (getMatchFrac(fixedIncomeCatRow, match) || 0) : 0;
-      const excludedFrac = largeCapFrac + fixedIncomeFrac;
+      // Combined with "US Equity Only": that tag's own effect (everything
+      // that isn't US Large/Small Cap gets folded directly into Large Cap)
+      // happens BEFORE ex-USLC removes Large Cap — so the amount ex-USLC
+      // actually excludes is Large Cap's fraction *plus* every non-US-equity
+      // class in that same category (International, Emerging Markets, etc.),
+      // since that's what ends up bundled into the Large Cap figure being
+      // removed. Verified this reduces to the same math as excluding all of
+      // them directly and rescaling once.
+      let nonUsEquityFrac = 0;
+      if (flags.isExUslc && flags.isUsEquityOnly && usLargeCapRow) {
+        nonUsEquityFrac = classRows
+          .filter(c => c.category===usLargeCapRow.category && normAlnum(c.label)!=="USLARGECAP" && normAlnum(c.label)!=="USSMALLCAP")
+          .reduce((s,c) => s + (getMatchFrac(c, match) || 0), 0);
+      }
+      const excludedFrac = largeCapFrac + fixedIncomeFrac + nonUsEquityFrac;
       const scale = excludedFrac < 1 ? 1/(1-excludedFrac) : 1;
 
       if (classSubName) {
         const classMatch = matchLibraryLabel(classSubName, classRows);
         if (!classMatch) {
           unmatchedClasses.push({ modelName, label: classSubName });
+        } else if (flags.isUsEquityOnly && usLargeCapRow && classMatch.category===usLargeCapRow.category
+                   && normAlnum(classMatch.label)!=="USLARGECAP" && normAlnum(classMatch.label)!=="USSMALLCAP") {
+          // Non-US-equity class (International, Emerging Markets, etc.) —
+          // "US Equity Only" means this shouldn't hold any weight at all;
+          // its fraction is already folded into excludedFrac above.
+          recordChange(i, "Class Target %", modelName, classSubName, r["Class Target %"], 0);
         } else {
           const classFrac = getMatchFrac(classMatch, match);
           if (classFrac !== null && classFrac !== undefined) {
