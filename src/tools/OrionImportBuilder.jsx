@@ -1175,6 +1175,39 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
     }
   });
 
+  // Reconcile ex-USLC/ex-FI rounding drift: the whole-portfolio rescale
+  // rounds each class to 2 decimals independently, so tiny drift (a few
+  // hundredths of a point) can accumulate across a model's classes and land
+  // just off 100%. Nudge the largest class by the residual so the model's
+  // classes sum to exactly 100 — a change this small on the largest class is
+  // negligible, and safer than nudging a small class by comparison.
+  const exclusionGroups = new Map(); // modelName -> [{ i, val }]
+  rows.forEach((r, i) => {
+    const modelName = r["* Model Name"];
+    if (!modelName || !r["Class SubModel Name"] || !(modelName in modelMatchCache)) return;
+    const { match, flags } = modelMatchCache[modelName];
+    if (!match || !(flags.isExUslc || flags.isExFI)) return;
+    const val = updated[i]["Class Target %"];
+    if (typeof val !== "number") return;
+    if (!exclusionGroups.has(modelName)) exclusionGroups.set(modelName, []);
+    exclusionGroups.get(modelName).push({ i, val });
+  });
+  exclusionGroups.forEach((entries, modelName) => {
+    const sum = entries.reduce((s,e) => s+e.val, 0);
+    const diff = +(100 - sum).toFixed(2);
+    if (diff === 0 || Math.abs(diff) >= 0.5) return; // 0.5+ off suggests a real issue, not rounding — leave alone
+    const largest = entries.reduce((a,b) => b.val>a.val ? b : a, entries[0]);
+    const newVal = +(largest.val + diff).toFixed(2);
+    if (Math.abs(newVal - largest.val) < 1e-9) return;
+    updated[largest.i]["Class Target %"] = newVal;
+    const label = rows[largest.i]["Class SubModel Name"];
+    const key = `${modelName}|Class Target %|${label}|${newVal}`;
+    if (!changeKeys.has(key)) {
+      changeKeys.add(key);
+      changes.push({ modelName, level:"Class", label, oldVal: rows[largest.i]["Class Target %"], newVal, note:"rounding reconciliation (classes now sum to 100%)" });
+    }
+  });
+
   return {
     updatedRows: updated, changes,
     skippedModels: [...skippedModels.entries()].map(([modelName, reason]) => ({ modelName, reason })),
