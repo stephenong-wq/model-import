@@ -891,6 +891,10 @@ function matchLibraryLabel(sourceStr, libraryRows) {
 // ("... - Tax Aware", "... - Core Stock Model") — real files mix both styles.
 //   isTaxAware         → use the Tax Aware library sheet instead of the base one
 //   isExUslc           → excludes US Large Cap; see the flatten-and-rescale rule below
+//   isExFI             → excludes the entire Fixed Income category, same
+//                        flatten-and-rescale rule — combinable with isExUslc
+//                        (both fractions excluded together) since real model
+//                        names use both tags at once (e.g. "ex-USLC, ex-FI")
 //   isUsEquityOnly     → excludes non-US equity; US Small Cap keeps its normal
 //                        value, US Large Cap absorbs whatever's left
 //   holdingsAssetClass → a holdings substitution: "equity" (Core/Growth/
@@ -919,6 +923,7 @@ function analyzeModelName(modelName) {
   const flags = {
     isTaxAware: /tax/i.test(modelName||""),
     isExUslc: /ex[-\s]?uslc/i.test(modelName||""),
+    isExFI: /\bex[-\s]?fi\b/i.test(modelName||""),
     isUsEquityOnly: false,
     holdingsAssetClass: null, // "equity" | "fixedIncome" | "other" | null
   };
@@ -1064,16 +1069,21 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
     const catSubName = r["Category SubModel Name"];
     const classSubName = r["Class SubModel Name"];
 
-    if (flags.isExUslc) {
-      // Verified against real data: US Large Cap is excluded and its
+    if (flags.isExUslc || flags.isExFI) {
+      // Verified against real data (ex-USLC case): the excluded portion's
       // whole-model fraction is redistributed pro-rata across EVERY other
-      // class in the model (not just Equity) — new Class % = classFrac ×
-      // 1/(1-largeCapFrac) × 100. Category Target % is intentionally left
-      // untouched — the file's Category SubModel Name for these rows is a
-      // flattened placeholder, not real structured data.
-      const usLargeCapRow = matchLibraryLabel("US Large Cap", classRows);
+      // class in the model — new Class % = classFrac × 1/(1-excludedFrac) ×
+      // 100. ex-FI removes the entire Fixed Income category the same way;
+      // combined (both tags on one model) just sums both excluded fractions
+      // before rescaling. Category Target % is intentionally left untouched
+      // — the file's Category SubModel Name for these rows is a flattened
+      // placeholder, not real structured data.
+      const usLargeCapRow = flags.isExUslc ? matchLibraryLabel("US Large Cap", classRows) : null;
       const largeCapFrac = usLargeCapRow ? (getMatchFrac(usLargeCapRow, match) || 0) : 0;
-      const scale = largeCapFrac < 1 ? 1/(1-largeCapFrac) : 1;
+      const fixedIncomeCatRow = flags.isExFI ? matchLibraryLabel("FIXED INCOME", catRows) : null;
+      const fixedIncomeFrac = fixedIncomeCatRow ? (getMatchFrac(fixedIncomeCatRow, match) || 0) : 0;
+      const excludedFrac = largeCapFrac + fixedIncomeFrac;
+      const scale = excludedFrac < 1 ? 1/(1-excludedFrac) : 1;
 
       if (classSubName) {
         const classMatch = matchLibraryLabel(classSubName, classRows);
