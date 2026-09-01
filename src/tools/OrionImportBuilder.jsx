@@ -1103,6 +1103,12 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
         const classMatch = matchLibraryLabel(classSubName, classRows);
         if (!classMatch) {
           unmatchedClasses.push({ modelName, label: classSubName });
+        } else if (flags.isExUslc && usLargeCapRow && classMatch===usLargeCapRow) {
+          // US Large Cap itself — ex-USLC means this is excluded entirely,
+          // not rescaled. Some files still carry this row explicitly (rather
+          // than omitting it) even after the tag is applied, so this can't
+          // just be assumed structurally absent.
+          recordChange(i, "Class Target %", modelName, classSubName, r["Class Target %"], 0);
         } else if (flags.isUsEquityOnly && usLargeCapRow && classMatch.category===usLargeCapRow.category
                    && normAlnum(classMatch.label)!=="USLARGECAP" && normAlnum(classMatch.label)!=="USSMALLCAP") {
           // Non-US-equity class (International, Emerging Markets, etc.) —
