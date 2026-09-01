@@ -1175,24 +1175,28 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
     }
   });
 
-  // Reconcile ex-USLC/ex-FI rounding drift: the whole-portfolio rescale
+  // Reconcile rounding drift: every class-value formula in this function
   // rounds each class to 2 decimals independently, so tiny drift (a few
-  // hundredths of a point) can accumulate across a model's classes and land
-  // just off 100%. Nudge the largest class by the residual so the model's
-  // classes sum to exactly 100 — a change this small on the largest class is
-  // negligible, and safer than nudging a small class by comparison.
-  const exclusionGroups = new Map(); // modelName -> [{ i, val }]
+  // hundredths of a point) can accumulate across a category's classes and
+  // land just off 100% — this isn't specific to ex-USLC/ex-FI, it happens
+  // with the normal classFrac/catFrac formula too. Nudge the largest class
+  // in each (model, category) group by the residual so it sums to exactly
+  // 100 — a change this small on the largest class is negligible, and safer
+  // than nudging a small class by comparison.
+  const categoryGroups = new Map(); // "modelName|catSubModelName" -> [{ i, val }]
   rows.forEach((r, i) => {
     const modelName = r["* Model Name"];
-    if (!modelName || !r["Class SubModel Name"] || !(modelName in modelMatchCache)) return;
-    const { match, flags } = modelMatchCache[modelName];
-    if (!match || !(flags.isExUslc || flags.isExFI)) return;
+    const catSubModelName = r["Category SubModel Name"];
+    if (!modelName || !catSubModelName || !r["Class SubModel Name"]) return;
     const val = updated[i]["Class Target %"];
     if (typeof val !== "number") return;
-    if (!exclusionGroups.has(modelName)) exclusionGroups.set(modelName, []);
-    exclusionGroups.get(modelName).push({ i, val });
+    const key = `${modelName}|${catSubModelName}`;
+    if (!categoryGroups.has(key)) categoryGroups.set(key, []);
+    categoryGroups.get(key).push({ i, val });
   });
-  exclusionGroups.forEach((entries, modelName) => {
+  categoryGroups.forEach((entries, key) => {
+    if (entries.length < 2) return; // nothing to reconcile with only one class
+    const modelName = rows[entries[0].i]["* Model Name"];
     const sum = entries.reduce((s,e) => s+e.val, 0);
     const diff = +(100 - sum).toFixed(2);
     if (diff === 0 || Math.abs(diff) >= 0.5) return; // 0.5+ off suggests a real issue, not rounding — leave alone
@@ -1201,9 +1205,9 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
     if (Math.abs(newVal - largest.val) < 1e-9) return;
     updated[largest.i]["Class Target %"] = newVal;
     const label = rows[largest.i]["Class SubModel Name"];
-    const key = `${modelName}|Class Target %|${label}|${newVal}`;
-    if (!changeKeys.has(key)) {
-      changeKeys.add(key);
+    const key2 = `${modelName}|Class Target %|${label}|${newVal}`;
+    if (!changeKeys.has(key2)) {
+      changeKeys.add(key2);
       changes.push({ modelName, level:"Class", label, oldVal: rows[largest.i]["Class Target %"], newVal, note:"rounding reconciliation (classes now sum to 100%)" });
     }
   });
