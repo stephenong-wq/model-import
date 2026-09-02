@@ -1040,7 +1040,7 @@ function parseTargetFile(wb, masterModels = []) {
       }
       return {
         base,
-        taxAware:     /\(Tax Aware\)/i.test(name),
+        taxAware:     /\(Tax Aware\)/i.test(name) || /- Tax Aware/i.test(name),
         exUslc:       /\(ex-USLC\)|\(Ex-USLC\)/i.test(name) && !/Ex-Int Dev/i.test(name),
         exAll:        /Ex-USLC, Ex-Int Dev, Ex-EM/i.test(name),
         usEquityOnly: /US Equity Only/i.test(name),
