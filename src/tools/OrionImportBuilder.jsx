@@ -2458,7 +2458,6 @@ function AcmFlow({ onBack }) {
           throw new Error(`${missing.length} ticker${missing.length!==1?"s":""} missing a Category (not filled in on the template, and not seen before): ${missing.map(s=>s.ticker).join(", ")}. Add Category/Class to the template and re-upload.`);
         }
         setCategorized(merged);
-        setSkipAdjustmentFamilies({}); // reset per-upload; families aren't known until now
         // Stays on "upload" — the family checkboxes appear right here once
         // `parsed` is set, instead of moving to a separate screen.
       } catch (err) { setError(err.message); }
