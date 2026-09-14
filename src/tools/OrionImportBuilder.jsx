@@ -2361,7 +2361,6 @@ function buildAcmFinalExport(reimportedFamilies, ssPrefixName, modelType, adviso
             "* Model Name": fullModelName,
             "* Security Set ID": ssId,
             "Category SubModel Name": `${categoryPrefix} - ${catDisplay}`,
-            "Category Asset Class Type": meta.display,
             "Category Namespace": "Default Team",
             "Category Target %": catPct,
             "Category Band/Range": catBand.band,
