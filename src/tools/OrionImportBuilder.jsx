@@ -1539,30 +1539,11 @@ function parseAdvisorTemplate(buffer, sheetName) {
     modelCols.push({ i, h: h.toString().trim() });
   }
 
-  // Pair adjacent "X" / "X NQ" columns into families.
-  const families = {};
-  const consumed = new Set();
-  for (let k=0; k<modelCols.length; k++) {
-    const { i, h } = modelCols[k];
-    if (consumed.has(i) || /nq$/i.test(h)) continue;
-    families.Reg = families.Reg || [];
-    families.Reg.push({ model:h, col:i });
-    consumed.add(i);
-    const next = modelCols[k+1];
-    if (next && /nq$/i.test(next.h) && !consumed.has(next.i)) {
-      families.NQ = families.NQ || [];
-      families.NQ.push({ model:h, col:next.i });
-      consumed.add(next.i);
-    }
-  }
-  for (const { i, h } of modelCols) {
-    if (consumed.has(i)) continue;
-    families.NQ = families.NQ || [];
-    families.NQ.push({ model:h.replace(/\s*nq$/i,"").trim(), col:i });
-    consumed.add(i);
-  }
-  if (!families.Reg && families.NQ) { families.Reg = families.NQ; delete families.NQ; }
-  if (Object.keys(families).length===1 && families.Reg) { families.Standard = families.Reg; delete families.Reg; }
+  // Each upload is one flat set of models — no Reg/NQ pairing within a
+  // single file. Reg and Tax-Aware/NQ variants get uploaded as separate
+  // files, run through separately, so every model column here just belongs
+  // to one family.
+  const families = { Standard: modelCols.map(({i,h}) => ({ model:h, col:i })) };
 
   const securities = [];
   for (let r=dataStart; r<raw.length; r++) {
@@ -1652,6 +1633,27 @@ function computeProportionalTargets(siblingRawArrays) {
   return { targets: acmRoundAndReconcile(normalized, increment), avgs: normalized };
 }
 
+// For a family already confirmed to be proportional (advisor worked it out
+// directly, no need for the tool to re-derive a "best fit") — no z-score
+// outlier exclusion, no rounding to a clean 5%/1% grid. Just the actual
+// ratio, taken directly (zero-parent models still skipped, since there's
+// nothing to divide by) and normalized so siblings sum to 1.
+function computeDirectProportionalTargets(siblingRawArrays) {
+  if (siblingRawArrays.length===1) return { targets:[1], avgs:[1] };
+  const numModels = siblingRawArrays[0].length;
+  const parentTotals = Array.from({length:numModels}, (_,m) => siblingRawArrays.reduce((s,arr)=>s+(arr[m]||0),0));
+  const rawMeans = siblingRawArrays.map(arr => {
+    const ratios = [];
+    for (let m=0;m<numModels;m++) if (parentTotals[m]>1e-9) ratios.push(arr[m]/parentTotals[m]);
+    if (ratios.length===0) return 0;
+    return ratios.reduce((a,b)=>a+b,0)/ratios.length;
+  });
+  const sum = rawMeans.reduce((a,b)=>a+b,0);
+  const normalized = sum>0 ? rawMeans.map(t=>t/sum) : rawMeans.map(()=>1/siblingRawArrays.length);
+  const rounded = normalized.map(v=>+v.toFixed(6));
+  return { targets: rounded, avgs: rounded };
+}
+
 // Builds the per-family Category > Class > Ticker tree with current (raw)
 // totals per model and computed proportional targets. Categories are never
 // smoothed (they're the model's true risk-profile definition); Class and
@@ -1673,8 +1675,14 @@ function computeProportionalTargets(siblingRawArrays) {
 // family that has that same Security Set. Groups whose ticker composition
 // genuinely differs between families (different bond tickers, etc.) are
 // still computed independently per family, same as before.
-function buildAcmFamilyTrees(familyData) {
+function buildAcmFamilyTrees(familyData, skipAdjustmentFamilies) {
+  skipAdjustmentFamilies = skipAdjustmentFamilies || new Set();
   const famNames = Object.keys(familyData);
+  // Use the direct (no exclusion, no rounding) computation only when EVERY
+  // family contributing to a given computation is flagged "already
+  // proportional" — a merge combining a flagged and unflagged family falls
+  // back to the normal best-fit treatment rather than guessing.
+  const pickCompute = fams => fams.every(f => skipAdjustmentFamilies.has(f)) ? computeDirectProportionalTargets : computeProportionalTargets;
 
   const famGroups = {}; // famName -> { catName -> { clsKey -> [securities] } }
   famNames.forEach(fam => {
@@ -1729,7 +1737,7 @@ function buildAcmFamilyTrees(familyData) {
           });
           return combined;
         });
-        ({ targets: classTargetsShared, avgs: classAvgsShared } = computeProportionalTargets(combinedArrays));
+        ({ targets: classTargetsShared, avgs: classAvgsShared } = pickCompute(famsWithCat)(combinedArrays));
       }
     }
 
@@ -1745,7 +1753,7 @@ function buildAcmFamilyTrees(familyData) {
         classTargets = classTargetsShared; classAvgs = classAvgsShared;
       } else if (activeClassNames.length>1 && activeClassNames[0]!=="__direct__") {
         const classArrays = activeClassNames.map(cn => models.map(m => classes[cn].reduce((s,sec)=>s+(sec.raw[m]||0),0)));
-        ({ targets: classTargets, avgs: classAvgs } = computeProportionalTargets(classArrays));
+        ({ targets: classTargets, avgs: classAvgs } = pickCompute([fam])(classArrays));
       } else {
         classTargets = activeClassNames.map(()=>1); classAvgs = activeClassNames.map(()=>1);
       }
@@ -1778,10 +1786,10 @@ function buildAcmFamilyTrees(familyData) {
                 combined[ti] = combined[ti].concat(fModels.map(m => sec ? (sec.raw[m]||0) : 0));
               });
             });
-            ({ targets: tickerTargets, avgs: tickerAvgs } = computeProportionalTargets(combined));
+            ({ targets: tickerTargets, avgs: tickerAvgs } = pickCompute(famsWithThisClass)(combined));
           } else {
             const arrays = activeSecs.map(s => models.map(m => s.raw[m]||0));
-            ({ targets: tickerTargets, avgs: tickerAvgs } = computeProportionalTargets(arrays));
+            ({ targets: tickerTargets, avgs: tickerAvgs } = pickCompute([fam])(arrays));
           }
         } else if (activeSecs.length===1) {
           tickerTargets = [1]; tickerAvgs = [1];
@@ -2242,7 +2250,7 @@ function acmCategoryMeta(catKey) {
   return ACM_CATEGORY_META[catKey] || { display: acmTitleCase(catKey), bandType: "fixed5" };
 }
 
-function buildAcmFinalExport(reimportedFamilies) {
+function buildAcmFinalExport(reimportedFamilies, ssPrefixName, modelType) {
   const modelRows = [];
 
   // ── Pass 1: determine, per (Category, Class), whether its ticker+
@@ -2277,16 +2285,17 @@ function buildAcmFinalExport(reimportedFamilies) {
     });
   });
 
-  // Returns the shared base family name if 2+ families have this exact
-  // (Category, Class) composition, otherwise this family's own full name.
+  // Returns the Category/Class/Security-Set prefix to use: the dedicated
+  // ssPrefixName (independent of whatever's used for the Model Name), with
+  // " (NQ)" appended only when this family's version genuinely isn't shared
+  // with another family — a truly shared Security Set/Class never carries a
+  // tax-status suffix, since nothing about it actually differs by tax status.
   function sharedOrOwnFamilyName(familyName, catName, clsKey, tickers) {
     const sig = classSignature(catName, clsKey, tickers);
     const fullKey = `${catName}|${clsKey}|${sig}`;
     const sharingFamilies = sigToFamilies.get(fullKey);
-    if (sharingFamilies && sharingFamilies.size > 1) {
-      return acmBaseFamilyName([...sharingFamilies].sort()[0]);
-    }
-    return familyName;
+    if (sharingFamilies && sharingFamilies.size > 1) return ssPrefixName;
+    return `${ssPrefixName}${/\(NQ\)/i.test(familyName) ? " (NQ)" : ""}`;
   }
 
   // ── Pass 2: build Model rows (Category/Class SubModel Names are
@@ -2306,7 +2315,7 @@ function buildAcmFinalExport(reimportedFamilies) {
 
     models.forEach((modelName, mi) => {
       const isNQFamily = /\(NQ\)/i.test(familyName);
-      const fullModelName = `Strategic Advisor Model - ${acmBaseFamilyName(familyName)} ${modelName}${isNQFamily ? " (NQ)" : ""}`;
+      const fullModelName = `${modelType} Advisor Model - ${acmBaseFamilyName(familyName)} ${modelName}${isNQFamily ? " (NQ)" : ""}`;
       Object.entries(byCategory).forEach(([catName, classes]) => {
         const catTotal = (categoryTotals[catName] && categoryTotals[catName][mi]) || 0;
         if (catTotal <= 1e-9) return; // 0% category for this model — nothing to allocate, skip entirely
@@ -2321,7 +2330,7 @@ function buildAcmFinalExport(reimportedFamilies) {
           const fam = sigToFamilies.get(`${catName}|${ck}|${sig}`);
           return fam && fam.size > 1;
         });
-        const categoryPrefix = allClassesShared ? acmBaseFamilyName(familyName) : familyName;
+        const categoryPrefix = allClassesShared ? ssPrefixName : `${ssPrefixName}${isNQFamily ? " (NQ)" : ""}`;
 
         Object.entries(classes).forEach(([clsKey, tks]) => {
           const isDirect = clsKey === "__direct__";
@@ -2396,8 +2405,8 @@ function buildAcmFinalExport(reimportedFamilies) {
   return { modelRows, ssRows: ssRowsFull };
 }
 
-function downloadAcmFinalExport(reimportedFamilies, advisorName) {
-  const { modelRows, ssRows } = buildAcmFinalExport(reimportedFamilies);
+function downloadAcmFinalExport(reimportedFamilies, advisorName, ssPrefixName, modelType) {
+  const { modelRows, ssRows } = buildAcmFinalExport(reimportedFamilies, ssPrefixName || advisorName, modelType || "Strategic");
   downloadXlsxWithHeaders(modelRows, TEMPLATE_COLS, `${advisorName||"Advisor"}_ACM_Models.xlsx`);
   downloadXlsxWithHeaders(ssRows, ACM_SS_TEMPLATE_COLS, `${advisorName||"Advisor"}_ACM_SecuritySets.xlsx`);
 }
@@ -2407,6 +2416,9 @@ function downloadAcmFinalExport(reimportedFamilies, advisorName) {
 function AcmFlow({ onBack }) {
   const [stage, setStage] = useState("upload"); // upload (parses, categorizes, computes, exports) | reimport | done
   const [advisorName, setAdvisorName] = useState("");
+  const [ssPrefixName, setSsPrefixName] = useState("");
+  const [modelType, setModelType] = useState("Strategic");
+  const [skipAdjustmentFamilies, setSkipAdjustmentFamilies] = useState({}); // familyKey -> boolean
   const [rawFile, setRawFile] = useState(null);
   const [parsed, setParsed] = useState(null); // {securities, familyModelOrder}
   const [categorized, setCategorized] = useState(null); // securities with .category/.class set
@@ -2442,30 +2454,37 @@ function AcmFlow({ onBack }) {
           throw new Error(`${missing.length} ticker${missing.length!==1?"s":""} missing a Category (not filled in on the template, and not seen before): ${missing.map(s=>s.ticker).join(", ")}. Add Category/Class to the template and re-upload.`);
         }
         setCategorized(merged);
-
-        // Everything's categorized — go straight to compute + export, no
-        // review screen needed since Category/Class already came from the
-        // template itself. Build all families' trees together so Security
-        // Sets sharing identical tickers across families can pool their
-        // sample for the z-score/average computation.
-        const familyData = {};
-        Object.entries(result.familyModelOrder).forEach(([fam, models]) => {
-          familyData[fam] = { securities: merged.map(s => ({ ...s, raw: s.raw[fam] })), models };
-        });
-        const trees = buildAcmFamilyTrees(familyData);
-        setFamilyTrees(trees);
-        setExporting(true);
-        try {
-          merged.forEach(s => { lookup[s.ticker] = { category: s.category, class: s.class }; });
-          await saveTickerLookup(lookup);
-          await downloadAcmDigest(trees, advisorName);
-        } finally {
-          setExporting(false);
-        }
-        setStage("reimport");
+        setSkipAdjustmentFamilies({}); // reset per-upload; families aren't known until now
+        setStage("confirmFamilies");
       } catch (err) { setError(err.message); }
     };
     reader.readAsArrayBuffer(file);
+  }
+
+  async function proceedToComputeAndExport() {
+    const merged = categorized;
+    try {
+      const lookup = await loadTickerLookup();
+      // Everything's categorized — compute + export. Build all families' trees
+      // together so Security Sets sharing identical tickers across families can
+      // pool their sample for the z-score/average computation.
+      const familyData = {};
+      Object.entries(parsed.familyModelOrder).forEach(([fam, models]) => {
+        familyData[fam] = { securities: merged.map(s => ({ ...s, raw: s.raw[fam] })), models };
+      });
+      const skipSet = new Set(Object.entries(skipAdjustmentFamilies).filter(([,v])=>v).map(([k])=>k));
+      const trees = buildAcmFamilyTrees(familyData, skipSet);
+      setFamilyTrees(trees);
+      setExporting(true);
+      try {
+        merged.forEach(s => { lookup[s.ticker] = { category: s.category, class: s.class }; });
+        await saveTickerLookup(lookup);
+        await downloadAcmDigest(trees, advisorName);
+      } finally {
+        setExporting(false);
+      }
+      setStage("reimport");
+    } catch (err) { setError(err.message); }
   }
 
   function handleReimportFile(file) {
@@ -2483,7 +2502,7 @@ function AcmFlow({ onBack }) {
   }
 
   function finalize() {
-    downloadAcmFinalExport(reimportedFamilies, advisorName);
+    downloadAcmFinalExport(reimportedFamilies, advisorName, ssPrefixName, modelType);
     setStage("done");
   }
 
@@ -2506,12 +2525,41 @@ function AcmFlow({ onBack }) {
         {exporting && <div style={{marginTop:14,fontSize:13,color:"#7c3aed"}}>Computing targets & exporting digest…</div>}
         {error && <div style={{marginTop:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
         <div style={{marginTop:16,background:"#f5f3ff",border:"0.5px solid #ddd6fe",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#4c1d95",lineHeight:1.6}}>
-          Category/Class are read directly from the template — remembers any ticker's assignment after the first time, so future imports (any advisor) auto-fill anything already seen. Goes straight from upload to a computed, exported digest — no separate review step needed. Computes a proportional target weight per group, excluding zero and statistically extreme models per your judgment call rather than strict stats.
+          Category/Class are read directly from the template — remembers any ticker's assignment after the first time, so future imports (any advisor) auto-fill anything already seen. Computes a proportional target weight per group, excluding zero and statistically extreme models per your judgment call rather than strict stats — unless you mark a family as already proportional on the next screen.
         </div>
         <div style={{marginTop:16}}>
           <button onClick={onBack} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
           <button onClick={()=>{setError(null);setStage("reimport");}} style={{marginLeft:12,background:"none",border:"none",fontSize:12,color:"#7c3aed",cursor:"pointer",textDecoration:"underline"}}>
             Already have a digest file? Skip to upload it →
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (stage === "confirmFamilies") {
+    const familyKeys = parsed ? Object.keys(parsed.familyModelOrder) : [];
+    return (
+      <div>
+        <div style={{fontSize:13,color:"#374151",marginBottom:16}}>
+          Detected {familyKeys.length} model famil{familyKeys.length===1?"y":"ies"}: {familyKeys.join(", ")}. For any family where the advisor already worked out proportional weightings directly with you, check it below — the tool will use the ratio exactly as sent (no outlier exclusion, no rounding to a clean 5%/1%) instead of computing its own best fit.
+        </div>
+        {familyKeys.map(fam => (
+          <label key={fam} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!skipAdjustmentFamilies[fam]}
+              onChange={e=>setSkipAdjustmentFamilies(prev=>({...prev, [fam]: e.target.checked}))} />
+            <div>
+              <div style={{fontSize:13,fontWeight:600,color:"#111827"}}>{acmFamilyDisplayName(fam, advisorName)}</div>
+              <div style={{fontSize:12,color:"#6b7280"}}>Already proportional — skip best-fit calculation</div>
+            </div>
+          </label>
+        ))}
+        {error && <div style={{marginTop:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
+        <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
+          <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
+          <button onClick={proceedToComputeAndExport} disabled={exporting}
+            style={{background:exporting?"#c4b5fd":"#7c3aed",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:exporting?"default":"pointer"}}>
+            {exporting ? "Computing & exporting…" : "Compute targets & export digest ↓"}
           </button>
         </div>
       </div>
@@ -2532,6 +2580,24 @@ function AcmFlow({ onBack }) {
             Loaded {Object.values(reimportedFamilies).reduce((s,f)=>s+f.tickers.length,0)} ticker rows across {Object.keys(reimportedFamilies).length} famil{Object.keys(reimportedFamilies).length===1?"y":"ies"}: {Object.keys(reimportedFamilies).join(", ")}.
           </div>
         )}
+        <div style={{marginTop:16,display:"flex",gap:12}}>
+          <div style={{flex:"0 0 160px"}}>
+            <label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4}}>Model type</label>
+            <select value={modelType} onChange={e=>setModelType(e.target.value)}
+              style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 10px",fontSize:13}}>
+              <option value="Strategic">Strategic</option>
+              <option value="Tactical">Tactical</option>
+            </select>
+          </div>
+          <div style={{flex:1}}>
+            <label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4}}>Category / Class / Security Set prefix</label>
+            <input value={ssPrefixName} onChange={e=>setSsPrefixName(e.target.value)} placeholder={advisorName || "e.g. MSNE Consulting Dividend"}
+              style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 10px",fontSize:13}} />
+          </div>
+        </div>
+        <div style={{marginTop:6,fontSize:11,color:"#9ca3af"}}>
+          Model Name uses "{modelType} Advisor Model - {advisorName||"…"}". Category/Class/Security Set names use "{ssPrefixName||advisorName||"…"} - {"{category}"}" — independent of the Model Name, defaults to the advisor name above if left blank.
+        </div>
         <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
           <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
           <div style={{display:"flex",gap:8}}>
@@ -2556,7 +2622,7 @@ function AcmFlow({ onBack }) {
       <div style={{fontSize:13,color:"#6b7280",marginBottom:28}}>Model import + Security Set import — ready to bring into Orion Eclipse</div>
       <div style={{display:"flex",gap:10,justifyContent:"center"}}>
         <button onClick={()=>setStage("reimport")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-        <button onClick={()=>downloadAcmFinalExport(reimportedFamilies, advisorName)} style={{background:"none",border:"0.5px solid #7c3aed",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#7c3aed",cursor:"pointer"}}>Download again</button>
+        <button onClick={()=>downloadAcmFinalExport(reimportedFamilies, advisorName, ssPrefixName, modelType)} style={{background:"none",border:"0.5px solid #7c3aed",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#7c3aed",cursor:"pointer"}}>Download again</button>
       </div>
     </div>
   );
