@@ -2567,7 +2567,7 @@ function AcmFlow({ onBack }) {
       <div>
         <div style={{marginBottom:16}}>
           <label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4}}>Advisor / model family name</label>
-          <input value={advisorName} onChange={e=>setAdvisorName(e.target.value)} placeholder="e.g. Fortify Wealth"
+          <input value={advisorName} onChange={e=>setAdvisorName(e.target.value)} placeholder="e.g. Sector ETF Equity Growth (Josh Sievers)"
             style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 10px",fontSize:13}} />
         </div>
         <div style={{display:"flex",gap:12,marginBottom:16}}>
@@ -2581,7 +2581,7 @@ function AcmFlow({ onBack }) {
           </div>
           <div style={{flex:1}}>
             <label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4}}>Category / Class / Security Set prefix</label>
-            <input value={ssPrefixName} onChange={e=>setSsPrefixName(e.target.value)} placeholder={advisorName || "e.g. MSNE Consulting Dividend"}
+            <input value={ssPrefixName} onChange={e=>setSsPrefixName(e.target.value)} placeholder={advisorName || "e.g. MSNE Consulting"}
               style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 10px",fontSize:13}} />
           </div>
         </div>
