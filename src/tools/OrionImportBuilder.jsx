@@ -2422,7 +2422,7 @@ function AcmFlow({ onBack }) {
   const [advisorName, setAdvisorName] = useState("");
   const [ssPrefixName, setSsPrefixName] = useState("");
   const [modelType, setModelType] = useState("Strategic");
-  const [skipAdjustmentFamilies, setSkipAdjustmentFamilies] = useState({}); // familyKey -> boolean
+  const [skipAdjustment, setSkipAdjustment] = useState(false); // no more per-family map — only one family per upload now
   const [rawFile, setRawFile] = useState(null);
   const [parsed, setParsed] = useState(null); // {securities, familyModelOrder}
   const [categorized, setCategorized] = useState(null); // securities with .category/.class set
@@ -2503,7 +2503,7 @@ function AcmFlow({ onBack }) {
         familyData[fam] = { securities: merged.map(s => ({ ...s, raw: s.raw[fam] })), models };
       });
       const familyKeys = Object.keys(parsed.familyModelOrder);
-      const skipSet = new Set(Object.entries(skipAdjustmentFamilies).filter(([,v])=>v).map(([k])=>k));
+      const skipSet = skipAdjustment ? new Set(familyKeys) : new Set();
       const trees = buildAcmFamilyTrees(familyData, skipSet);
       setFamilyTrees(trees);
       merged.forEach(s => { lookup[s.ticker] = { category: s.category, class: s.class }; });
@@ -2588,6 +2588,13 @@ function AcmFlow({ onBack }) {
         <div style={{marginBottom:16,fontSize:11,color:"#9ca3af"}}>
           Model Name uses "{modelType} Advisor Model - {advisorName||"…"}". Category/Class/Security Set names use "{ssPrefixName||advisorName||"…"} - {"{category}"}" — independent of the Model Name, defaults to the advisor name above if left blank.
         </div>
+        <label style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:16,cursor:"pointer"}}>
+          <input type="checkbox" checked={skipAdjustment} onChange={e=>setSkipAdjustment(e.target.checked)} />
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:"#111827"}}>Already proportional — skip best-fit calculation</div>
+            <div style={{fontSize:12,color:"#6b7280"}}>The advisor already worked out proportional weightings directly with you — use the ratio exactly as sent (no outlier exclusion, no rounding to a clean 5%/1%), and skip the digest review step entirely.</div>
+          </div>
+        </label>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
           <label style={{fontSize:12,color:"#6b7280"}}>Advisor model, in the standard template</label>
           <button onClick={downloadAcmTemplate} style={{fontSize:11,color:"#7c3aed",background:"none",border:"none",cursor:"pointer",padding:0,textDecoration:"underline"}}>
@@ -2599,20 +2606,8 @@ function AcmFlow({ onBack }) {
         {error && <div style={{marginTop:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
 
         {familyKeys.length>0 && (
-          <div style={{marginTop:16}}>
-            <div style={{fontSize:13,color:"#374151",marginBottom:10}}>
-              Detected {familyKeys.length} model famil{familyKeys.length===1?"y":"ies"}: {familyKeys.join(", ")}. For any family where the advisor already worked out proportional weightings directly with you, check it below — the tool uses the ratio exactly as sent (no outlier exclusion, no rounding to a clean 5%/1%) instead of computing its own best fit, and skips the digest review step entirely if every family here is checked.
-            </div>
-            {familyKeys.map(fam => (
-              <label key={fam} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:8,cursor:"pointer"}}>
-                <input type="checkbox" checked={!!skipAdjustmentFamilies[fam]}
-                  onChange={e=>setSkipAdjustmentFamilies(prev=>({...prev, [fam]: e.target.checked}))} />
-                <div>
-                  <div style={{fontSize:13,fontWeight:600,color:"#111827"}}>{acmFamilyDisplayName(fam, advisorName)}</div>
-                  <div style={{fontSize:12,color:"#6b7280"}}>Already proportional — skip best-fit calculation</div>
-                </div>
-              </label>
-            ))}
+          <div style={{marginTop:16,background:"#f0fdf4",border:"0.5px solid #bbf7d0",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#166534"}}>
+            Detected {familyKeys.length} model famil{familyKeys.length===1?"y":"ies"}: {familyKeys.map(f=>acmFamilyDisplayName(f,advisorName)).join(", ")}.
           </div>
         )}
 
