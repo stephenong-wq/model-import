@@ -2250,7 +2250,7 @@ function acmCategoryMeta(catKey) {
   return ACM_CATEGORY_META[catKey] || { display: acmTitleCase(catKey), bandType: "fixed5" };
 }
 
-function buildAcmFinalExport(reimportedFamilies, ssPrefixName, modelType) {
+function buildAcmFinalExport(reimportedFamilies, ssPrefixName, modelType, advisorName) {
   const modelRows = [];
 
   // ── Pass 1: determine, per (Category, Class), whether its ticker+
@@ -2315,7 +2315,11 @@ function buildAcmFinalExport(reimportedFamilies, ssPrefixName, modelType) {
 
     models.forEach((modelName, mi) => {
       const isNQFamily = /\(NQ\)/i.test(familyName);
-      const fullModelName = `${modelType} Advisor Model - ${acmBaseFamilyName(familyName)} ${modelName}${isNQFamily ? " (NQ)" : ""}`;
+      // Use the fresh advisorName directly, NOT anything derived from
+      // familyName — familyName comes from the digest's sheet/tab name,
+      // which Excel silently truncates to 31 characters, and that
+      // truncation must never leak into the actual Model Name text.
+      const fullModelName = `${modelType} Advisor Model - ${advisorName} ${modelName}${isNQFamily ? " (NQ)" : ""}`;
       Object.entries(byCategory).forEach(([catName, classes]) => {
         const catTotal = (categoryTotals[catName] && categoryTotals[catName][mi]) || 0;
         if (catTotal <= 1e-9) return; // 0% category for this model — nothing to allocate, skip entirely
@@ -2406,7 +2410,7 @@ function buildAcmFinalExport(reimportedFamilies, ssPrefixName, modelType) {
 }
 
 function downloadAcmFinalExport(reimportedFamilies, advisorName, ssPrefixName, modelType) {
-  const { modelRows, ssRows } = buildAcmFinalExport(reimportedFamilies, ssPrefixName || advisorName, modelType || "Strategic");
+  const { modelRows, ssRows } = buildAcmFinalExport(reimportedFamilies, ssPrefixName || advisorName, modelType || "Strategic", advisorName || "Advisor");
   downloadXlsxWithHeaders(modelRows, TEMPLATE_COLS, `${advisorName||"Advisor"}_ACM_Models.xlsx`);
   downloadXlsxWithHeaders(ssRows, ACM_SS_TEMPLATE_COLS, `${advisorName||"Advisor"}_ACM_SecuritySets.xlsx`);
 }
@@ -2506,6 +2510,35 @@ function AcmFlow({ onBack }) {
     setStage("done");
   }
 
+  // For when nothing needs re-weighting — skip the digest export/re-upload
+  // round trip entirely and build the final files straight from what's
+  // already been computed. Converts familyTrees into the same shape
+  // parseAcmDigestForReimport would produce, keyed by the ORIGINAL family
+  // name (not a digest sheet name, so no 31-character truncation risk here).
+  function skipReimportAndFinalize() {
+    const families = {};
+    Object.entries(familyTrees).forEach(([fam, tree]) => {
+      const displayName = acmFamilyDisplayName(fam, advisorName);
+      const categoryTotals = {}, classTargets = {}, tickers = [];
+      tree.categories.forEach(cat => {
+        categoryTotals[cat.name] = cat.totals;
+        cat.classes.forEach(cls => {
+          if (!cls.isDirect) {
+            classTargets[cat.name] = classTargets[cat.name] || {};
+            classTargets[cat.name][cls.name] = cls.targetPct;
+          }
+          cls.tickers.forEach(t => {
+            tickers.push({ category: cat.name, class: cls.isDirect ? null : cls.name, ticker: t.ticker, targetPct: t.targetPct });
+          });
+        });
+      });
+      families[displayName] = { models: tree.models, categoryTotals, classTargets, tickers };
+    });
+    setReimportedFamilies(families);
+    downloadAcmFinalExport(families, advisorName, ssPrefixName, modelType);
+    setStage("done");
+  }
+
   if (stage === "upload") {
     return (
       <div>
@@ -2602,6 +2635,7 @@ function AcmFlow({ onBack }) {
           <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
           <div style={{display:"flex",gap:8}}>
             {familyTrees && <button onClick={()=>downloadAcmDigest(familyTrees, advisorName)} style={{background:"none",border:"0.5px solid #7c3aed",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#7c3aed",cursor:"pointer"}}>Download digest again</button>}
+            {familyTrees && <button onClick={skipReimportAndFinalize} style={{background:"none",border:"0.5px solid #9ca3af",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#4b5563",cursor:"pointer"}}>No changes needed — skip re-upload →</button>}
             <button onClick={finalize} disabled={!reimportedFamilies}
               style={{background:reimportedFamilies?"#7c3aed":"#c4b5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:reimportedFamilies?"pointer":"default"}}>
               Export final Model + Security Set files ↓
