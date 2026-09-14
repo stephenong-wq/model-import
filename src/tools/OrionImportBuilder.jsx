@@ -2459,35 +2459,74 @@ function AcmFlow({ onBack }) {
         }
         setCategorized(merged);
         setSkipAdjustmentFamilies({}); // reset per-upload; families aren't known until now
-        setStage("confirmFamilies");
+        // Stays on "upload" — the family checkboxes appear right here once
+        // `parsed` is set, instead of moving to a separate screen.
       } catch (err) { setError(err.message); }
     };
     reader.readAsArrayBuffer(file);
+  }
+
+  // Converts an already-computed family tree into the same shape
+  // parseAcmDigestForReimport would produce, keyed by the ORIGINAL family
+  // name (not a digest sheet name, so no 31-character truncation risk).
+  function treesToReimportShape(trees) {
+    const families = {};
+    Object.entries(trees).forEach(([fam, tree]) => {
+      const displayName = acmFamilyDisplayName(fam, advisorName);
+      const categoryTotals = {}, classTargets = {}, tickers = [];
+      tree.categories.forEach(cat => {
+        categoryTotals[cat.name] = cat.totals;
+        cat.classes.forEach(cls => {
+          if (!cls.isDirect) {
+            classTargets[cat.name] = classTargets[cat.name] || {};
+            classTargets[cat.name][cls.name] = cls.targetPct;
+          }
+          cls.tickers.forEach(t => {
+            tickers.push({ category: cat.name, class: cls.isDirect ? null : cls.name, ticker: t.ticker, targetPct: t.targetPct });
+          });
+        });
+      });
+      families[displayName] = { models: tree.models, categoryTotals, classTargets, tickers };
+    });
+    return families;
   }
 
   async function proceedToComputeAndExport() {
     const merged = categorized;
     try {
       const lookup = await loadTickerLookup();
-      // Everything's categorized — compute + export. Build all families' trees
+      // Everything's categorized — compute. Build all families' trees
       // together so Security Sets sharing identical tickers across families can
       // pool their sample for the z-score/average computation.
       const familyData = {};
       Object.entries(parsed.familyModelOrder).forEach(([fam, models]) => {
         familyData[fam] = { securities: merged.map(s => ({ ...s, raw: s.raw[fam] })), models };
       });
+      const familyKeys = Object.keys(parsed.familyModelOrder);
       const skipSet = new Set(Object.entries(skipAdjustmentFamilies).filter(([,v])=>v).map(([k])=>k));
       const trees = buildAcmFamilyTrees(familyData, skipSet);
       setFamilyTrees(trees);
+      merged.forEach(s => { lookup[s.ticker] = { category: s.category, class: s.class }; });
+      await saveTickerLookup(lookup);
+
+      const allProportional = familyKeys.length>0 && familyKeys.every(f => skipSet.has(f));
       setExporting(true);
       try {
-        merged.forEach(s => { lookup[s.ticker] = { category: s.category, class: s.class }; });
-        await saveTickerLookup(lookup);
-        await downloadAcmDigest(trees, advisorName);
+        if (allProportional) {
+          // Every family is already proportional — nothing for the advisor
+          // to review or adjust, so skip the digest round-trip entirely and
+          // go straight to the final Model + Security Set files.
+          const families = treesToReimportShape(trees);
+          setReimportedFamilies(families);
+          downloadAcmFinalExport(families, advisorName, ssPrefixName, modelType);
+          setStage("done");
+        } else {
+          await downloadAcmDigest(trees, advisorName);
+          setStage("reimport");
+        }
       } finally {
         setExporting(false);
       }
-      setStage("reimport");
     } catch (err) { setError(err.message); }
   }
 
@@ -2516,36 +2555,38 @@ function AcmFlow({ onBack }) {
   // parseAcmDigestForReimport would produce, keyed by the ORIGINAL family
   // name (not a digest sheet name, so no 31-character truncation risk here).
   function skipReimportAndFinalize() {
-    const families = {};
-    Object.entries(familyTrees).forEach(([fam, tree]) => {
-      const displayName = acmFamilyDisplayName(fam, advisorName);
-      const categoryTotals = {}, classTargets = {}, tickers = [];
-      tree.categories.forEach(cat => {
-        categoryTotals[cat.name] = cat.totals;
-        cat.classes.forEach(cls => {
-          if (!cls.isDirect) {
-            classTargets[cat.name] = classTargets[cat.name] || {};
-            classTargets[cat.name][cls.name] = cls.targetPct;
-          }
-          cls.tickers.forEach(t => {
-            tickers.push({ category: cat.name, class: cls.isDirect ? null : cls.name, ticker: t.ticker, targetPct: t.targetPct });
-          });
-        });
-      });
-      families[displayName] = { models: tree.models, categoryTotals, classTargets, tickers };
-    });
+    const families = treesToReimportShape(familyTrees);
     setReimportedFamilies(families);
     downloadAcmFinalExport(families, advisorName, ssPrefixName, modelType);
     setStage("done");
   }
 
   if (stage === "upload") {
+    const familyKeys = parsed ? Object.keys(parsed.familyModelOrder) : [];
     return (
       <div>
         <div style={{marginBottom:16}}>
           <label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4}}>Advisor / model family name</label>
           <input value={advisorName} onChange={e=>setAdvisorName(e.target.value)} placeholder="e.g. Fortify Wealth"
             style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 10px",fontSize:13}} />
+        </div>
+        <div style={{display:"flex",gap:12,marginBottom:16}}>
+          <div style={{flex:"0 0 160px"}}>
+            <label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4}}>Model type</label>
+            <select value={modelType} onChange={e=>setModelType(e.target.value)}
+              style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 10px",fontSize:13}}>
+              <option value="Strategic">Strategic</option>
+              <option value="Tactical">Tactical</option>
+            </select>
+          </div>
+          <div style={{flex:1}}>
+            <label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4}}>Category / Class / Security Set prefix</label>
+            <input value={ssPrefixName} onChange={e=>setSsPrefixName(e.target.value)} placeholder={advisorName || "e.g. MSNE Consulting Dividend"}
+              style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 10px",fontSize:13}} />
+          </div>
+        </div>
+        <div style={{marginBottom:16,fontSize:11,color:"#9ca3af"}}>
+          Model Name uses "{modelType} Advisor Model - {advisorName||"…"}". Category/Class/Security Set names use "{ssPrefixName||advisorName||"…"} - {"{category}"}" — independent of the Model Name, defaults to the advisor name above if left blank.
         </div>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
           <label style={{fontSize:12,color:"#6b7280"}}>Advisor model, in the standard template</label>
@@ -2555,45 +2596,45 @@ function AcmFlow({ onBack }) {
         </div>
         <FilePickBox hint="Ticker + Category/Class + model columns, reformatted from whatever the advisor sent (.xlsx)"
           file={rawFile} onFile={handleRawFile} accentColor="#7c3aed" />
-        {exporting && <div style={{marginTop:14,fontSize:13,color:"#7c3aed"}}>Computing targets & exporting digest…</div>}
         {error && <div style={{marginTop:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
-        <div style={{marginTop:16,background:"#f5f3ff",border:"0.5px solid #ddd6fe",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#4c1d95",lineHeight:1.6}}>
-          Category/Class are read directly from the template — remembers any ticker's assignment after the first time, so future imports (any advisor) auto-fill anything already seen. Computes a proportional target weight per group, excluding zero and statistically extreme models per your judgment call rather than strict stats — unless you mark a family as already proportional on the next screen.
-        </div>
-        <div style={{marginTop:16}}>
-          <button onClick={onBack} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-          <button onClick={()=>{setError(null);setStage("reimport");}} style={{marginLeft:12,background:"none",border:"none",fontSize:12,color:"#7c3aed",cursor:"pointer",textDecoration:"underline"}}>
-            Already have a digest file? Skip to upload it →
-          </button>
-        </div>
-      </div>
-    );
-  }
 
-  if (stage === "confirmFamilies") {
-    const familyKeys = parsed ? Object.keys(parsed.familyModelOrder) : [];
-    return (
-      <div>
-        <div style={{fontSize:13,color:"#374151",marginBottom:16}}>
-          Detected {familyKeys.length} model famil{familyKeys.length===1?"y":"ies"}: {familyKeys.join(", ")}. For any family where the advisor already worked out proportional weightings directly with you, check it below — the tool will use the ratio exactly as sent (no outlier exclusion, no rounding to a clean 5%/1%) instead of computing its own best fit.
-        </div>
-        {familyKeys.map(fam => (
-          <label key={fam} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:8,cursor:"pointer"}}>
-            <input type="checkbox" checked={!!skipAdjustmentFamilies[fam]}
-              onChange={e=>setSkipAdjustmentFamilies(prev=>({...prev, [fam]: e.target.checked}))} />
-            <div>
-              <div style={{fontSize:13,fontWeight:600,color:"#111827"}}>{acmFamilyDisplayName(fam, advisorName)}</div>
-              <div style={{fontSize:12,color:"#6b7280"}}>Already proportional — skip best-fit calculation</div>
+        {familyKeys.length>0 && (
+          <div style={{marginTop:16}}>
+            <div style={{fontSize:13,color:"#374151",marginBottom:10}}>
+              Detected {familyKeys.length} model famil{familyKeys.length===1?"y":"ies"}: {familyKeys.join(", ")}. For any family where the advisor already worked out proportional weightings directly with you, check it below — the tool uses the ratio exactly as sent (no outlier exclusion, no rounding to a clean 5%/1%) instead of computing its own best fit, and skips the digest review step entirely if every family here is checked.
             </div>
-          </label>
-        ))}
-        {error && <div style={{marginTop:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
+            {familyKeys.map(fam => (
+              <label key={fam} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:8,cursor:"pointer"}}>
+                <input type="checkbox" checked={!!skipAdjustmentFamilies[fam]}
+                  onChange={e=>setSkipAdjustmentFamilies(prev=>({...prev, [fam]: e.target.checked}))} />
+                <div>
+                  <div style={{fontSize:13,fontWeight:600,color:"#111827"}}>{acmFamilyDisplayName(fam, advisorName)}</div>
+                  <div style={{fontSize:12,color:"#6b7280"}}>Already proportional — skip best-fit calculation</div>
+                </div>
+              </label>
+            ))}
+          </div>
+        )}
+
+        {!familyKeys.length && (
+          <div style={{marginTop:16,background:"#f5f3ff",border:"0.5px solid #ddd6fe",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#4c1d95",lineHeight:1.6}}>
+            Category/Class are read directly from the template — remembers any ticker's assignment after the first time, so future imports (any advisor) auto-fill anything already seen.
+          </div>
+        )}
+
         <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
-          <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-          <button onClick={proceedToComputeAndExport} disabled={exporting}
-            style={{background:exporting?"#c4b5fd":"#7c3aed",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:exporting?"default":"pointer"}}>
-            {exporting ? "Computing & exporting…" : "Compute targets & export digest ↓"}
-          </button>
+          <button onClick={onBack} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <button onClick={()=>{setError(null);setStage("reimport");}} style={{background:"none",border:"none",fontSize:12,color:"#7c3aed",cursor:"pointer",textDecoration:"underline"}}>
+              Already have a digest file? Skip to upload it →
+            </button>
+            {familyKeys.length>0 && (
+              <button onClick={proceedToComputeAndExport} disabled={exporting}
+                style={{background:exporting?"#c4b5fd":"#7c3aed",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:exporting?"default":"pointer"}}>
+                {exporting ? "Computing & exporting…" : "Compute targets & export ↓"}
+              </button>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -2613,23 +2654,8 @@ function AcmFlow({ onBack }) {
             Loaded {Object.values(reimportedFamilies).reduce((s,f)=>s+f.tickers.length,0)} ticker rows across {Object.keys(reimportedFamilies).length} famil{Object.keys(reimportedFamilies).length===1?"y":"ies"}: {Object.keys(reimportedFamilies).join(", ")}.
           </div>
         )}
-        <div style={{marginTop:16,display:"flex",gap:12}}>
-          <div style={{flex:"0 0 160px"}}>
-            <label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4}}>Model type</label>
-            <select value={modelType} onChange={e=>setModelType(e.target.value)}
-              style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 10px",fontSize:13}}>
-              <option value="Strategic">Strategic</option>
-              <option value="Tactical">Tactical</option>
-            </select>
-          </div>
-          <div style={{flex:1}}>
-            <label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4}}>Category / Class / Security Set prefix</label>
-            <input value={ssPrefixName} onChange={e=>setSsPrefixName(e.target.value)} placeholder={advisorName || "e.g. MSNE Consulting Dividend"}
-              style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 10px",fontSize:13}} />
-          </div>
-        </div>
         <div style={{marginTop:6,fontSize:11,color:"#9ca3af"}}>
-          Model Name uses "{modelType} Advisor Model - {advisorName||"…"}". Category/Class/Security Set names use "{ssPrefixName||advisorName||"…"} - {"{category}"}" — independent of the Model Name, defaults to the advisor name above if left blank.
+          Model Name uses "{modelType} Advisor Model - {advisorName||"…"}". Category/Class/Security Set names use "{ssPrefixName||advisorName||"…"} - {"{category}"}" (set on the previous screen).
         </div>
         <div style={{display:"flex",justifyContent:"space-between",marginTop:16}}>
           <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
