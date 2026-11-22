@@ -855,7 +855,7 @@ function parseLibraryWorkbook(buffer) {
     // this doesn't depend on guessing which sheet names to allow.
     if (variantCols.length < 2 || !rows.some(r => r.level === "category")) return;
 
-    sheets.push({ name, variants: variantCols.map(v=>v.name), rows, isTaxAware: /tax/i.test(name) });
+    sheets.push({ name, variants: variantCols.map(v=>v.name), rows, isTaxAware: /tax|\(\s*ta\s*\)/i.test(name) });
   });
   return sheets;
 }
@@ -868,21 +868,32 @@ function parseLibraryWorkbook(buffer) {
 // Cash" contains both "EQUITY" and "CASH" — so among candidates the one
 // ending closest to the end of the string wins (the actual category/class
 // segment is always the trailing part of the name); ties go to the longer label.
+// Library labels sometimes carry a qualifier — "Global Equity - DI TLH enabled
+// for taxable accounts", "US Investment Grade (Corporate Bond Strategy)" —
+// that the model's own Class name leaves off ("... - Global Equity"). The full
+// label is tried first; only if nothing matches does the short form (text
+// before " - " or "(") get a turn, so existing exact matches never change.
+function libraryShortLabel(label) {
+  return (label||"").replace(/\([^)]*\)/g," ").split(" - ")[0].replace(/\s{2,}/g," ").trim();
+}
 function matchLibraryLabel(sourceStr, libraryRows) {
   const ns = normAlnum(sourceStr);
   if (!ns) return null;
-  let best = null, bestEnd = -1, bestLen = 0;
-  libraryRows.forEach(row => {
-    const nl = normAlnum(row.label);
-    if (!nl) return;
-    const idx = ns.lastIndexOf(nl);
-    if (idx === -1) return;
-    const end = idx + nl.length;
-    if (end > bestEnd || (end === bestEnd && nl.length > bestLen)) {
-      best = row; bestEnd = end; bestLen = nl.length;
-    }
-  });
-  return best;
+  const pick = labelOf => {
+    let best = null, bestEnd = -1, bestLen = 0;
+    libraryRows.forEach(row => {
+      const nl = normAlnum(labelOf(row));
+      if (!nl) return;
+      const idx = ns.lastIndexOf(nl);
+      if (idx === -1) return;
+      const end = idx + nl.length;
+      if (end > bestEnd || (end === bestEnd && nl.length > bestLen)) {
+        best = row; bestEnd = end; bestLen = nl.length;
+      }
+    });
+    return best;
+  };
+  return pick(row => row.label) || pick(row => libraryShortLabel(row.label));
 }
 
 // Strips recognized modifier tags off a Model Name's trailing segments (in
@@ -919,14 +930,28 @@ function matchLibraryLabel(sourceStr, libraryRows) {
 // derivative the library doesn't cover.
 function analyzeModelName(modelName) {
   const core = (modelName||"").replace(/\([^)]*\)/g,"").replace(/\s{2,}/g," ").trim();
-  const segments = core.split(" - ").map(s=>s.trim()).filter(Boolean);
   const flags = {
     isTaxAware: /tax/i.test(modelName||""),
     isExUslc: /ex[-\s]?uslc/i.test(modelName||""),
     isExFI: /\bex[-\s]?fi\b/i.test(modelName||""),
+    isExIntDev: /\bex[-\s]?int(?:l|ernational)?\.?\s*dev/i.test(modelName||""),
+    isExEM: /\bex[-\s]?em\b/i.test(modelName||""),
     isUsEquityOnly: /us\s+equity\s+only/i.test(modelName||""),
+    isParagon: /^\s*paragon\/stp\b/i.test(modelName||""),
     holdingsAssetClass: null, // "equity" | "fixedIncome" | "other" | null
   };
+  let segments;
+  if (flags.isParagon) {
+    // "Paragon/STP All Equity (ex-USLC)" and "Paragon/STP All Equity + Core Stock
+    // Model" have no " - " separator: the prefix is followed directly by the
+    // variant, optionally joined to a stock-model tag with " + ".
+    let rest = core.replace(/^paragon\/stp\s*/i,"").trim();
+    const plus = rest.match(/^(.*?)\s*\+\s*(?:core|growth|value|dividend)\s+stock\s+model$/i);
+    if (plus) { rest = plus[1].trim(); flags.holdingsAssetClass = "equity"; }
+    segments = ["Paragon/STP", rest].filter(Boolean);
+  } else {
+    segments = core.split(" - ").map(s=>s.trim()).filter(Boolean);
+  }
   let changed = true;
   while (changed && segments.length > 2) {
     changed = false;
@@ -942,6 +967,21 @@ function analyzeModelName(modelName) {
   return { segments, flags };
 }
 
+// Which library tab a model draws its targets from depends on its family
+// (name prefix), not just on whether it's Tax Aware:
+//   STP - X              → Savvy library, "Savvy Total Portfolios" (+ Tax Aware tab)
+//   Paragon/STP X        → Savvy library, same tabs (international is halved — see below)
+//   STP Direct HH - X    → STP Direct library, "STP Direct Med" (+ "(TA)" tab)
+//   STP Tactical ETF ... → nothing to update here: a single Security Set, no
+//                          categories or classes (tickers live in the set itself)
+const MODEL_FAMILIES = [
+  { id:"paragon", test:/^\s*paragon\/stp\b/i, source:"savvy", sheetPrefix:"Savvy Total Portfolios", libraryLabel:"Savvy" },
+  { id:"tacticalEtf", test:/^\s*stp\s+tactical\s+etf\b/i,
+    skip:"STP Tactical ETF models are a single Security Set with no categories or classes — nothing to update here" },
+  { id:"direct", test:/^\s*stp\s+direct\s+hh\b/i, source:"direct", sheetPrefix:"STP Direct Med", libraryLabel:"STP Direct" },
+  { id:"stp", test:/^\s*stp\b/i, source:"savvy", sheetPrefix:"Savvy Total Portfolios", libraryLabel:"Savvy" },
+];
+
 // Matches a Model Name to a specific {sheet, variant} (or blend of two
 // neighboring variants — see the risk-ladder note further down) in the
 // library, after peeling off any recognized modifier tags via analyzeModelName.
@@ -949,13 +989,33 @@ function analyzeModelName(modelName) {
 // reason when the library genuinely doesn't cover this model.
 function matchModelVariant(modelName, librarySheets) {
   const { segments, flags } = analyzeModelName(modelName);
+  const family = MODEL_FAMILIES.find(f => f.test.test(modelName||""));
+  if (!family) {
+    return { match:null, flags, reason:"doesn't start with a recognized model family (STP, STP Direct HH, Paragon/STP)" };
+  }
+  if (family.skip) return { match:null, flags, reason:family.skip };
+
+  // An exclusion tag the tool doesn't know would silently produce wrong numbers
+  // (the model would be computed as if it weren't excluded) — skip it instead.
+  const unknownEx = (modelName||"")
+    .replace(/ex[-\s]?uslc/gi,"").replace(/\bex[-\s]?fi\b/gi,"")
+    .replace(/\bex[-\s]?int(?:l|ernational)?\.?\s*dev/gi,"").replace(/\bex[-\s]?em\b/gi,"");
+  if (/\bex[-\s]+[a-z]/i.test(unknownEx)) {
+    return { match:null, flags, reason:"has an exclusion tag the tool doesn't recognize (known: Ex-USLC, Ex-FI, Ex-Int Dev, Ex-EM)" };
+  }
   if (segments.length !== 2) {
     return { match:null, flags, reason:`${segments.length} segment(s) left after removing recognized tags (${segments.join(" / ")||"none"}) — doesn't reduce to a single "{prefix} - {variant}" form` };
   }
   const candidate = segments[1];
-  const searchIn = librarySheets.filter(s => s.isTaxAware === flags.isTaxAware);
+
+  const fromLibrary = librarySheets.filter(s => !s.source || s.source === family.source);
+  if (fromLibrary.length === 0) {
+    return { match:null, flags, reason:`the ${family.libraryLabel} library hasn't been uploaded` };
+  }
+  const prefixN = normAlnum(family.sheetPrefix);
+  const searchIn = fromLibrary.filter(s => normAlnum(s.name).startsWith(prefixN) && s.isTaxAware === flags.isTaxAware);
   if (searchIn.length === 0) {
-    return { match:null, flags, reason:`no ${flags.isTaxAware?"Tax Aware":"base"} sheet found in the library file` };
+    return { match:null, flags, reason:`no ${flags.isTaxAware?"Tax Aware ":""}"${family.sheetPrefix}" tab found in the ${family.libraryLabel} library` };
   }
 
   for (const sheet of searchIn) {
@@ -967,7 +1027,8 @@ function matchModelVariant(modelName, librarySheets) {
   // neighboring risk-ladder variants — pair index = (firstNumber-10)/20 along
   // the library's own column order (10/90=AllFixed+Conservative, 30/70=
   // Conservative+ModConservative, 50/50=ModConservative+Moderate, 70/30=
-  // Moderate+ModAggressive).
+  // Moderate+ModAggressive). Only reached when the library has no column of
+  // that exact name — a 50/50 or 70/30 column in the library is used directly.
   const blendMatch = candidate.match(/^(\d{1,3})\s*\/\s*(\d{1,3})$/);
   if (blendMatch) {
     const n1 = parseInt(blendMatch[1],10), n2 = parseInt(blendMatch[2],10);
@@ -1011,19 +1072,26 @@ function getMatchFrac(row, match) {
 //                            sum to 100%) — matches how the existing file
 //                            already stores class-level targets.
 //
-// ex-USLC (confirmed rule; note this changes the file's current ex-USLC
-// numbers, which were built on an earlier whole-portfolio version):
-//   US Large Cap is excluded and its share is redistributed pro-rata among
-//   the *other classes in its own category (Equity) only* — Fixed Income,
-//   Alternatives, and Cash are untouched. Category Target % still reflects
-//   each class's true underlying category value (e.g. 62/32/5/1), even
-//   though the file's Category SubModel Name text is one flattened label
-//   shared across every row of the model.
+// ex-USLC / ex-FI / ex-Int Dev / ex-EM (any combination):
+//   the excluded classes' whole-model fractions are summed and redistributed
+//   pro-rata across EVERY other class in the model (whole-model rescale, not
+//   just the excluded class's own category). Category Target % is left
+//   untouched — the file's Category label for these rows is one flattened
+//   placeholder shared by the whole model.
+//
+// Paragon/STP: same as the equivalent STP model, except international
+//   (Intl Developed + Emerging Markets) is half the library's and the other
+//   half is added to US Large Cap.
 //
 // US Equity Only (verified against STP - Moderate - US Equity Only):
 //   Category Target %s are untouched. US Small Cap keeps its normal
 //   classFrac/catFrac value; US Large Cap = 100 - that Small Cap value
 //   (they're the only two classes left in the category).
+//
+// Classes/categories the library doesn't carry for a model's column (blank or
+// 0%), or that an ex- tag excludes, are REMOVED — their rows are deleted from
+// the export. Adding new classes/categories is not handled (it needs a new
+// Security Set).
 //
 // Differences within `tolerance` percentage points are treated as rounding
 // noise, not a real change — the original value is left exactly as-is.
@@ -1032,6 +1100,7 @@ const DEFAULT_CHANGE_TOLERANCE = 0.05;
 
 function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_TOLERANCE) {
   const updated = rows.map(r => ({...r}));
+  const deleted = new Set(); // row indexes removed from the export (see removeRow)
   const changes = [];
   const changeKeys = new Set();
   const skippedModels = new Map(); // modelName -> reason
@@ -1039,6 +1108,7 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
   const unmatchedCategories = [];
   const unmatchedClasses = [];
   const modelMatchCache = {};
+  const entryAt = new Map(); // "row|field" -> its review entry, so a later rounding nudge updates it instead of adding a second line
 
   function recordChange(i, field, modelName, label, oldVal, newVal, note) {
     if (Math.abs(newVal - (parseFloat(oldVal)||0)) > tolerance) {
@@ -1049,9 +1119,25 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
       const key = `${modelName}|${field}|${label}|${newVal}`;
       if (!changeKeys.has(key)) {
         changeKeys.add(key);
-        changes.push({ modelName, level: field==="Category Target %"?"Category":"Class", label, oldVal, newVal, note });
+        const entry = { modelName, level: field==="Category Target %"?"Category":"Class", label, oldVal, newVal, note, _row:i, _field:field };
+        changes.push(entry);
+        entryAt.set(`${i}|${field}`, entry);
       }
       updated[i][field] = newVal;
+    }
+  }
+
+  // A class or category the library no longer has for this model (blank or 0%
+  // in its column, or excluded by an ex- tag) is removed — the row is deleted
+  // from the export rather than left at 0%. Adding classes is not handled.
+  function removeRow(i, level, label, oldVal, note) {
+    if (deleted.has(i)) return;
+    deleted.add(i);
+    const modelName = rows[i]["* Model Name"];
+    const key = `${modelName}|removed|${level}|${label}`;
+    if (!changeKeys.has(key)) {
+      changeKeys.add(key);
+      changes.push({ modelName, level, label, oldVal, newVal:null, removed:true, note });
     }
   }
 
@@ -1069,17 +1155,37 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
     const catSubName = r["Category SubModel Name"];
     const classSubName = r["Class SubModel Name"];
 
-    if (flags.isExUslc || flags.isExFI) {
+    const uslcRow = matchLibraryLabel("US Large Cap", classRows);
+    const intlRow = matchLibraryLabel("Intl Developed ex-US Market", classRows);
+    const emRow = matchLibraryLabel("Emerging Markets", classRows);
+    // Paragon/STP: international exposure (Intl Developed + Emerging Markets) is
+    // HALF the library's, and the other half is added to US Large Cap. Everything
+    // else is the library as-is. Verified against the existing Paragon models.
+    const frac = row => {
+      const v = getMatchFrac(row, match);
+      if (!flags.isParagon || v === null || v === undefined) return v;
+      if (row === intlRow || row === emRow) return v/2;
+      if (row === uslcRow) {
+        const half = x => x ? (getMatchFrac(x, match) || 0)/2 : 0;
+        return v + half(intlRow) + half(emRow);
+      }
+      return v;
+    };
+
+    if (flags.isExUslc || flags.isExFI || flags.isExIntDev || flags.isExEM) {
       // Verified against real data (ex-USLC case): the excluded portion's
       // whole-model fraction is redistributed pro-rata across EVERY other
       // class in the model — new Class % = classFrac × 1/(1-excludedFrac) ×
-      // 100. ex-FI removes the entire Fixed Income category the same way;
-      // combined (both tags on one model) just sums both excluded fractions
-      // before rescaling. Category Target % is intentionally left untouched
+      // 100. Each tag adds its piece to the excluded fraction: Ex-USLC = US
+      // Large Cap, Ex-Int Dev = Intl Developed, Ex-EM = Emerging Markets,
+      // Ex-FI = the whole Fixed Income category — so any combination is just the
+      // sum before rescaling. Category Target % is intentionally left untouched
       // — the file's Category SubModel Name for these rows is a flattened
       // placeholder, not real structured data.
-      const usLargeCapRow = flags.isExUslc ? matchLibraryLabel("US Large Cap", classRows) : null;
-      const largeCapFrac = usLargeCapRow ? (getMatchFrac(usLargeCapRow, match) || 0) : 0;
+      const usLargeCapRow = flags.isExUslc ? uslcRow : null;
+      const largeCapFrac = usLargeCapRow ? (frac(usLargeCapRow) || 0) : 0;
+      const intlDevFrac = flags.isExIntDev && intlRow ? (frac(intlRow) || 0) : 0;
+      const emFrac = flags.isExEM && emRow ? (frac(emRow) || 0) : 0;
       const fixedIncomeCatRow = flags.isExFI ? matchLibraryLabel("FIXED INCOME", catRows) : null;
       const fixedIncomeFrac = fixedIncomeCatRow ? (getMatchFrac(fixedIncomeCatRow, match) || 0) : 0;
       // Combined with "US Equity Only": that tag's own effect (everything
@@ -1090,34 +1196,35 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
       // since that's what ends up bundled into the Large Cap figure being
       // removed. Verified this reduces to the same math as excluding all of
       // them directly and rescaling once.
+      const isNonUsEquity = c => usLargeCapRow && c.category===usLargeCapRow.category
+        && normAlnum(c.label)!=="USLARGECAP" && normAlnum(c.label)!=="USSMALLCAP";
       let nonUsEquityFrac = 0;
       if (flags.isExUslc && flags.isUsEquityOnly && usLargeCapRow) {
-        nonUsEquityFrac = classRows
-          .filter(c => c.category===usLargeCapRow.category && normAlnum(c.label)!=="USLARGECAP" && normAlnum(c.label)!=="USSMALLCAP")
-          .reduce((s,c) => s + (getMatchFrac(c, match) || 0), 0);
+        nonUsEquityFrac = classRows.filter(isNonUsEquity).reduce((s,c) => s + (frac(c) || 0), 0);
       }
-      const excludedFrac = largeCapFrac + fixedIncomeFrac + nonUsEquityFrac;
+      const excludedFrac = largeCapFrac + intlDevFrac + emFrac + fixedIncomeFrac + nonUsEquityFrac;
       const scale = excludedFrac < 1 ? 1/(1-excludedFrac) : 1;
 
       if (classSubName) {
         const classMatch = matchLibraryLabel(classSubName, classRows);
+        const excludedClass = classMatch && (
+          (flags.isExUslc && classMatch===uslcRow) ||
+          (flags.isExIntDev && classMatch===intlRow) ||
+          (flags.isExEM && classMatch===emRow) ||
+          (flags.isExFI && fixedIncomeCatRow && classMatch.category===fixedIncomeCatRow.label) ||
+          (flags.isUsEquityOnly && flags.isExUslc && isNonUsEquity(classMatch))
+        );
         if (!classMatch) {
           unmatchedClasses.push({ modelName, label: classSubName });
-        } else if (flags.isExUslc && usLargeCapRow && classMatch===usLargeCapRow) {
-          // US Large Cap itself — ex-USLC means this is excluded entirely,
-          // not rescaled. Some files still carry this row explicitly (rather
-          // than omitting it) even after the tag is applied, so this can't
-          // just be assumed structurally absent.
-          recordChange(i, "Class Target %", modelName, classSubName, r["Class Target %"], 0);
-        } else if (flags.isUsEquityOnly && usLargeCapRow && classMatch.category===usLargeCapRow.category
-                   && normAlnum(classMatch.label)!=="USLARGECAP" && normAlnum(classMatch.label)!=="USSMALLCAP") {
-          // Non-US-equity class (International, Emerging Markets, etc.) —
-          // "US Equity Only" means this shouldn't hold any weight at all;
-          // its fraction is already folded into excludedFrac above.
-          recordChange(i, "Class Target %", modelName, classSubName, r["Class Target %"], 0);
+        } else if (excludedClass) {
+          // Some files still carry a row for a class the tag excludes (rather
+          // than omitting it), so this can't just be assumed structurally absent.
+          removeRow(i, "Class", classSubName, r["Class Target %"], "excluded by this model's ex- tag");
         } else {
-          const classFrac = getMatchFrac(classMatch, match);
-          if (classFrac !== null && classFrac !== undefined) {
+          const classFrac = frac(classMatch);
+          if (classFrac === null || classFrac === undefined || classFrac <= 0) {
+            removeRow(i, "Class", classSubName, r["Class Target %"], "not in this model's library column");
+          } else {
             recordChange(i, "Class Target %", modelName, classSubName, r["Class Target %"], +(classFrac*scale*100).toFixed(2));
           }
         }
@@ -1136,10 +1243,14 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
       if (!catMatch) {
         unmatchedCategories.push({ modelName, label: catSubName });
       } else {
-        const frac = getMatchFrac(catMatch, match);
-        if (frac !== null && frac !== undefined) {
-          recordChange(i, "Category Target %", modelName, catSubName, r["Category Target %"], +(frac*100).toFixed(2));
+        const f = getMatchFrac(catMatch, match);
+        if (f === null || f === undefined || f <= 0) {
+          // The whole category is absent for this model's column — every row
+          // under it goes (one entry shown in the review, all its rows removed).
+          removeRow(i, "Category", catSubName, r["Category Target %"], "category isn't in this model's library column");
+          return;
         }
+        recordChange(i, "Category Target %", modelName, catSubName, r["Category Target %"], +(f*100).toFixed(2));
       }
     }
 
@@ -1157,20 +1268,22 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
         unmatchedClasses.push({ modelName, label: classSubName });
       } else {
         const catFrac = catMatch ? getMatchFrac(catMatch, match) : null;
-        let newVal = null;
+        let newVal = null, remove = false;
         if (forcedFullAllocation) {
           newVal = 100;
         } else if (flags.isUsEquityOnly && normAlnum(classMatch.label)==="USLARGECAP") {
           const smallCapRow = matchLibraryLabel("US Small Cap", classRows);
-          const smallCapFrac = smallCapRow ? getMatchFrac(smallCapRow, match) : null;
+          const smallCapFrac = smallCapRow ? frac(smallCapRow) : null;
           if (smallCapFrac !== null && smallCapFrac !== undefined && catFrac) {
             newVal = +(100 - +(smallCapFrac/catFrac*100).toFixed(2)).toFixed(2);
           }
         } else {
-          const classFrac = getMatchFrac(classMatch, match);
-          if (classFrac !== null && classFrac !== undefined && catFrac) newVal = +(classFrac/catFrac*100).toFixed(2);
+          const classFrac = frac(classMatch);
+          if (classFrac === null || classFrac === undefined || classFrac <= 0) remove = true;
+          else if (catFrac) newVal = +(classFrac/catFrac*100).toFixed(2);
         }
-        if (newVal !== null) recordChange(i, "Class Target %", modelName, classSubName, r["Class Target %"], newVal);
+        if (remove) removeRow(i, "Class", classSubName, r["Class Target %"], "class isn't in this model's library column");
+        else if (newVal !== null) recordChange(i, "Class Target %", modelName, classSubName, r["Class Target %"], newVal);
       }
     }
   });
@@ -1185,6 +1298,7 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
   // than nudging a small class by comparison.
   const categoryGroups = new Map(); // "modelName|catSubModelName" -> [{ i, val }]
   rows.forEach((r, i) => {
+    if (deleted.has(i)) return;
     const modelName = r["* Model Name"];
     const catSubModelName = r["Category SubModel Name"];
     if (!modelName || !catSubModelName || !r["Class SubModel Name"]) return;
@@ -1205,26 +1319,37 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
     if (Math.abs(newVal - largest.val) < 1e-9) return;
     updated[largest.i]["Class Target %"] = newVal;
     const label = rows[largest.i]["Class SubModel Name"];
-    const key2 = `${modelName}|Class Target %|${label}|${newVal}`;
-    if (!changeKeys.has(key2)) {
-      changeKeys.add(key2);
-      changes.push({ modelName, level:"Class", label, oldVal: rows[largest.i]["Class Target %"], newVal, note:"rounding reconciliation (classes now sum to 100%)" });
+    const ek = `${largest.i}|Class Target %`, existing = entryAt.get(ek);
+    if (existing) {
+      existing.newVal = newVal;
+      existing.note = existing.note || "rounding reconciliation (classes now sum to 100%)";
+    } else {
+      const entry = { modelName, level:"Class", label, oldVal: rows[largest.i]["Class Target %"], newVal, note:"rounding reconciliation (classes now sum to 100%)", _row:largest.i, _field:"Class Target %" };
+      changes.push(entry);
+      entryAt.set(ek, entry);
     }
   });
 
+  // One line per changed value, showing its FINAL value; a change that the
+  // rounding step moved back to where it started isn't a change at all.
+  const finalChanges = changes
+    .filter(c => c.removed || Math.abs(c.newVal - (parseFloat(c.oldVal)||0)) > 1e-9)
+    .map(({ _row, _field, ...c }) => c);
+
   return {
-    updatedRows: updated, changes,
+    updatedRows: updated.filter((_, i) => !deleted.has(i)), changes: finalChanges,
     skippedModels: [...skippedModels.entries()].map(([modelName, reason]) => ({ modelName, reason })),
     matchedModelCount: matchedModels.size,
+    removedRowCount: deleted.size,
     unmatchedCategories, unmatchedClasses,
   };
 }
 
-function downloadXlsxWithHeaders(rows, headers, filename) {
+function downloadXlsxWithHeaders(rows, headers, filename, sheetName = "Sheet 1") {
   const ws = XLSX.utils.json_to_sheet(rows, { header:headers });
   ws["!cols"] = headers.map(c=>({ wch:Math.max((c||"").length+2,14) }));
   const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, "Sheet 1");
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
   XLSX.writeFile(wb, filename);
 }
 
@@ -1268,7 +1393,9 @@ function UpdateModelsFlow({ onBack }) {
   const [existingFile, setExistingFile] = useState(null);
   const [existing, setExisting] = useState(null); // {headers, rows}
   const [libraryFile, setLibraryFile] = useState(null);
-  const [library, setLibrary] = useState(null); // sheets[]
+  const [library, setLibrary] = useState(null); // sheets[]  (Savvy library: STP, Paragon/STP)
+  const [directFile, setDirectFile] = useState(null);
+  const [directLibrary, setDirectLibrary] = useState(null); // sheets[]  (STP Direct library: STP Direct HH)
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
   const [lastDownload, setLastDownload] = useState("full"); // "full" | "changed"
@@ -1302,16 +1429,39 @@ function UpdateModelsFlow({ onBack }) {
     reader.readAsArrayBuffer(file);
   }
 
+  function handleDirectFile(file) {
+    if (!file) return;
+    setError(null); setDirectFile(file); setDirectLibrary(null);
+    const reader = new FileReader();
+    reader.onload = e => {
+      try {
+        const sheets = parseLibraryWorkbook(new Uint8Array(e.target.result));
+        if (sheets.length===0) throw new Error("Couldn't find a model matrix sheet in the STP Direct library (looked for a row with a 'Ticker' column).");
+        setDirectLibrary(sheets);
+      } catch(err) { setError(err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // Both libraries feed one pool; each sheet remembers which library it came from
+  // so a model family only ever reads its own library's tabs.
+  function pooledLibrary() {
+    return [
+      ...(library||[]).map(s => ({ ...s, source:"savvy" })),
+      ...(directLibrary||[]).map(s => ({ ...s, source:"direct" })),
+    ];
+  }
+
   function runCompare() {
-    const res = computeLibraryUpdates(existing.rows, library, tolerance);
+    const res = computeLibraryUpdates(existing.rows, pooledLibrary(), tolerance);
     setResult(res);
     setStage("review");
   }
 
   function handleToleranceChange(newTolerance) {
     setTolerance(newTolerance);
-    if (existing && library) {
-      setResult(computeLibraryUpdates(existing.rows, library, newTolerance));
+    if (existing && (library || directLibrary)) {
+      setResult(computeLibraryUpdates(existing.rows, pooledLibrary(), newTolerance));
     }
   }
 
@@ -1329,10 +1479,10 @@ function UpdateModelsFlow({ onBack }) {
 
   function reset() {
     setStage("upload"); setExistingFile(null); setExisting(null);
-    setLibraryFile(null); setLibrary(null); setError(null); setResult(null);
+    setLibraryFile(null); setLibrary(null); setDirectFile(null); setDirectLibrary(null); setError(null); setResult(null);
   }
 
-  const bothReady = existing && library;
+  const bothReady = existing && (library || directLibrary);
 
   if (stage === "upload") {
     return (
@@ -1340,12 +1490,14 @@ function UpdateModelsFlow({ onBack }) {
         <div style={{display:"flex",gap:12,marginBottom:14}}>
           <FilePickBox label="Current model export" hint="How the models are set up today (.xlsx)"
             file={existingFile} onFile={handleExistingFile} />
-          <FilePickBox label="Model library / targets" hint="New targets to apply (.xlsx)"
+          <FilePickBox label="Savvy model library" hint="Targets for STP and Paragon/STP models (.xlsx)"
             file={libraryFile} onFile={handleLibraryFile} accentColor="#0aa89c" />
+          <FilePickBox label="STP Direct library" hint="Targets for STP Direct HH models (.xlsx) — optional"
+            file={directFile} onFile={handleDirectFile} accentColor="#7c3aed" />
         </div>
         {error && <div style={{marginBottom:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
         <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.6,marginBottom:16}}>
-          <strong style={{color:"#0369a1"}}>What this does:</strong> matches each model to its column in the library, recalculates Category and Class targets from it, and leaves bands, Security Sets, and anything the library doesn't cover untouched. You'll see every change before exporting.
+          <strong style={{color:"#0369a1"}}>What this does:</strong> matches each model to its column in the library, recalculates Category and Class targets from it, and leaves bands, Security Sets, and anything the library doesn't cover untouched. A class or category the library no longer has for a model is removed (its row is deleted); new ones aren't added. You'll see every change before exporting.
         </div>
         <div style={{display:"flex",justifyContent:"space-between"}}>
           <button onClick={onBack} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
@@ -1367,9 +1519,10 @@ function UpdateModelsFlow({ onBack }) {
     return (
       <div>
         <div style={{display:"flex",gap:16,marginBottom:16,alignItems:"stretch"}}>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,flex:1}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,flex:1}}>
             {[
               ["Models matched", matchedModelCount, "#1a56db"],
+              ["Rows removed", changes.filter(c=>c.removed).length, changes.some(c=>c.removed)?"#b45309":"#9ca3af"],
               ["Models skipped", skippedModels.length, "#9ca3af"],
               ["Unmatched labels", unmatchedCategories.length+unmatchedClasses.length, unmatchedCategories.length+unmatchedClasses.length?"#dc2626":"#9ca3af"],
             ].map(([lbl,val,color])=>(
@@ -1403,19 +1556,21 @@ function UpdateModelsFlow({ onBack }) {
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
               <tbody>
                 {grouped[name].map((c,i)=>{
-                  const delta = Math.abs(c.newVal - (parseFloat(c.oldVal)||0));
-                  const notable = delta > 0.5;
+                  const delta = c.removed ? Math.abs(parseFloat(c.oldVal)||0) : Math.abs(c.newVal - (parseFloat(c.oldVal)||0));
+                  const notable = c.removed || delta > 0.5;
                   return (
                   <tr key={i} style={{borderTop:i>0?"0.5px solid #f3f4f6":"none", background:notable?"#fffbeb":"transparent"}}>
                     <td style={{padding:"6px 12px",color:"#6b7280",width:70}}>{c.level}</td>
                     <td style={{padding:"6px 12px",color:"#374151"}}>
                       {c.label}
                       {c.note && <span style={{marginLeft:6,fontSize:10,color:"#6b7280",fontStyle:"italic"}}>({c.note})</span>}
-                      {notable && <span style={{marginLeft:6,fontSize:9,fontWeight:700,color:"#b45309",background:"#fef3c7",borderRadius:4,padding:"1px 5px"}}>Δ {delta.toFixed(2)}pt</span>}
+                      {c.removed
+                        ? <span style={{marginLeft:6,fontSize:9,fontWeight:700,color:"#b91c1c",background:"#fee2e2",borderRadius:4,padding:"1px 5px"}}>ROW REMOVED</span>
+                        : notable && <span style={{marginLeft:6,fontSize:9,fontWeight:700,color:"#b45309",background:"#fef3c7",borderRadius:4,padding:"1px 5px"}}>Δ {delta.toFixed(2)}pt</span>}
                     </td>
                     <td style={{padding:"6px 12px",color:"#dc2626",textAlign:"right",width:70}}>{c.oldVal ?? "—"}%</td>
                     <td style={{padding:"6px 4px",color:"#9ca3af",width:20}}>→</td>
-                    <td style={{padding:"6px 12px",color:"#16a34a",fontWeight:700,textAlign:"right",width:70}}>{c.newVal}%</td>
+                    <td style={{padding:"6px 12px",color:c.removed?"#b91c1c":"#16a34a",fontWeight:700,textAlign:"right",width:70}}>{c.removed ? "removed" : `${c.newVal}%`}</td>
                   </tr>
                   );
                 })}
@@ -1434,8 +1589,8 @@ function UpdateModelsFlow({ onBack }) {
                 <div style={{marginBottom:8}}>
                   <strong style={{color:"#374151"}}>Not matched to the library</strong> (kept as-is):
                   <ul style={{margin:"4px 0 0",paddingLeft:18}}>
-                    {skippedModels.map((s,i)=>(
-                      <li key={i} style={{marginBottom:2}}><strong style={{color:"#374151"}}>{s.modelName}</strong> — {s.reason}</li>
+                    {Object.entries(skippedModels.reduce((g,s)=>{ (g[s.reason]=g[s.reason]||[]).push(s.modelName); return g; }, {})).map(([why,names],i)=>(
+                      <li key={i} style={{marginBottom:4}}><strong style={{color:"#374151"}}>{why}</strong> ({names.length}): {names.join("; ")}</li>
                     ))}
                   </ul>
                 </div>
@@ -1482,7 +1637,7 @@ function UpdateModelsFlow({ onBack }) {
       <div style={{fontSize:13,color:"#6b7280",marginBottom:6}}>
         {lastDownload==="changed"
           ? `Only the ${new Set(result.changes.map(c=>c.modelName)).size} model(s) with updated values were included.`
-          : `All ${result.matchedModelCount + result.skippedModels.length} models included, ${result.changes.length} value(s) updated.`}
+          : `All ${result.matchedModelCount + result.skippedModels.length} models included, ${result.changes.filter(c=>!c.removed).length} value(s) updated${result.removedRowCount ? `, ${result.removedRowCount} row(s) removed` : ""}.`}
       </div>
       <div style={{fontSize:13,color:"#6b7280",marginBottom:28}}>Ready to re-import into Orion Eclipse</div>
       <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
@@ -1490,6 +1645,500 @@ function UpdateModelsFlow({ onBack }) {
         <button onClick={()=>handleDownload(true)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download changed only</button>
         <button onClick={()=>handleDownload(false)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download full file</button>
         <button onClick={reset} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"8px 18px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>Process another pair</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Update Sleeve Strategies ─────────────────────────────────────────────────
+// A sleeve strategy splits one account across several model aggregates
+// ("sleeves"), each with a Target Allocation. The Sleeve Strategy Import lists
+// sleeves by Model Agg ID only; the Sleeve Strategy Export carries the names, so
+// it's stored in the browser (ID -> name) and refreshed occasionally.
+//
+// Only strategies whose splits come from the model library are recalculated —
+// and the library is always the source of truth:
+//
+//  1. STP Direct (Large/Medium x NQ/Qualified): the Global Equity sleeve (DI, or
+//     the stock model for Qualified) = library Global Equity; Large also has a
+//     Corporate/Muni Bond sleeve = library US Investment Grade; the Tactical ETF
+//     model gets the remainder.
+//
+//  2. An ex- model plus the sleeve that replaces what it excludes — "STP Mod Agg
+//     + DI (S&P 500)", Russell/Nasdaq DI, Paragon NQ, an Ex-FI model + a bond sleeve: the
+//     replacement sleeve takes the weight the ex- model excludes (US Large Cap,
+//     Intl Dev, EM or Fixed Income; Paragon's US Large Cap includes the half of
+//     international it moves there) and the ex- model takes the rest. Fixed
+//     sleeves (Thematic, a bond sleeve) keep their current percentages and only
+//     the remainder is split — e.g. Moderate + DI (85%) + Thematic (15%) = 32.3 / 52.7 / 15.
+//
+// Everything else (fixed splits, client/custom strategies, anything without STP
+// or Paragon in the name) is left untouched. Targets are rounded to 2 decimals and
+// every updated strategy totals exactly what it did before (100).
+const SLEEVE_AGG_KEY = "sleeve-agg-map";
+async function loadSleeveAggMap() {
+  try {
+    const res = await window.storage.get(SLEEVE_AGG_KEY);
+    return res && res.value ? JSON.parse(res.value) : null;
+  } catch { return null; }
+}
+async function saveSleeveAggMap(obj) {
+  try { await window.storage.set(SLEEVE_AGG_KEY, JSON.stringify(obj)); } catch {}
+}
+
+// Sleeve Strategy Export -> { "<Model Agg ID>": "<Model Agg. Name>" }
+function parseSleeveExport(buffer) {
+  const wb = XLSX.read(buffer, { type:"array" });
+  const raw = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header:1, defval:null });
+  let headerIdx = -1;
+  for (let i=0; i<Math.min(raw.length,10); i++) {
+    if ((raw[i]||[]).map(normalizeKey).includes("model agg id")) { headerIdx = i; break; }
+  }
+  if (headerIdx === -1) throw new Error("Couldn't find a 'Model Agg ID' column — this should be the Sleeve Strategy Export file.");
+  const head = raw[headerIdx].map(normalizeKey);
+  const idCol = head.indexOf("model agg id");
+  let nameCol = head.indexOf("model agg. name");
+  if (nameCol === -1) nameCol = head.indexOf("model agg name");
+  if (nameCol === -1) nameCol = head.indexOf("model");
+  if (nameCol === -1) throw new Error("Couldn't find the 'Model Agg. Name' column in the Sleeve Strategy Export.");
+  const map = {};
+  for (let i=headerIdx+1; i<raw.length; i++) {
+    const row = raw[i]; if (!row) continue;
+    const id = row[idCol], nm = row[nameCol];
+    if (id === null || id === undefined || id === "" || !nm) continue;
+    map[String(id).trim()] = String(nm).trim();
+  }
+  if (Object.keys(map).length === 0) throw new Error("No model aggregates found in the Sleeve Strategy Export.");
+  return map;
+}
+
+// Sleeve Strategy Import -> { headers, rows, sheetName } with every column kept as-is
+function parseSleeveImport(buffer) {
+  const wb = XLSX.read(buffer, { type:"array" });
+  const sheetName = wb.SheetNames[0];
+  const raw = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header:1, defval:null });
+  let headerIdx = -1;
+  for (let i=0; i<Math.min(raw.length,10); i++) {
+    if ((raw[i]||[]).map(normalizeKey).includes("sleeve strategy id")) { headerIdx = i; break; }
+  }
+  if (headerIdx === -1) throw new Error("Couldn't find a 'Sleeve Strategy ID' column — this should be the Sleeve Strategy Import file.");
+  const headers = [];
+  const names = raw[headerIdx].map(c => (c===null||c===undefined) ? null : c.toString().trim());
+  names.forEach(h => { if (h && !headers.includes(h)) headers.push(h); });
+  for (const need of ["Sleeve Strategy ID","Name","SleeveType","Modelagg Id","Target Allocation"]) {
+    if (!headers.includes(need)) throw new Error(`The Sleeve Strategy Import is missing the '${need}' column.`);
+  }
+  const rows = [];
+  for (let i=headerIdx+1; i<raw.length; i++) {
+    const row = raw[i];
+    if (!row || row.every(c=>c===null||c==="")) continue;
+    const obj = {};
+    names.forEach((h,idx)=>{ if (h) obj[h] = row[idx]!==undefined ? row[idx] : null; });
+    if (obj["Sleeve Strategy ID"]===null || obj["Sleeve Strategy ID"]==="") continue;
+    rows.push(obj);
+  }
+  if (rows.length === 0) throw new Error("No sleeve strategies found in the import file.");
+  return { headers, rows, sheetName };
+}
+
+// What a sleeve is, from its model aggregate's name.
+function sleeveKind(n) {
+  if (/thematic/i.test(n)) return "THEMATIC";
+  if (/Large Cap 500/i.test(n)) return "DI_SPX";
+  if (/Total Portfolios Model US Large Cap Equity/i.test(n)) return "DI_USLC";
+  if (/Total Portfolios Global Equity/i.test(n)) return "DI_GLOBAL";
+  if (/Corporate Bond Strategy/i.test(n)) return "CORP_BOND";
+  if (/Municipal Bond Strategy/i.test(n)) return "MUNI_BOND";
+  if (/Paragon Core ETF All Fixed/i.test(n)) return "PARAGON_FI";
+  if (/^Paragon\/STP/i.test(n)) return "PARAGON_EQ";
+  if (/^STP Tactical ETF/i.test(n)) return "TACT_ETF";
+  if (/^STP - /i.test(n)) return /ex-uslc|ex-fi/i.test(n) ? "STP_EX" : "STP";
+  if (/Bond Ladder/i.test(n)) return "LADDER";
+  if (/Custom Indexing|Orion Custom/i.test(n)) return "DI_OTHER";
+  if (/Stock Model|Single Stock/i.test(n)) return "STOCK";
+  return "OTHER";
+}
+const SLEEVE_EQUITY_DI = new Set(["DI_SPX","DI_USLC","DI_GLOBAL","DI_OTHER"]);
+const SLEEVE_FI = new Set(["CORP_BOND","MUNI_BOND"]);
+const sleeveRound = x => +(Math.round(x*100 + 1e-9)/100).toFixed(2);
+const SLEEVE_TOLERANCE = 0.005; // a change smaller than the 2-decimal precision isn't a change
+
+// "STP Direct Large (NQ) - Mod Agg (TA)" -> { size, acct, profile, isTA }
+function parseDirectStrategyName(name) {
+  const m = (name||"").match(/^STP Direct (Large|Medium)\s*\((NQ|Qualified)\)\s*-\s*(.+?)\s*$/i);
+  if (!m) return null;
+  let profile = m[3].trim(), isTA = false;
+  const t = profile.match(/^(.*?)\s*\((?:TA|Tax[-\s]?Aware)\)\s*$/i);
+  if (t) { profile = t[1].trim(); isTA = true; }
+  const alias = { "mod agg":"Moderately Aggressive", "mod cons":"Moderately Conservative" };
+  profile = alias[profile.toLowerCase()] || profile;
+  return { size: /large/i.test(m[1]) ? "Large" : "Medium", acct: m[2], profile, isTA };
+}
+
+// The whole-model weight an ex- model leaves out (US Large Cap / Intl Dev / EM /
+// Fixed Income, per its name), read from the library column it maps to.
+function sleeveExcludedFraction(aggName, librarySheets) {
+  const { match, flags, reason } = matchModelVariant(aggName, librarySheets);
+  if (!match) return { reason };
+  const classRows = match.sheet.rows.filter(x=>x.level==="class");
+  const catRows = match.sheet.rows.filter(x=>x.level==="category");
+  const uslcRow = matchLibraryLabel("US Large Cap", classRows);
+  const intlRow = matchLibraryLabel("Intl Developed ex-US Market", classRows);
+  const emRow = matchLibraryLabel("Emerging Markets", classRows);
+  const raw = row => (row ? (getMatchFrac(row, match) || 0) : 0);
+  // Paragon/STP: international is halved and the other half sits in US Large Cap.
+  const frac = row => {
+    const v = raw(row);
+    if (!flags.isParagon) return v;
+    if (row === intlRow || row === emRow) return v/2;
+    if (row === uslcRow) return v + raw(intlRow)/2 + raw(emRow)/2;
+    return v;
+  };
+  let ex = 0;
+  if (flags.isExUslc) { if (!uslcRow) return { reason:"the library has no US Large Cap row" }; ex += frac(uslcRow); }
+  if (flags.isExIntDev) { if (!intlRow) return { reason:"the library has no Intl Developed row" }; ex += frac(intlRow); }
+  if (flags.isExEM) { if (!emRow) return { reason:"the library has no Emerging Markets row" }; ex += frac(emRow); }
+  if (flags.isExFI) {
+    const fiRow = matchLibraryLabel("FIXED INCOME", catRows);
+    if (!fiRow) return { reason:"the library has no Fixed Income row" };
+    ex += raw(fiRow);
+  }
+  return { frac: ex };
+}
+
+function computeSleeveUpdates(rows, aggMap, librarySheets) {
+  const updated = rows.map(r => ({...r}));
+  const strategies = new Map(); // id -> { id, name, idx: [row indexes of its Normal sleeves] }
+  rows.forEach((r, i) => {
+    const id = r["Sleeve Strategy ID"];
+    if (id === null || id === undefined || id === "") return;
+    if (!strategies.has(id)) strategies.set(id, { id, name: r["Name"], idx: [] });
+    if (r["SleeveType"] === "Normal") strategies.get(id).idx.push(i);
+  });
+  const changes = [], statuses = [];
+
+  for (const s of strategies.values()) {
+    const comps = s.idx.map(i => {
+      const aggId = rows[i]["Modelagg Id"];
+      const aggName = aggMap[String(aggId)];
+      return { i, aggId, aggName, kind: aggName ? sleeveKind(aggName) : null, old: parseFloat(rows[i]["Target Allocation"]) || 0 };
+    });
+    const skip = (group, reason) => statuses.push({ id:s.id, name:s.name, status:"skipped", group, reason });
+    // newVals: Map(comp -> new target). Applies only what actually moved.
+    const apply = (family, newVals) => {
+      let changed = 0;
+      for (const [c, v] of newVals) {
+        if (Math.abs(v - c.old) > SLEEVE_TOLERANCE) {
+          updated[c.i]["Target Allocation"] = v;
+          changes.push({ strategyId:s.id, strategyName:s.name, family, label:c.aggName, oldVal:c.old, newVal:v });
+          changed++;
+        }
+      }
+      statuses.push({ id:s.id, name:s.name, status: changed ? "updated" : "unchanged", family });
+    };
+
+    if (!/STP|Paragon/i.test(s.name||"")) { skip("Not touched", "No STP or Paragon in the name"); continue; }
+    const unknown = comps.filter(c => !c.aggName).map(c => c.aggId);
+    if (unknown.length) {
+      skip("Needs a fresh Sleeve Strategy Export", `Model Agg ID ${[...new Set(unknown)].join(", ")} isn't in the stored export`);
+      continue;
+    }
+
+    // ── 1. STP Direct ───────────────────────────────────────────────────────
+    if (/^STP Direct\b/i.test(s.name)) {
+      const info = parseDirectStrategyName(s.name);
+      if (!info) { skip("Couldn't read", "Name isn't in the form 'STP Direct Large|Medium (NQ|Qualified) - Profile'"); continue; }
+      const allowed = new Set(["DI_GLOBAL","STOCK","CORP_BOND","MUNI_BOND","TACT_ETF"]);
+      const odd = comps.find(c => !allowed.has(c.kind) || (info.size==="Medium" && SLEEVE_FI.has(c.kind)));
+      if (odd) { skip("Couldn't read", `Unexpected sleeve: ${odd.aggName}`); continue; }
+      const globals = comps.filter(c => c.kind==="DI_GLOBAL" || c.kind==="STOCK");
+      const bonds = comps.filter(c => SLEEVE_FI.has(c.kind));
+      const tacts = comps.filter(c => c.kind==="TACT_ETF");
+      if (tacts.length !== 1 || globals.length > 1 || bonds.length > 1) { skip("Couldn't read", "Expected one Tactical ETF sleeve and at most one Global Equity and one bond sleeve"); continue; }
+      const prefix = normAlnum(info.size==="Large" ? "STP Direct Large" : "STP Direct Med");
+      const sheet = librarySheets.find(x => (!x.source || x.source==="direct") && normAlnum(x.name).startsWith(prefix) && x.isTaxAware===info.isTA);
+      if (!sheet) { skip("Library not available", `no ${info.isTA?"Tax Aware ":""}'STP Direct ${info.size==="Large"?"Large":"Med"}' tab (is the STP Direct library uploaded?)`); continue; }
+      const variant = sheet.variants.find(v => v.toLowerCase()===info.profile.toLowerCase());
+      if (!variant) { skip("Library not available", `'${info.profile}' isn't a column in ${sheet.name}`); continue; }
+      const classRows = sheet.rows.filter(x=>x.level==="class");
+      const gRow = matchLibraryLabel("Global Equity", classRows), igRow = matchLibraryLabel("US Investment Grade", classRows);
+      const pct = row => row ? sleeveRound((row.values[variant] ?? 0) * 100) : 0;
+      const globalPct = pct(gRow), igPct = info.size==="Large" ? pct(igRow) : 0;
+      if (globalPct > 0 && !globals.length) { skip("Couldn't read", "The library has Global Equity for this profile but the strategy has no Global Equity sleeve"); continue; }
+      if (igPct > 0 && !bonds.length) { skip("Couldn't read", "The library has US Investment Grade for this profile but the strategy has no bond sleeve"); continue; }
+      const m = new Map();
+      if (globals.length) m.set(globals[0], globalPct);
+      if (bonds.length) m.set(bonds[0], igPct);
+      m.set(tacts[0], sleeveRound(100 - (globals.length?globalPct:0) - (bonds.length?igPct:0)));
+      apply("STP Direct", m);
+      continue;
+    }
+
+    // ── 2. ex- model + the sleeve that replaces what it excludes ─────────────
+    const exComps = comps.filter(c => c.kind==="STP_EX" || (c.kind==="PARAGON_EQ" && /ex-uslc/i.test(c.aggName)));
+    if (exComps.length === 0) { skip("Fixed splits", "Percentages are fixed (not derived from the model library)"); continue; }
+    if (exComps.length > 1) { skip("Couldn't read", "More than one ex- model in the strategy"); continue; }
+    const ex = exComps[0];
+    const { flags } = analyzeModelName(ex.aggName);
+    const equityEx = flags.isExUslc || flags.isExIntDev || flags.isExEM, fiEx = flags.isExFI;
+    if (equityEx && fiEx) { skip("Couldn't read", `${ex.aggName} excludes both equity and Fixed Income — that needs two replacement sleeves`); continue; }
+    if (!equityEx && !fiEx) { skip("Couldn't read", `No recognizable exclusion in ${ex.aggName}`); continue; }
+    const wanted = equityEx ? (k => SLEEVE_EQUITY_DI.has(k)) : (k => SLEEVE_FI.has(k));
+    const reps = comps.filter(c => c !== ex && wanted(c.kind));
+    if (reps.length === 0) { skip("Fixed splits", `Nothing library-driven: no ${equityEx?"DI":"bond"} sleeve takes the weight ${ex.aggName} excludes`); continue; }
+    if (reps.length > 1) { skip("Couldn't read", `More than one ${equityEx?"DI":"bond"} sleeve to take the excluded weight`); continue; }
+    const rep = reps[0];
+    const fixedTotal = comps.filter(c => c !== ex && c !== rep).reduce((t, c) => t + c.old, 0);
+    const remainder = 100 - fixedTotal;
+    if (remainder < 0) { skip("Couldn't read", "The fixed sleeves already add to more than 100"); continue; }
+    const exFrac = sleeveExcludedFraction(ex.aggName, librarySheets);
+    if (exFrac.reason) { skip("Library not available", `${ex.aggName}: ${exFrac.reason}`); continue; }
+    const repPct = sleeveRound(remainder * exFrac.frac);
+    const m = new Map([[rep, repPct], [ex, sleeveRound(remainder - repPct)]]);
+    apply(flags.isParagon ? "Paragon" : "STP ex- model + sleeve", m);
+  }
+
+  return { updatedRows: updated, changes, statuses, strategyCount: strategies.size };
+}
+
+function SleeveStrategyFlow({ onBack }) {
+  const [stage, setStage] = useState("upload"); // upload | review | done
+  const [importFile, setImportFile] = useState(null);
+  const [importData, setImportData] = useState(null); // { headers, rows, sheetName }
+  const [exportFile, setExportFile] = useState(null);
+  const [aggMap, setAggMap] = useState(null); // { id: name }
+  const [aggMeta, setAggMeta] = useState(null); // { savedAt, fileName, count }
+  const [libraryFile, setLibraryFile] = useState(null);
+  const [library, setLibrary] = useState(null); // Savvy library
+  const [directFile, setDirectFile] = useState(null);
+  const [directLibrary, setDirectLibrary] = useState(null); // STP Direct library
+  const [error, setError] = useState(null);
+  const [result, setResult] = useState(null);
+  const [lastDownload, setLastDownload] = useState("full");
+
+  useEffect(() => {
+    let alive = true;
+    loadSleeveAggMap().then(saved => {
+      if (alive && saved && saved.map) {
+        setAggMap(saved.map);
+        setAggMeta({ savedAt: saved.savedAt, fileName: saved.fileName, count: Object.keys(saved.map).length });
+      }
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const readFile = (file, parse, onOk) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      try { onOk(parse(new Uint8Array(e.target.result))); }
+      catch (err) { setError(err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+  function handleImportFile(file) {
+    if (!file) return;
+    setError(null); setImportFile(file); setImportData(null);
+    readFile(file, parseSleeveImport, setImportData);
+  }
+  function handleExportFile(file) {
+    if (!file) return;
+    setError(null); setExportFile(file);
+    readFile(file, parseSleeveExport, map => {
+      const meta = { savedAt: new Date().toISOString(), fileName: file.name, count: Object.keys(map).length };
+      setAggMap(map); setAggMeta(meta);
+      saveSleeveAggMap({ map, savedAt: meta.savedAt, fileName: file.name });
+    });
+  }
+  function handleLibraryFile(file) {
+    if (!file) return;
+    setError(null); setLibraryFile(file); setLibrary(null);
+    readFile(file, parseLibraryWorkbook, sheets => {
+      if (sheets.length === 0) setError("Couldn't find a model matrix sheet (looked for a row with a 'Ticker' column).");
+      else setLibrary(sheets);
+    });
+  }
+  function handleDirectFile(file) {
+    if (!file) return;
+    setError(null); setDirectFile(file); setDirectLibrary(null);
+    readFile(file, parseLibraryWorkbook, sheets => {
+      if (sheets.length === 0) setError("Couldn't find a model matrix sheet in the STP Direct library (looked for a row with a 'Ticker' column).");
+      else setDirectLibrary(sheets);
+    });
+  }
+
+  const pooledLibrary = () => [
+    ...(library||[]).map(s => ({ ...s, source:"savvy" })),
+    ...(directLibrary||[]).map(s => ({ ...s, source:"direct" })),
+  ];
+  const ready = importData && aggMap && (library || directLibrary);
+
+  function runCompare() {
+    setResult(computeSleeveUpdates(importData.rows, aggMap, pooledLibrary()));
+    setStage("review");
+  }
+  function handleDownload(changedOnly) {
+    const baseName = importFile.name.replace(/\.[^.]+$/,"");
+    const changedIds = new Set(result.changes.map(c => c.strategyId));
+    const rowsToExport = changedOnly
+      ? result.updatedRows.filter(r => changedIds.has(r["Sleeve Strategy ID"]))
+      : result.updatedRows;
+    downloadXlsxWithHeaders(rowsToExport, importData.headers, `${baseName}${changedOnly ? "_ChangedStrategiesOnly" : "_Updated"}.xlsx`, importData.sheetName);
+    setLastDownload(changedOnly ? "changed" : "full");
+    setStage("done");
+  }
+  function reset() {
+    setStage("upload"); setImportFile(null); setImportData(null); setExportFile(null);
+    setLibraryFile(null); setLibrary(null); setDirectFile(null); setDirectLibrary(null);
+    setError(null); setResult(null);
+  }
+
+  const btnGhost = {background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"};
+
+  if (stage === "upload") {
+    const exportHint = aggMeta
+      ? `Stored: ${aggMeta.count} model aggregates · saved ${new Date(aggMeta.savedAt).toLocaleDateString()}${exportFile ? "" : " — choose a file to refresh"}`
+      : "Needed once, then it's remembered (.xlsx)";
+    return (
+      <div>
+        <div style={{display:"flex",gap:12,marginBottom:12}}>
+          <FilePickBox label="Sleeve Strategy Import" hint="The file to update (.xlsx)"
+            file={importFile} onFile={handleImportFile} />
+          <FilePickBox label="Sleeve Strategy Export" hint={exportHint}
+            file={exportFile || (aggMeta ? { name: aggMeta.fileName || "stored export" } : null)} onFile={handleExportFile} accentColor="#f59e0b" />
+        </div>
+        <div style={{display:"flex",gap:12,marginBottom:14}}>
+          <FilePickBox label="Savvy model library" hint="STP and Paragon/STP targets (.xlsx)"
+            file={libraryFile} onFile={handleLibraryFile} accentColor="#0aa89c" />
+          <FilePickBox label="STP Direct library" hint="STP Direct targets (.xlsx)"
+            file={directFile} onFile={handleDirectFile} accentColor="#7c3aed" />
+        </div>
+        {error && <div style={{marginBottom:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
+        <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.6,marginBottom:16}}>
+          <strong style={{color:"#0369a1"}}>What this does:</strong> recalculates the Target Allocation of the sleeve strategies whose splits come from the model libraries — STP Direct, Paragon, and STP + DI strategies — and leaves everything else exactly as it is, including the Thematic and other fixed percentages. The libraries are always the source of truth. The export contains only the strategies that changed. You'll see every change before exporting.
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between"}}>
+          <button onClick={onBack} style={btnGhost}>← Back</button>
+          <button onClick={runCompare} disabled={!ready}
+            style={{background:ready?"#1a56db":"#93c5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:ready?"pointer":"default"}}>
+            Compare & review →
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (stage === "review") {
+    const { changes, statuses, strategyCount } = result;
+    const grouped = {};
+    changes.forEach(c => { (grouped[c.strategyId] = grouped[c.strategyId] || { name:c.strategyName, family:c.family, items:[] }).items.push(c); });
+    const updatedIds = Object.keys(grouped);
+    const unchanged = statuses.filter(s => s.status==="unchanged");
+    const skipped = statuses.filter(s => s.status==="skipped");
+    const skippedByReason = skipped.reduce((g, s) => { const k = `${s.group} — ${s.reason}`; (g[k] = g[k] || []).push(s.name); return g; }, {});
+    return (
+      <div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:16}}>
+          {[
+            ["Strategies in file", strategyCount, "#1a56db"],
+            ["Being updated", updatedIds.length, updatedIds.length ? "#b45309" : "#9ca3af"],
+            ["Already correct", unchanged.length, "#16a34a"],
+            ["Not updated", skipped.length, "#9ca3af"],
+          ].map(([lbl,val,color])=>(
+            <div key={lbl} style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px"}}>
+              <div style={{fontSize:19,fontWeight:700,color}}>{val}</div>
+              <div style={{fontSize:11,color:"#6b7280"}}>{lbl}</div>
+            </div>
+          ))}
+        </div>
+
+        {updatedIds.length === 0 && (
+          <div style={{background:"#f0fdf4",border:"0.5px solid #bbf7d0",borderRadius:8,padding:"14px",fontSize:13,color:"#166534",marginBottom:16}}>
+            Every library-driven sleeve strategy already matches the libraries — nothing to change.
+          </div>
+        )}
+
+        {updatedIds.map(id => (
+          <div key={id} style={{border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:10,overflow:"hidden"}}>
+            <div style={{background:"#f9fafb",padding:"8px 12px",fontSize:12,fontWeight:700,color:"#111827",borderBottom:"0.5px solid #e5e7eb",display:"flex",justifyContent:"space-between"}}>
+              <span>{grouped[id].name} <span style={{fontWeight:400,color:"#9ca3af"}}>(ID {id})</span></span>
+              <span style={{fontSize:10,fontWeight:600,color:"#6b7280"}}>{grouped[id].family}</span>
+            </div>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <tbody>
+                {grouped[id].items.map((c,i)=>(
+                  <tr key={i} style={{borderTop:i>0?"0.5px solid #f3f4f6":"none"}}>
+                    <td style={{padding:"6px 12px",color:"#374151"}}>{c.label}</td>
+                    <td style={{padding:"6px 12px",color:"#dc2626",textAlign:"right",width:80}}>{c.oldVal}%</td>
+                    <td style={{padding:"6px 4px",color:"#9ca3af",width:20}}>→</td>
+                    <td style={{padding:"6px 12px",color:"#16a34a",fontWeight:700,textAlign:"right",width:80}}>{c.newVal}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+        {(unchanged.length>0 || skipped.length>0) && (
+          <details style={{marginTop:8,marginBottom:20}}>
+            <summary style={{cursor:"pointer",fontSize:12,fontWeight:600,color:"#6b7280"}}>
+              Not changed — {unchanged.length} already correct, {skipped.length} not updated
+            </summary>
+            <div style={{marginTop:8,padding:"10px 12px",background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,fontSize:11,color:"#6b7280",lineHeight:1.7}}>
+              {unchanged.length>0 && (
+                <div style={{marginBottom:8}}>
+                  <strong style={{color:"#374151"}}>Already match the libraries</strong> ({unchanged.length}): {unchanged.map(u=>u.name).join("; ")}
+                </div>
+              )}
+              {skipped.length>0 && (
+                <div>
+                  <strong style={{color:"#374151"}}>Not updated</strong> (kept as-is):
+                  <ul style={{margin:"4px 0 0",paddingLeft:18}}>
+                    {Object.entries(skippedByReason).map(([why,names],i)=>(
+                      <li key={i} style={{marginBottom:4}}><strong style={{color:"#374151"}}>{why}</strong> ({names.length}): {names.join("; ")}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          </details>
+        )}
+
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"0.5px solid #e5e7eb",paddingTop:16}}>
+          <button onClick={()=>setStage("upload")} style={btnGhost}>← Back</button>
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={()=>handleDownload(false)}
+              style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#6b7280",cursor:"pointer"}}>
+              Export full file ↓
+            </button>
+            <button onClick={()=>handleDownload(true)} disabled={updatedIds.length===0}
+              style={{background:updatedIds.length?"#1a56db":"#93c5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:updatedIds.length?"pointer":"default"}}>
+              Export changed strategies ↓
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // stage === "done"
+  const changedCount = new Set(result.changes.map(c => c.strategyId)).size;
+  return (
+    <div style={{textAlign:"center",padding:"48px 24px"}}>
+      <div style={{width:56,height:56,borderRadius:"50%",background:"#dcfce7",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px"}}>
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+      </div>
+      <div style={{fontSize:18,fontWeight:700,color:"#111827",marginBottom:6}}>File downloaded</div>
+      <div style={{fontSize:13,color:"#6b7280",marginBottom:6}}>
+        {lastDownload==="changed"
+          ? `Only the ${changedCount} strategy(ies) with updated targets were included.`
+          : `All ${result.strategyCount} strategies included, ${changedCount} updated.`}
+      </div>
+      <div style={{fontSize:13,color:"#6b7280",marginBottom:28}}>Ready to import back into Orion</div>
+      <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
+        <button onClick={()=>setStage("review")} style={btnGhost}>← Back to review</button>
+        <button onClick={()=>handleDownload(true)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download changed only</button>
+        <button onClick={()=>handleDownload(false)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download full file</button>
+        <button onClick={reset} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"8px 18px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>Process another file</button>
       </div>
     </div>
   );
@@ -2749,7 +3398,7 @@ export default function OrionImportBuilder() {
           <div>
             <div style={{fontSize:18,fontWeight:700,color:"#111827"}}>Orion Import Builder</div>
             <div style={{fontSize:12,color:"#6b7280"}}>
-              {mode===null ? "Upload · visualize · edit · export" : mode==="import" ? "New import file" : mode==="update" ? "Update existing models" : "Advisor Custom Model builder"}
+              {mode===null ? "Upload · visualize · edit · export" : mode==="import" ? "New import file" : mode==="update" ? "Update existing models" : mode==="sleeve" ? "Update sleeve strategies" : "Advisor Custom Model builder"}
             </div>
           </div>
         </div>
@@ -2802,6 +3451,17 @@ export default function OrionImportBuilder() {
             <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Build Advisor Custom Model</div>
             <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Turn an advisor's raw, non-proportional model file into proportional targets, then export Model + Security Set import files.</div>
           </div>
+          <div onClick={()=>setMode("sleeve")}
+            style={{flex:1,border:"0.5px solid #e5e7eb",borderRadius:12,padding:"28px 20px",cursor:"pointer",background:"#fff",transition:"all 0.15s"}}
+            onMouseEnter={e=>e.currentTarget.style.borderColor="#f59e0b"} onMouseLeave={e=>e.currentTarget.style.borderColor="#e5e7eb"}>
+            <div style={{width:36,height:36,borderRadius:9,background:"#fffbeb",display:"flex",alignItems:"center",justifyContent:"center",marginBottom:14}}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/>
+              </svg>
+            </div>
+            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Update sleeve strategies</div>
+            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload the Sleeve Strategy Import plus the model libraries — get back the import with refreshed targets for STP Direct, Paragon and STP + DI strategies.</div>
+          </div>
         </div>
       )}
 
@@ -2810,6 +3470,9 @@ export default function OrionImportBuilder() {
 
       {/* ── Advisor Custom Model workflow ── */}
       {mode==="acm" && <AcmFlow onBack={()=>setMode(null)} />}
+
+      {/* ── Sleeve Strategy workflow ── */}
+      {mode==="sleeve" && <SleeveStrategyFlow onBack={()=>setMode(null)} />}
 
       {/* ── Import workflow (upload/edit/done) ── */}
       {mode==="import" && (
