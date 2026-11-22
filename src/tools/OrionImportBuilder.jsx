@@ -1088,10 +1088,10 @@ function getMatchFrac(row, match) {
 //   classFrac/catFrac value; US Large Cap = 100 - that Small Cap value
 //   (they're the only two classes left in the category).
 //
-// Classes/categories the library doesn't carry for a model's column (blank or
-// 0%), or that an ex- tag excludes, are REMOVED — their rows are deleted from
-// the export. Adding new classes/categories is not handled (it needs a new
-// Security Set).
+// Classes/categories the library doesn't carry for a model — blank or 0% in its
+// column, deleted from the library's tab altogether, or excluded by an ex- tag —
+// are REMOVED: their rows are deleted from the export. Adding new classes or
+// categories is not handled (it needs a new Security Set).
 //
 // Every value that differs from the library is brought to it — the tolerance
 // defaults to 0 and isn't exposed in the UI (a tolerance is for auditing, not for
@@ -1215,7 +1215,7 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
           (flags.isUsEquityOnly && flags.isExUslc && isNonUsEquity(classMatch))
         );
         if (!classMatch) {
-          unmatchedClasses.push({ modelName, label: classSubName });
+          removeRow(i, "Class", classSubName, r["Class Target %"], "class isn't in the library any more");
         } else if (excludedClass) {
           // Some files still carry a row for a class the tag excludes (rather
           // than omitting it), so this can't just be assumed structurally absent.
@@ -1239,8 +1239,27 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
       catMatch = matchLibraryLabel("FIXED INCOME", catRows);
     }
 
+    // Is this row's class still in the library? (Stock-model and Bond Ladder rows have their own fallbacks.)
+    let classMatch = classSubName ? matchLibraryLabel(classSubName, classRows) : null;
+    let forcedFullAllocation = false;
+    if (classSubName && !classMatch && flags.holdingsAssetClass === "equity" && /stock/i.test(classSubName)) {
+      // The substituted holdings row (e.g. "Savvy US Equity - Core S&P 500 Stock Model") stands in for US Large Cap.
+      // Only that row: any other unmatched row (say Cash, once it's left the library) must not borrow US Large Cap.
+      classMatch = matchLibraryLabel("US Large Cap", classRows);
+    } else if (classSubName && !classMatch && flags.holdingsAssetClass === "fixedIncome" && /ladder/i.test(classSubName)) {
+      // Bond Ladder collapses its whole category into this one row (verified: always 100%).
+      forcedFullAllocation = true;
+    }
+    // A class that's no longer in the library goes — decided BEFORE any category matching, because a category
+    // label like "STP - All Equity - Cash" also contains "Equity" and could be mistaken for the Equity category.
+    if (classSubName && !classMatch && !forcedFullAllocation) {
+      removeRow(i, "Class", classSubName, r["Class Target %"], `class isn't in the library any more (${catSubName || "no category"})`);
+      return;
+    }
+
     if (catSubName) {
       if (!catMatch) {
+        // A missing category over a class that still matches is a naming mismatch — flag it, don't guess.
         unmatchedCategories.push({ modelName, label: catSubName });
       } else {
         const f = getMatchFrac(catMatch, match);
@@ -1255,18 +1274,7 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
     }
 
     if (classSubName) {
-      let classMatch = matchLibraryLabel(classSubName, classRows);
-      let forcedFullAllocation = false;
-      if (!classMatch && flags.holdingsAssetClass === "equity") {
-        // Substituted holdings row (stock model) stands in for US Large Cap.
-        classMatch = matchLibraryLabel("US Large Cap", classRows);
-      } else if (!classMatch && flags.holdingsAssetClass === "fixedIncome") {
-        // Bond Ladder collapses its whole category into this one row (verified: always 100%).
-        forcedFullAllocation = true;
-      }
-      if (!classMatch && !forcedFullAllocation) {
-        unmatchedClasses.push({ modelName, label: classSubName });
-      } else {
+      {
         const catFrac = catMatch ? getMatchFrac(catMatch, match) : null;
         let newVal = null, remove = false;
         if (forcedFullAllocation) {
@@ -1287,6 +1295,19 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
       }
     }
   });
+
+  // Safety net: if the library would remove EVERY row of a model, it almost certainly doesn't
+  // define that model's structure (a wrong tab, or rows deleted by mistake) — leave the model alone.
+  const rowsPerModel = new Map(), removedPerModel = new Map();
+  rows.forEach(r => { const n = r["* Model Name"]; if (n) rowsPerModel.set(n, (rowsPerModel.get(n) || 0) + 1); });
+  deleted.forEach(i => { const n = rows[i]["* Model Name"]; removedPerModel.set(n, (removedPerModel.get(n) || 0) + 1); });
+  for (const [n, c] of removedPerModel) {
+    if (c !== rowsPerModel.get(n)) continue;
+    rows.forEach((r, i) => { if (r["* Model Name"] === n) { deleted.delete(i); updated[i] = { ...r }; } });
+    for (let k = changes.length - 1; k >= 0; k--) if (changes[k].modelName === n) changes.splice(k, 1);
+    matchedModels.delete(n);
+    skippedModels.set(n, "Every row would be removed — the library doesn't seem to define this model's structure");
+  }
 
   // Reconcile rounding drift: every class-value formula in this function
   // rounds each class to 2 decimals independently, so tiny drift (a few
@@ -1989,7 +2010,7 @@ function UpdateFlow({ onBack }) {
         </div>
         {error && <div style={{marginBottom:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
         <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.7,marginBottom:16}}>
-          <strong style={{color:"#0369a1"}}>What this does:</strong> add the model export, the Sleeve Strategy Import, or both. <strong>Models:</strong> recalculates Category and Class targets from the library and leaves bands, Security Sets and anything the library doesn't cover untouched; a class or category the library no longer has for a model is removed (its row is deleted), new ones aren't added. <strong>Sleeve strategies:</strong> recalculates Target Allocation for the STP Direct, Paragon and STP + DI strategies and leaves Thematic and other fixed percentages alone. The sleeve export has just the strategies that changed, and only their Normal sleeve rows. You'll see every change before exporting, and each file exports separately.
+          <strong style={{color:"#0369a1"}}>What this does:</strong> add the model export, the Sleeve Strategy Import, or both. <strong>Models:</strong> recalculates Category and Class targets from the library and leaves bands, Security Sets and anything the library doesn't cover untouched; a class or category the library no longer has for a model — blank, 0%, or deleted from the library — is removed (its row is deleted), and new ones aren't added. <strong>Sleeve strategies:</strong> recalculates Target Allocation for the STP Direct, Paragon and STP + DI strategies and leaves Thematic and other fixed percentages alone. The sleeve export has just the strategies that changed, and only their Normal sleeve rows. You'll see every change before exporting, and each file exports separately.
         </div>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <button onClick={onBack} style={btnGhost}>← Back</button>
