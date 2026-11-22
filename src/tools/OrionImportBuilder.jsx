@@ -3572,7 +3572,7 @@ export default function OrionImportBuilder() {
           <div>
             <div style={{fontSize:18,fontWeight:700,color:"#111827"}}>Orion Import Builder</div>
             <div style={{fontSize:12,color:"#6b7280"}}>
-              {mode===null ? "Upload · visualize · edit · export" : mode==="import" ? "New import file" : mode==="update" ? "Update existing models, sleeve strategies and security sets" : "Advisor Custom Model builder"}
+              {mode===null ? "Upload · visualize · edit · export" : mode==="import" ? "New import file" : mode==="update" ? "Update Existing Models" : "Advisor Custom Model builder"}
             </div>
           </div>
         </div>
@@ -3611,7 +3611,7 @@ export default function OrionImportBuilder() {
                 <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
               </svg>
             </div>
-            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Update existing models, sleeve strategies and security sets</div>
+            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Update Existing Models</div>
             <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload your model export, Sleeve Strategy Import and/or Security Set Detail plus the model libraries — get back updated files with just the changed values.</div>
           </div>
           <div onClick={()=>setMode("acm")}
