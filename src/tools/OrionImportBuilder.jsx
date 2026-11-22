@@ -1353,10 +1353,9 @@ function downloadXlsxWithHeaders(rows, headers, filename, sheetName = "Sheet 1")
   XLSX.writeFile(wb, filename);
 }
 
-// ── Update Existing Models Flow ─────────────────────────────────────────────
-// Two-file workflow: an existing Orion export (current state) + a model
-// library file (new targets). Matches models/categories/classes between them
-// and lets the user review every value that would change before exporting.
+// ── Shared file picker ──────────────────────────────────────────────────────
+// (The Update flow itself — models + sleeve strategies — is further down, after
+// the helpers it uses.)
 
 function FilePickBox({ label, hint, file, onFile, accentColor="#1a56db" }) {
   const ref = useRef();
@@ -1384,268 +1383,6 @@ function FilePickBox({ label, hint, file, onFile, accentColor="#1a56db" }) {
           Choose file
         </div>
       )}
-    </div>
-  );
-}
-
-function UpdateModelsFlow({ onBack }) {
-  const [stage, setStage] = useState("upload"); // upload | review | done
-  const [existingFile, setExistingFile] = useState(null);
-  const [existing, setExisting] = useState(null); // {headers, rows}
-  const [libraryFile, setLibraryFile] = useState(null);
-  const [library, setLibrary] = useState(null); // sheets[]  (Savvy library: STP, Paragon/STP)
-  const [directFile, setDirectFile] = useState(null);
-  const [directLibrary, setDirectLibrary] = useState(null); // sheets[]  (STP Direct library: STP Direct HH)
-  const [error, setError] = useState(null);
-  const [result, setResult] = useState(null);
-  const [lastDownload, setLastDownload] = useState("full"); // "full" | "changed"
-  const [tolerance, setTolerance] = useState(DEFAULT_CHANGE_TOLERANCE);
-
-  function handleExistingFile(file) {
-    if (!file) return;
-    setError(null); setExistingFile(file); setExisting(null);
-    const reader = new FileReader();
-    reader.onload = e => {
-      try {
-        const parsed = parseWorkbookRows(new Uint8Array(e.target.result));
-        if (parsed.rows.length===0) throw new Error("No data rows found in the current-model file.");
-        setExisting(parsed);
-      } catch(err) { setError(err.message); }
-    };
-    reader.readAsArrayBuffer(file);
-  }
-
-  function handleLibraryFile(file) {
-    if (!file) return;
-    setError(null); setLibraryFile(file); setLibrary(null);
-    const reader = new FileReader();
-    reader.onload = e => {
-      try {
-        const sheets = parseLibraryWorkbook(new Uint8Array(e.target.result));
-        if (sheets.length===0) throw new Error("Couldn't find a model matrix sheet (looked for a row with a 'Ticker' column).");
-        setLibrary(sheets);
-      } catch(err) { setError(err.message); }
-    };
-    reader.readAsArrayBuffer(file);
-  }
-
-  function handleDirectFile(file) {
-    if (!file) return;
-    setError(null); setDirectFile(file); setDirectLibrary(null);
-    const reader = new FileReader();
-    reader.onload = e => {
-      try {
-        const sheets = parseLibraryWorkbook(new Uint8Array(e.target.result));
-        if (sheets.length===0) throw new Error("Couldn't find a model matrix sheet in the STP Direct library (looked for a row with a 'Ticker' column).");
-        setDirectLibrary(sheets);
-      } catch(err) { setError(err.message); }
-    };
-    reader.readAsArrayBuffer(file);
-  }
-
-  // Both libraries feed one pool; each sheet remembers which library it came from
-  // so a model family only ever reads its own library's tabs.
-  function pooledLibrary() {
-    return [
-      ...(library||[]).map(s => ({ ...s, source:"savvy" })),
-      ...(directLibrary||[]).map(s => ({ ...s, source:"direct" })),
-    ];
-  }
-
-  function runCompare() {
-    const res = computeLibraryUpdates(existing.rows, pooledLibrary(), tolerance);
-    setResult(res);
-    setStage("review");
-  }
-
-  function handleToleranceChange(newTolerance) {
-    setTolerance(newTolerance);
-    if (existing && (library || directLibrary)) {
-      setResult(computeLibraryUpdates(existing.rows, pooledLibrary(), newTolerance));
-    }
-  }
-
-  function handleDownload(changedOnly) {
-    const baseName = existingFile.name.replace(/\.[^.]+$/,"");
-    const changedModelNames = new Set(result.changes.map(c=>c.modelName));
-    const rowsToExport = changedOnly
-      ? result.updatedRows.filter(r => changedModelNames.has(r["* Model Name"]))
-      : result.updatedRows;
-    const suffix = changedOnly ? "_ChangedModelsOnly" : "_Updated";
-    downloadXlsxWithHeaders(rowsToExport, existing.headers, `${baseName}${suffix}.xlsx`);
-    setLastDownload(changedOnly ? "changed" : "full");
-    setStage("done");
-  }
-
-  function reset() {
-    setStage("upload"); setExistingFile(null); setExisting(null);
-    setLibraryFile(null); setLibrary(null); setDirectFile(null); setDirectLibrary(null); setError(null); setResult(null);
-  }
-
-  const bothReady = existing && (library || directLibrary);
-
-  if (stage === "upload") {
-    return (
-      <div>
-        <div style={{display:"flex",gap:12,marginBottom:14}}>
-          <FilePickBox label="Current model export" hint="How the models are set up today (.xlsx)"
-            file={existingFile} onFile={handleExistingFile} />
-          <FilePickBox label="Savvy model library" hint="Targets for STP and Paragon/STP models (.xlsx)"
-            file={libraryFile} onFile={handleLibraryFile} accentColor="#0aa89c" />
-          <FilePickBox label="STP Direct library" hint="Targets for STP Direct HH models (.xlsx) — optional"
-            file={directFile} onFile={handleDirectFile} accentColor="#7c3aed" />
-        </div>
-        {error && <div style={{marginBottom:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
-        <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.6,marginBottom:16}}>
-          <strong style={{color:"#0369a1"}}>What this does:</strong> matches each model to its column in the library, recalculates Category and Class targets from it, and leaves bands, Security Sets, and anything the library doesn't cover untouched. A class or category the library no longer has for a model is removed (its row is deleted); new ones aren't added. You'll see every change before exporting.
-        </div>
-        <div style={{display:"flex",justifyContent:"space-between"}}>
-          <button onClick={onBack} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-          <button onClick={runCompare} disabled={!bothReady}
-            style={{background:bothReady?"#1a56db":"#93c5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:bothReady?"pointer":"default"}}>
-            Compare & review →
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (stage === "review") {
-    const { changes, skippedModels, matchedModelCount, unmatchedCategories, unmatchedClasses } = result;
-    const grouped = {};
-    changes.forEach(c => { (grouped[c.modelName] = grouped[c.modelName]||[]).push(c); });
-    const modelNames = Object.keys(grouped);
-
-    return (
-      <div>
-        <div style={{display:"flex",gap:16,marginBottom:16,alignItems:"stretch"}}>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,flex:1}}>
-            {[
-              ["Models matched", matchedModelCount, "#1a56db"],
-              ["Rows removed", changes.filter(c=>c.removed).length, changes.some(c=>c.removed)?"#b45309":"#9ca3af"],
-              ["Models skipped", skippedModels.length, "#9ca3af"],
-              ["Unmatched labels", unmatchedCategories.length+unmatchedClasses.length, unmatchedCategories.length+unmatchedClasses.length?"#dc2626":"#9ca3af"],
-            ].map(([lbl,val,color])=>(
-              <div key={lbl} style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px"}}>
-                <div style={{fontSize:19,fontWeight:700,color}}>{val}</div>
-                <div style={{fontSize:11,color:"#6b7280"}}>{lbl}</div>
-              </div>
-            ))}
-          </div>
-          <div style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px",minWidth:150}}>
-            <label style={{fontSize:11,color:"#6b7280",display:"block",marginBottom:4}}>Change tolerance (pp)</label>
-            <input type="number" step="0.01" min="0" value={tolerance}
-              onChange={e=>{
-                const v = e.target.value === "" ? 0 : parseFloat(e.target.value);
-                if (!isNaN(v)) handleToleranceChange(v);
-              }}
-              style={{width:"100%",border:"0.5px solid #d1d5db",borderRadius:6,padding:"4px 8px",fontSize:14,fontWeight:700,color:"#111827"}} />
-          </div>
-        </div>
-
-
-        {modelNames.length===0 && (
-          <div style={{background:"#f0fdf4",border:"0.5px solid #bbf7d0",borderRadius:8,padding:"14px",fontSize:13,color:"#166534",marginBottom:16}}>
-            No target values differ from what's already in the current model file — nothing to change.
-          </div>
-        )}
-
-        {modelNames.map(name => (
-          <div key={name} style={{border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:10,overflow:"hidden"}}>
-            <div style={{background:"#f9fafb",padding:"8px 12px",fontSize:12,fontWeight:700,color:"#111827",borderBottom:"0.5px solid #e5e7eb"}}>{name}</div>
-            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-              <tbody>
-                {grouped[name].map((c,i)=>{
-                  const delta = c.removed ? Math.abs(parseFloat(c.oldVal)||0) : Math.abs(c.newVal - (parseFloat(c.oldVal)||0));
-                  const notable = c.removed || delta > 0.5;
-                  return (
-                  <tr key={i} style={{borderTop:i>0?"0.5px solid #f3f4f6":"none", background:notable?"#fffbeb":"transparent"}}>
-                    <td style={{padding:"6px 12px",color:"#6b7280",width:70}}>{c.level}</td>
-                    <td style={{padding:"6px 12px",color:"#374151"}}>
-                      {c.label}
-                      {c.note && <span style={{marginLeft:6,fontSize:10,color:"#6b7280",fontStyle:"italic"}}>({c.note})</span>}
-                      {c.removed
-                        ? <span style={{marginLeft:6,fontSize:9,fontWeight:700,color:"#b91c1c",background:"#fee2e2",borderRadius:4,padding:"1px 5px"}}>ROW REMOVED</span>
-                        : notable && <span style={{marginLeft:6,fontSize:9,fontWeight:700,color:"#b45309",background:"#fef3c7",borderRadius:4,padding:"1px 5px"}}>Δ {delta.toFixed(2)}pt</span>}
-                    </td>
-                    <td style={{padding:"6px 12px",color:"#dc2626",textAlign:"right",width:70}}>{c.oldVal ?? "—"}%</td>
-                    <td style={{padding:"6px 4px",color:"#9ca3af",width:20}}>→</td>
-                    <td style={{padding:"6px 12px",color:c.removed?"#b91c1c":"#16a34a",fontWeight:700,textAlign:"right",width:70}}>{c.removed ? "removed" : `${c.newVal}%`}</td>
-                  </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        ))}
-
-        {(skippedModels.length>0 || unmatchedCategories.length>0 || unmatchedClasses.length>0) && (
-          <details style={{marginTop:8,marginBottom:20}}>
-            <summary style={{cursor:"pointer",fontSize:12,fontWeight:600,color:"#6b7280"}}>
-              Not updated — {skippedModels.length} model(s), {unmatchedCategories.length+unmatchedClasses.length} unmatched label(s)
-            </summary>
-            <div style={{marginTop:8,padding:"10px 12px",background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,fontSize:11,color:"#6b7280",lineHeight:1.7}}>
-              {skippedModels.length>0 && (
-                <div style={{marginBottom:8}}>
-                  <strong style={{color:"#374151"}}>Not matched to the library</strong> (kept as-is):
-                  <ul style={{margin:"4px 0 0",paddingLeft:18}}>
-                    {Object.entries(skippedModels.reduce((g,s)=>{ (g[s.reason]=g[s.reason]||[]).push(s.modelName); return g; }, {})).map(([why,names],i)=>(
-                      <li key={i} style={{marginBottom:4}}><strong style={{color:"#374151"}}>{why}</strong> ({names.length}): {names.join("; ")}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {unmatchedCategories.length>0 && (
-                <div style={{marginBottom:8}}>
-                  <strong style={{color:"#374151"}}>Category not found in library:</strong>{" "}
-                  {unmatchedCategories.map((u,i)=>`${u.modelName} → ${u.label}`).join("; ")}
-                </div>
-              )}
-              {unmatchedClasses.length>0 && (
-                <div>
-                  <strong style={{color:"#374151"}}>Class not found in library:</strong>{" "}
-                  {unmatchedClasses.map((u,i)=>`${u.modelName} → ${u.label}`).join("; ")}
-                </div>
-              )}
-            </div>
-          </details>
-        )}
-
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"0.5px solid #e5e7eb",paddingTop:16}}>
-          <button onClick={()=>setStage("upload")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back</button>
-          <div style={{display:"flex",gap:8}}>
-            <button onClick={()=>handleDownload(true)} disabled={modelNames.length===0}
-              style={{background:"none",border:`0.5px solid ${modelNames.length?"#1a56db":"#d1d5db"}`,borderRadius:6,padding:"8px 18px",fontSize:13,fontWeight:600,color:modelNames.length?"#1a56db":"#9ca3af",cursor:modelNames.length?"pointer":"default"}}>
-              Export changed models only ↓
-            </button>
-            <button onClick={()=>handleDownload(false)} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>
-              Export full file ↓
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // stage === "done"
-  return (
-    <div style={{textAlign:"center",padding:"48px 24px"}}>
-      <div style={{width:56,height:56,borderRadius:"50%",background:"#dcfce7",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px"}}>
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-      </div>
-      <div style={{fontSize:18,fontWeight:700,color:"#111827",marginBottom:6}}>File downloaded</div>
-      <div style={{fontSize:13,color:"#6b7280",marginBottom:6}}>
-        {lastDownload==="changed"
-          ? `Only the ${new Set(result.changes.map(c=>c.modelName)).size} model(s) with updated values were included.`
-          : `All ${result.matchedModelCount + result.skippedModels.length} models included, ${result.changes.filter(c=>!c.removed).length} value(s) updated${result.removedRowCount ? `, ${result.removedRowCount} row(s) removed` : ""}.`}
-      </div>
-      <div style={{fontSize:13,color:"#6b7280",marginBottom:28}}>Ready to re-import into Orion Eclipse</div>
-      <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
-        <button onClick={()=>setStage("review")} style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#374151",cursor:"pointer"}}>← Back to review</button>
-        <button onClick={()=>handleDownload(true)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download changed only</button>
-        <button onClick={()=>handleDownload(false)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download full file</button>
-        <button onClick={reset} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"8px 18px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>Process another pair</button>
-      </div>
     </div>
   );
 }
@@ -1761,6 +1498,7 @@ function sleeveKind(n) {
 const SLEEVE_EQUITY_DI = new Set(["DI_SPX","DI_USLC","DI_GLOBAL","DI_OTHER"]);
 const SLEEVE_FI = new Set(["CORP_BOND","MUNI_BOND"]);
 const sleeveRound = x => +(Math.round(x*100 + 1e-9)/100).toFixed(2);
+const isNormalSleeve = r => String(r["SleeveType"] || "").trim().toLowerCase() === "normal"; // only these rows carry the targets; Custodial / Contribution / Distribution rows are ignored
 const SLEEVE_TOLERANCE = 0.005; // a change smaller than the 2-decimal precision isn't a change
 
 // "STP Direct Large (NQ) - Mod Agg (TA)" -> { size, acct, profile, isTA }
@@ -1813,7 +1551,7 @@ function computeSleeveUpdates(rows, aggMap, librarySheets) {
     const id = r["Sleeve Strategy ID"];
     if (id === null || id === undefined || id === "") return;
     if (!strategies.has(id)) strategies.set(id, { id, name: r["Name"], idx: [] });
-    if (r["SleeveType"] === "Normal") strategies.get(id).idx.push(i);
+    if (isNormalSleeve(r)) strategies.get(id).idx.push(i);
   });
   const changes = [], statuses = [];
 
@@ -1901,20 +1639,234 @@ function computeSleeveUpdates(rows, aggMap, librarySheets) {
   return { updatedRows: updated, changes, statuses, strategyCount: strategies.size };
 }
 
-function SleeveStrategyFlow({ onBack }) {
-  const [stage, setStage] = useState("upload"); // upload | review | done
+// The two review screens used by UpdateFlow — one per kind of file being updated.
+function ModelsReviewPanel({ result, tolerance, onTolerance, onExport }) {
+  const { changes, skippedModels, matchedModelCount, unmatchedCategories, unmatchedClasses } = result;
+  const grouped = {};
+  changes.forEach(c => { (grouped[c.modelName] = grouped[c.modelName]||[]).push(c); });
+  const modelNames = Object.keys(grouped);
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:16,marginBottom:16,alignItems:"stretch"}}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,flex:1}}>
+          {[
+            ["Models matched", matchedModelCount, "#1a56db"],
+            ["Rows removed", changes.filter(c=>c.removed).length, changes.some(c=>c.removed)?"#b45309":"#9ca3af"],
+            ["Models skipped", skippedModels.length, "#9ca3af"],
+            ["Unmatched labels", unmatchedCategories.length+unmatchedClasses.length, unmatchedCategories.length+unmatchedClasses.length?"#dc2626":"#9ca3af"],
+          ].map(([lbl,val,color])=>(
+            <div key={lbl} style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px"}}>
+              <div style={{fontSize:19,fontWeight:700,color}}>{val}</div>
+              <div style={{fontSize:11,color:"#6b7280"}}>{lbl}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px",minWidth:150}}>
+          <label style={{fontSize:11,color:"#6b7280",display:"block",marginBottom:4}}>Change tolerance (pp)</label>
+          <input type="number" step="0.01" min="0" value={tolerance}
+            onChange={e=>{
+              const v = e.target.value === "" ? 0 : parseFloat(e.target.value);
+              if (!isNaN(v)) onTolerance(v);
+            }}
+            style={{width:"100%",boxSizing:"border-box",border:"0.5px solid #d1d5db",borderRadius:6,padding:"4px 8px",fontSize:14,fontWeight:700,color:"#111827"}} />
+        </div>
+      </div>
+
+
+      {modelNames.length===0 && (
+        <div style={{background:"#f0fdf4",border:"0.5px solid #bbf7d0",borderRadius:8,padding:"14px",fontSize:13,color:"#166534",marginBottom:16}}>
+          No target values differ from what's already in the current model file — nothing to change.
+        </div>
+      )}
+
+      {modelNames.map(name => (
+        <div key={name} style={{border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:10,overflow:"hidden"}}>
+          <div style={{background:"#f9fafb",padding:"8px 12px",fontSize:12,fontWeight:700,color:"#111827",borderBottom:"0.5px solid #e5e7eb"}}>{name}</div>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+            <tbody>
+              {grouped[name].map((c,i)=>{
+                const delta = c.removed ? Math.abs(parseFloat(c.oldVal)||0) : Math.abs(c.newVal - (parseFloat(c.oldVal)||0));
+                const notable = c.removed || delta > 0.5;
+                return (
+                <tr key={i} style={{borderTop:i>0?"0.5px solid #f3f4f6":"none", background:notable?"#fffbeb":"transparent"}}>
+                  <td style={{padding:"6px 12px",color:"#6b7280",width:70}}>{c.level}</td>
+                  <td style={{padding:"6px 12px",color:"#374151"}}>
+                    {c.label}
+                    {c.note && <span style={{marginLeft:6,fontSize:10,color:"#6b7280",fontStyle:"italic"}}>({c.note})</span>}
+                    {c.removed
+                      ? <span style={{marginLeft:6,fontSize:9,fontWeight:700,color:"#b91c1c",background:"#fee2e2",borderRadius:4,padding:"1px 5px"}}>ROW REMOVED</span>
+                      : notable && <span style={{marginLeft:6,fontSize:9,fontWeight:700,color:"#b45309",background:"#fef3c7",borderRadius:4,padding:"1px 5px"}}>Δ {delta.toFixed(2)}pt</span>}
+                  </td>
+                  <td style={{padding:"6px 12px",color:"#dc2626",textAlign:"right",width:70}}>{c.oldVal ?? "—"}%</td>
+                  <td style={{padding:"6px 4px",color:"#9ca3af",width:20}}>→</td>
+                  <td style={{padding:"6px 12px",color:c.removed?"#b91c1c":"#16a34a",fontWeight:700,textAlign:"right",width:70}}>{c.removed ? "removed" : `${c.newVal}%`}</td>
+                </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ))}
+
+      {(skippedModels.length>0 || unmatchedCategories.length>0 || unmatchedClasses.length>0) && (
+        <details style={{marginTop:8,marginBottom:20}}>
+          <summary style={{cursor:"pointer",fontSize:12,fontWeight:600,color:"#6b7280"}}>
+            Not updated — {skippedModels.length} model(s), {unmatchedCategories.length+unmatchedClasses.length} unmatched label(s)
+          </summary>
+          <div style={{marginTop:8,padding:"10px 12px",background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,fontSize:11,color:"#6b7280",lineHeight:1.7}}>
+            {skippedModels.length>0 && (
+              <div style={{marginBottom:8}}>
+                <strong style={{color:"#374151"}}>Not matched to the library</strong> (kept as-is):
+                <ul style={{margin:"4px 0 0",paddingLeft:18}}>
+                  {Object.entries(skippedModels.reduce((g,s)=>{ (g[s.reason]=g[s.reason]||[]).push(s.modelName); return g; }, {})).map(([why,names],i)=>(
+                    <li key={i} style={{marginBottom:4}}><strong style={{color:"#374151"}}>{why}</strong> ({names.length}): {names.join("; ")}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {unmatchedCategories.length>0 && (
+              <div style={{marginBottom:8}}>
+                <strong style={{color:"#374151"}}>Category not found in library:</strong>{" "}
+                {unmatchedCategories.map((u,i)=>`${u.modelName} → ${u.label}`).join("; ")}
+              </div>
+            )}
+            {unmatchedClasses.length>0 && (
+              <div>
+                <strong style={{color:"#374151"}}>Class not found in library:</strong>{" "}
+                {unmatchedClasses.map((u,i)=>`${u.modelName} → ${u.label}`).join("; ")}
+              </div>
+            )}
+          </div>
+        </details>
+      )}
+
+      <div style={{display:"flex",justifyContent:"flex-end",alignItems:"center",marginBottom:4}}>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>onExport(true)} disabled={modelNames.length===0}
+            style={{background:"none",border:`0.5px solid ${modelNames.length?"#1a56db":"#d1d5db"}`,borderRadius:6,padding:"8px 18px",fontSize:13,fontWeight:600,color:modelNames.length?"#1a56db":"#9ca3af",cursor:modelNames.length?"pointer":"default"}}>
+            Export changed models only ↓
+          </button>
+          <button onClick={()=>onExport(false)} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>
+            Export full file ↓
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SleevesReviewPanel({ result, onExport }) {
+  const { changes, statuses, strategyCount } = result;
+  const grouped = {};
+  changes.forEach(c => { (grouped[c.strategyId] = grouped[c.strategyId] || { name:c.strategyName, family:c.family, items:[] }).items.push(c); });
+  const updatedIds = Object.keys(grouped);
+  const unchanged = statuses.filter(s => s.status==="unchanged");
+  const skipped = statuses.filter(s => s.status==="skipped");
+  const skippedByReason = skipped.reduce((g, s) => { const k = `${s.group} — ${s.reason}`; (g[k] = g[k] || []).push(s.name); return g; }, {});
+  return (
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:16}}>
+        {[
+          ["Strategies in file", strategyCount, "#1a56db"],
+          ["Being updated", updatedIds.length, updatedIds.length ? "#b45309" : "#9ca3af"],
+          ["Already correct", unchanged.length, "#16a34a"],
+          ["Not updated", skipped.length, "#9ca3af"],
+        ].map(([lbl,val,color])=>(
+          <div key={lbl} style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px"}}>
+            <div style={{fontSize:19,fontWeight:700,color}}>{val}</div>
+            <div style={{fontSize:11,color:"#6b7280"}}>{lbl}</div>
+          </div>
+        ))}
+      </div>
+
+      {updatedIds.length === 0 && (
+        <div style={{background:"#f0fdf4",border:"0.5px solid #bbf7d0",borderRadius:8,padding:"14px",fontSize:13,color:"#166534",marginBottom:16}}>
+          Every library-driven sleeve strategy already matches the libraries — nothing to change.
+        </div>
+      )}
+
+      {updatedIds.map(id => (
+        <div key={id} style={{border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:10,overflow:"hidden"}}>
+          <div style={{background:"#f9fafb",padding:"8px 12px",fontSize:12,fontWeight:700,color:"#111827",borderBottom:"0.5px solid #e5e7eb",display:"flex",justifyContent:"space-between"}}>
+            <span>{grouped[id].name} <span style={{fontWeight:400,color:"#9ca3af"}}>(ID {id})</span></span>
+            <span style={{fontSize:10,fontWeight:600,color:"#6b7280"}}>{grouped[id].family}</span>
+          </div>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+            <tbody>
+              {grouped[id].items.map((c,i)=>(
+                <tr key={i} style={{borderTop:i>0?"0.5px solid #f3f4f6":"none"}}>
+                  <td style={{padding:"6px 12px",color:"#374151"}}>{c.label}</td>
+                  <td style={{padding:"6px 12px",color:"#dc2626",textAlign:"right",width:80}}>{c.oldVal}%</td>
+                  <td style={{padding:"6px 4px",color:"#9ca3af",width:20}}>→</td>
+                  <td style={{padding:"6px 12px",color:"#16a34a",fontWeight:700,textAlign:"right",width:80}}>{c.newVal}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+
+      {(unchanged.length>0 || skipped.length>0) && (
+        <details style={{marginTop:8,marginBottom:20}}>
+          <summary style={{cursor:"pointer",fontSize:12,fontWeight:600,color:"#6b7280"}}>
+            Not changed — {unchanged.length} already correct, {skipped.length} not updated
+          </summary>
+          <div style={{marginTop:8,padding:"10px 12px",background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,fontSize:11,color:"#6b7280",lineHeight:1.7}}>
+            {unchanged.length>0 && (
+              <div style={{marginBottom:8}}>
+                <strong style={{color:"#374151"}}>Already match the libraries</strong> ({unchanged.length}): {unchanged.map(u=>u.name).join("; ")}
+              </div>
+            )}
+            {skipped.length>0 && (
+              <div>
+                <strong style={{color:"#374151"}}>Not updated</strong> (kept as-is):
+                <ul style={{margin:"4px 0 0",paddingLeft:18}}>
+                  {Object.entries(skippedByReason).map(([why,names],i)=>(
+                    <li key={i} style={{marginBottom:4}}><strong style={{color:"#374151"}}>{why}</strong> ({names.length}): {names.join("; ")}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        </details>
+      )}
+
+      <div style={{display:"flex",justifyContent:"flex-end",alignItems:"center",marginBottom:4}}>
+        <div style={{display:"flex",gap:10}}>
+          <button onClick={()=>onExport()} disabled={updatedIds.length===0}
+            style={{background:updatedIds.length?"#1a56db":"#93c5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:updatedIds.length?"pointer":"default"}}>
+            Export changed strategies ↓
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Update flow: existing models and sleeve strategies ───────────────────────
+// One workflow for both kinds of file. Upload either (or both) of the model
+// export and the Sleeve Strategy Import, plus the model libraries — which are the
+// source of truth for both — and review / export each result separately.
+function UpdateFlow({ onBack }) {
+  const [stage, setStage] = useState("upload"); // upload | review
+  const [tab, setTab] = useState("models");
+  const [existingFile, setExistingFile] = useState(null);
+  const [existing, setExisting] = useState(null); // model export { headers, rows }
   const [importFile, setImportFile] = useState(null);
-  const [importData, setImportData] = useState(null); // { headers, rows, sheetName }
+  const [importData, setImportData] = useState(null); // sleeve import { headers, rows, sheetName }
   const [exportFile, setExportFile] = useState(null);
-  const [aggMap, setAggMap] = useState(null); // { id: name }
+  const [aggMap, setAggMap] = useState(null); // { modelAggId: name }, kept between sessions
   const [aggMeta, setAggMeta] = useState(null); // { savedAt, fileName, count }
   const [libraryFile, setLibraryFile] = useState(null);
-  const [library, setLibrary] = useState(null); // Savvy library
+  const [library, setLibrary] = useState(null); // Savvy library (STP, Paragon/STP)
   const [directFile, setDirectFile] = useState(null);
   const [directLibrary, setDirectLibrary] = useState(null); // STP Direct library
   const [error, setError] = useState(null);
-  const [result, setResult] = useState(null);
-  const [lastDownload, setLastDownload] = useState("full");
+  const [modelResult, setModelResult] = useState(null);
+  const [sleeveResult, setSleeveResult] = useState(null);
+  const [tolerance, setTolerance] = useState(DEFAULT_CHANGE_TOLERANCE);
+  const [downloads, setDownloads] = useState([]); // file names exported this session
 
   useEffect(() => {
     let alive = true;
@@ -1935,6 +1887,14 @@ function SleeveStrategyFlow({ onBack }) {
     };
     reader.readAsArrayBuffer(file);
   };
+  function handleExistingFile(file) {
+    if (!file) return;
+    setError(null); setExistingFile(file); setExisting(null);
+    readFile(file, parseWorkbookRows, parsed => {
+      if (parsed.rows.length === 0) throw new Error("No data rows found in the current-model file.");
+      setExisting(parsed);
+    });
+  }
   function handleImportFile(file) {
     if (!file) return;
     setError(null); setImportFile(file); setImportData(null);
@@ -1966,30 +1926,54 @@ function SleeveStrategyFlow({ onBack }) {
     });
   }
 
+  // Both libraries feed one pool; each sheet remembers which library it came from
+  // so a model family only ever reads its own library's tabs.
   const pooledLibrary = () => [
     ...(library||[]).map(s => ({ ...s, source:"savvy" })),
     ...(directLibrary||[]).map(s => ({ ...s, source:"direct" })),
   ];
-  const ready = importData && aggMap && (library || directLibrary);
+
+  const missing = [];
+  if (!existing && !importData) missing.push("a model export and/or a Sleeve Strategy Import");
+  if (importData && !aggMap) missing.push("the Sleeve Strategy Export (needed once)");
+  if (!library && !directLibrary) missing.push("at least one model library");
+  const ready = missing.length === 0;
 
   function runCompare() {
-    setResult(computeSleeveUpdates(importData.rows, aggMap, pooledLibrary()));
-    setStage("review");
+    const pooled = pooledLibrary();
+    const mr = existing ? computeLibraryUpdates(existing.rows, pooled, tolerance) : null;
+    const sr = importData ? computeSleeveUpdates(importData.rows, aggMap, pooled) : null;
+    setModelResult(mr); setSleeveResult(sr);
+    setTab(mr ? "models" : "sleeves"); setDownloads([]); setStage("review");
   }
-  function handleDownload(changedOnly) {
+  function handleToleranceChange(v) {
+    setTolerance(v);
+    if (existing && (library || directLibrary)) setModelResult(computeLibraryUpdates(existing.rows, pooledLibrary(), v));
+  }
+  const noteDownload = name => setDownloads(d => d.includes(name) ? d : [...d, name]);
+  function exportModels(changedOnly) {
+    const baseName = existingFile.name.replace(/\.[^.]+$/,"");
+    const changedNames = new Set(modelResult.changes.map(c => c.modelName));
+    const rows = changedOnly ? modelResult.updatedRows.filter(r => changedNames.has(r["* Model Name"])) : modelResult.updatedRows;
+    const name = `${baseName}${changedOnly ? "_ChangedModelsOnly" : "_Updated"}.xlsx`;
+    downloadXlsxWithHeaders(rows, existing.headers, name);
+    noteDownload(name);
+  }
+  function exportSleeves() {
     const baseName = importFile.name.replace(/\.[^.]+$/,"");
-    const changedIds = new Set(result.changes.map(c => c.strategyId));
-    const rowsToExport = changedOnly
-      ? result.updatedRows.filter(r => changedIds.has(r["Sleeve Strategy ID"]))
-      : result.updatedRows;
-    downloadXlsxWithHeaders(rowsToExport, importData.headers, `${baseName}${changedOnly ? "_ChangedStrategiesOnly" : "_Updated"}.xlsx`, importData.sheetName);
-    setLastDownload(changedOnly ? "changed" : "full");
-    setStage("done");
+    const changedIds = new Set(sleeveResult.changes.map(c => c.strategyId));
+    // Just the strategies that changed, and only their Normal sleeve rows (the
+    // Custodial / Contribution / Distribution rows aren't needed)
+    const rows = sleeveResult.updatedRows.filter(r => isNormalSleeve(r) && changedIds.has(r["Sleeve Strategy ID"]));
+    const name = `${baseName}_ChangedStrategiesOnly.xlsx`;
+    downloadXlsxWithHeaders(rows, importData.headers, name, importData.sheetName);
+    noteDownload(name);
   }
-  function reset() {
-    setStage("upload"); setImportFile(null); setImportData(null); setExportFile(null);
+  function startOver() {
+    setStage("upload");
+    setExistingFile(null); setExisting(null); setImportFile(null); setImportData(null); setExportFile(null);
     setLibraryFile(null); setLibrary(null); setDirectFile(null); setDirectLibrary(null);
-    setError(null); setResult(null);
+    setError(null); setModelResult(null); setSleeveResult(null); setDownloads([]);
   }
 
   const btnGhost = {background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"};
@@ -1997,152 +1981,76 @@ function SleeveStrategyFlow({ onBack }) {
   if (stage === "upload") {
     const exportHint = aggMeta
       ? `Stored: ${aggMeta.count} model aggregates · saved ${new Date(aggMeta.savedAt).toLocaleDateString()}${exportFile ? "" : " — choose a file to refresh"}`
-      : "Needed once, then it's remembered (.xlsx)";
+      : "Needed once for sleeve strategies, then remembered (.xlsx)";
     return (
       <div>
-        <div style={{display:"flex",gap:12,marginBottom:12}}>
-          <FilePickBox label="Sleeve Strategy Import" hint="The file to update (.xlsx)"
-            file={importFile} onFile={handleImportFile} />
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:12}}>
+          <FilePickBox label="Current model export" hint="Optional — your models and allocations (.xlsx)"
+            file={existingFile} onFile={handleExistingFile} />
+          <FilePickBox label="Sleeve Strategy Import" hint="Optional — the sleeve strategies to update (.xlsx)"
+            file={importFile} onFile={handleImportFile} accentColor="#f59e0b" />
           <FilePickBox label="Sleeve Strategy Export" hint={exportHint}
             file={exportFile || (aggMeta ? { name: aggMeta.fileName || "stored export" } : null)} onFile={handleExportFile} accentColor="#f59e0b" />
         </div>
-        <div style={{display:"flex",gap:12,marginBottom:14}}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:14}}>
           <FilePickBox label="Savvy model library" hint="STP and Paragon/STP targets (.xlsx)"
             file={libraryFile} onFile={handleLibraryFile} accentColor="#0aa89c" />
           <FilePickBox label="STP Direct library" hint="STP Direct targets (.xlsx)"
             file={directFile} onFile={handleDirectFile} accentColor="#7c3aed" />
+          <div style={{border:"0.5px solid #e5e7eb",borderRadius:10,background:"#fff",padding:"22px 16px",fontSize:12,color:"#6b7280",lineHeight:1.6,display:"flex",alignItems:"center"}}>
+            The libraries are the source of truth for both the models and the sleeve strategies, so you only upload them once.
+          </div>
         </div>
         {error && <div style={{marginBottom:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
-        <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.6,marginBottom:16}}>
-          <strong style={{color:"#0369a1"}}>What this does:</strong> recalculates the Target Allocation of the sleeve strategies whose splits come from the model libraries — STP Direct, Paragon, and STP + DI strategies — and leaves everything else exactly as it is, including the Thematic and other fixed percentages. The libraries are always the source of truth. The export contains only the strategies that changed. You'll see every change before exporting.
+        <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.7,marginBottom:16}}>
+          <strong style={{color:"#0369a1"}}>What this does:</strong> add the model export, the Sleeve Strategy Import, or both. <strong>Models:</strong> recalculates Category and Class targets from the library and leaves bands, Security Sets and anything the library doesn't cover untouched; a class or category the library no longer has for a model is removed (its row is deleted), new ones aren't added. <strong>Sleeve strategies:</strong> recalculates Target Allocation for the STP Direct, Paragon and STP + DI strategies and leaves Thematic and other fixed percentages alone. The sleeve export has just the strategies that changed, and only their Normal sleeve rows. You'll see every change before exporting, and each file exports separately.
         </div>
-        <div style={{display:"flex",justifyContent:"space-between"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <button onClick={onBack} style={btnGhost}>← Back</button>
-          <button onClick={runCompare} disabled={!ready}
-            style={{background:ready?"#1a56db":"#93c5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:ready?"pointer":"default"}}>
-            Compare & review →
-          </button>
+          <div style={{display:"flex",alignItems:"center",gap:14}}>
+            {!ready && <span style={{fontSize:11,color:"#9ca3af",textAlign:"right"}}>Still needed: {missing.join("; ")}</span>}
+            <button onClick={runCompare} disabled={!ready}
+              style={{background:ready?"#1a56db":"#93c5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:ready?"pointer":"default"}}>
+              Compare & review →
+            </button>
+          </div>
         </div>
       </div>
     );
   }
 
-  if (stage === "review") {
-    const { changes, statuses, strategyCount } = result;
-    const grouped = {};
-    changes.forEach(c => { (grouped[c.strategyId] = grouped[c.strategyId] || { name:c.strategyName, family:c.family, items:[] }).items.push(c); });
-    const updatedIds = Object.keys(grouped);
-    const unchanged = statuses.filter(s => s.status==="unchanged");
-    const skipped = statuses.filter(s => s.status==="skipped");
-    const skippedByReason = skipped.reduce((g, s) => { const k = `${s.group} — ${s.reason}`; (g[k] = g[k] || []).push(s.name); return g; }, {});
-    return (
-      <div>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:16}}>
-          {[
-            ["Strategies in file", strategyCount, "#1a56db"],
-            ["Being updated", updatedIds.length, updatedIds.length ? "#b45309" : "#9ca3af"],
-            ["Already correct", unchanged.length, "#16a34a"],
-            ["Not updated", skipped.length, "#9ca3af"],
-          ].map(([lbl,val,color])=>(
-            <div key={lbl} style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px"}}>
-              <div style={{fontSize:19,fontWeight:700,color}}>{val}</div>
-              <div style={{fontSize:11,color:"#6b7280"}}>{lbl}</div>
-            </div>
+  // stage === "review"
+  const nModels = modelResult ? new Set(modelResult.changes.map(c => c.modelName)).size : 0;
+  const nSleeves = sleeveResult ? new Set(sleeveResult.changes.map(c => c.strategyId)).size : 0;
+  const active = modelResult && sleeveResult ? tab : (modelResult ? "models" : "sleeves");
+  return (
+    <div>
+      {modelResult && sleeveResult && (
+        <div style={{display:"flex",gap:6,marginBottom:16,borderBottom:"0.5px solid #e5e7eb"}}>
+          {[["models","Models",nModels],["sleeves","Sleeve strategies",nSleeves]].map(([id,label,n])=>(
+            <button key={id} onClick={()=>setTab(id)}
+              style={{background:"none",border:"none",borderBottom:active===id?"2px solid #1a56db":"2px solid transparent",marginBottom:-1,padding:"8px 14px",fontSize:13,fontWeight:active===id?700:500,color:active===id?"#111827":"#6b7280",cursor:"pointer"}}>
+              {label}
+              <span style={{marginLeft:7,fontSize:11,fontWeight:700,color:n?"#b45309":"#9ca3af",background:n?"#fef3c7":"#f3f4f6",borderRadius:10,padding:"1px 8px"}}>{n} changed</span>
+            </button>
           ))}
         </div>
+      )}
 
-        {updatedIds.length === 0 && (
-          <div style={{background:"#f0fdf4",border:"0.5px solid #bbf7d0",borderRadius:8,padding:"14px",fontSize:13,color:"#166534",marginBottom:16}}>
-            Every library-driven sleeve strategy already matches the libraries — nothing to change.
-          </div>
-        )}
+      {active === "models" && <ModelsReviewPanel result={modelResult} tolerance={tolerance} onTolerance={handleToleranceChange} onExport={exportModels} />}
+      {active === "sleeves" && <SleevesReviewPanel result={sleeveResult} onExport={exportSleeves} />}
 
-        {updatedIds.map(id => (
-          <div key={id} style={{border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:10,overflow:"hidden"}}>
-            <div style={{background:"#f9fafb",padding:"8px 12px",fontSize:12,fontWeight:700,color:"#111827",borderBottom:"0.5px solid #e5e7eb",display:"flex",justifyContent:"space-between"}}>
-              <span>{grouped[id].name} <span style={{fontWeight:400,color:"#9ca3af"}}>(ID {id})</span></span>
-              <span style={{fontSize:10,fontWeight:600,color:"#6b7280"}}>{grouped[id].family}</span>
-            </div>
-            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-              <tbody>
-                {grouped[id].items.map((c,i)=>(
-                  <tr key={i} style={{borderTop:i>0?"0.5px solid #f3f4f6":"none"}}>
-                    <td style={{padding:"6px 12px",color:"#374151"}}>{c.label}</td>
-                    <td style={{padding:"6px 12px",color:"#dc2626",textAlign:"right",width:80}}>{c.oldVal}%</td>
-                    <td style={{padding:"6px 4px",color:"#9ca3af",width:20}}>→</td>
-                    <td style={{padding:"6px 12px",color:"#16a34a",fontWeight:700,textAlign:"right",width:80}}>{c.newVal}%</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ))}
-
-        {(unchanged.length>0 || skipped.length>0) && (
-          <details style={{marginTop:8,marginBottom:20}}>
-            <summary style={{cursor:"pointer",fontSize:12,fontWeight:600,color:"#6b7280"}}>
-              Not changed — {unchanged.length} already correct, {skipped.length} not updated
-            </summary>
-            <div style={{marginTop:8,padding:"10px 12px",background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,fontSize:11,color:"#6b7280",lineHeight:1.7}}>
-              {unchanged.length>0 && (
-                <div style={{marginBottom:8}}>
-                  <strong style={{color:"#374151"}}>Already match the libraries</strong> ({unchanged.length}): {unchanged.map(u=>u.name).join("; ")}
-                </div>
-              )}
-              {skipped.length>0 && (
-                <div>
-                  <strong style={{color:"#374151"}}>Not updated</strong> (kept as-is):
-                  <ul style={{margin:"4px 0 0",paddingLeft:18}}>
-                    {Object.entries(skippedByReason).map(([why,names],i)=>(
-                      <li key={i} style={{marginBottom:4}}><strong style={{color:"#374151"}}>{why}</strong> ({names.length}): {names.join("; ")}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          </details>
-        )}
-
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"0.5px solid #e5e7eb",paddingTop:16}}>
-          <button onClick={()=>setStage("upload")} style={btnGhost}>← Back</button>
-          <div style={{display:"flex",gap:10}}>
-            <button onClick={()=>handleDownload(false)}
-              style={{background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#6b7280",cursor:"pointer"}}>
-              Export full file ↓
-            </button>
-            <button onClick={()=>handleDownload(true)} disabled={updatedIds.length===0}
-              style={{background:updatedIds.length?"#1a56db":"#93c5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:updatedIds.length?"pointer":"default"}}>
-              Export changed strategies ↓
-            </button>
-          </div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"0.5px solid #e5e7eb",paddingTop:16,marginTop:8}}>
+        <button onClick={()=>setStage("upload")} style={btnGhost}>← Back</button>
+        <div style={{display:"flex",alignItems:"center",gap:14}}>
+          {downloads.length > 0 && <span style={{fontSize:12,color:"#16a34a"}}>✓ Downloaded: {downloads.join(", ")}</span>}
+          <button onClick={startOver} style={btnGhost}>Start over</button>
         </div>
-      </div>
-    );
-  }
-
-  // stage === "done"
-  const changedCount = new Set(result.changes.map(c => c.strategyId)).size;
-  return (
-    <div style={{textAlign:"center",padding:"48px 24px"}}>
-      <div style={{width:56,height:56,borderRadius:"50%",background:"#dcfce7",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px"}}>
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-      </div>
-      <div style={{fontSize:18,fontWeight:700,color:"#111827",marginBottom:6}}>File downloaded</div>
-      <div style={{fontSize:13,color:"#6b7280",marginBottom:6}}>
-        {lastDownload==="changed"
-          ? `Only the ${changedCount} strategy(ies) with updated targets were included.`
-          : `All ${result.strategyCount} strategies included, ${changedCount} updated.`}
-      </div>
-      <div style={{fontSize:13,color:"#6b7280",marginBottom:28}}>Ready to import back into Orion</div>
-      <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
-        <button onClick={()=>setStage("review")} style={btnGhost}>← Back to review</button>
-        <button onClick={()=>handleDownload(true)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download changed only</button>
-        <button onClick={()=>handleDownload(false)} style={{background:"none",border:"0.5px solid #1a56db",borderRadius:6,padding:"8px 18px",fontSize:13,color:"#1a56db",cursor:"pointer"}}>Download full file</button>
-        <button onClick={reset} style={{background:"#1a56db",border:"none",borderRadius:6,padding:"8px 18px",fontSize:13,fontWeight:600,color:"#fff",cursor:"pointer"}}>Process another file</button>
       </div>
     </div>
   );
 }
+
 
 // ── Advisor Custom Model (ACM) builder ──────────────────────────────────────
 // Turns an advisor's raw (non-proportional) fund/model matrix into: (1) a
@@ -3398,7 +3306,7 @@ export default function OrionImportBuilder() {
           <div>
             <div style={{fontSize:18,fontWeight:700,color:"#111827"}}>Orion Import Builder</div>
             <div style={{fontSize:12,color:"#6b7280"}}>
-              {mode===null ? "Upload · visualize · edit · export" : mode==="import" ? "New import file" : mode==="update" ? "Update existing models" : mode==="sleeve" ? "Update sleeve strategies" : "Advisor Custom Model builder"}
+              {mode===null ? "Upload · visualize · edit · export" : mode==="import" ? "New import file" : mode==="update" ? "Update existing models and sleeve strategies" : "Advisor Custom Model builder"}
             </div>
           </div>
         </div>
@@ -3437,8 +3345,8 @@ export default function OrionImportBuilder() {
                 <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
               </svg>
             </div>
-            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Update existing models</div>
-            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload your current model export plus a model library of new targets — get back an updated file with just the changed values.</div>
+            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Update existing models and sleeve strategies</div>
+            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload your current model export and/or the Sleeve Strategy Import plus the model libraries — get back updated files with just the changed values.</div>
           </div>
           <div onClick={()=>setMode("acm")}
             style={{flex:1,border:"0.5px solid #e5e7eb",borderRadius:12,padding:"28px 20px",cursor:"pointer",background:"#fff",transition:"all 0.15s"}}
@@ -3451,28 +3359,15 @@ export default function OrionImportBuilder() {
             <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Build Advisor Custom Model</div>
             <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Turn an advisor's raw, non-proportional model file into proportional targets, then export Model + Security Set import files.</div>
           </div>
-          <div onClick={()=>setMode("sleeve")}
-            style={{flex:1,border:"0.5px solid #e5e7eb",borderRadius:12,padding:"28px 20px",cursor:"pointer",background:"#fff",transition:"all 0.15s"}}
-            onMouseEnter={e=>e.currentTarget.style.borderColor="#f59e0b"} onMouseLeave={e=>e.currentTarget.style.borderColor="#e5e7eb"}>
-            <div style={{width:36,height:36,borderRadius:9,background:"#fffbeb",display:"flex",alignItems:"center",justifyContent:"center",marginBottom:14}}>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/>
-              </svg>
-            </div>
-            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Update sleeve strategies</div>
-            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload the Sleeve Strategy Import plus the model libraries — get back the import with refreshed targets for STP Direct, Paragon and STP + DI strategies.</div>
-          </div>
         </div>
       )}
 
       {/* ── Update Existing Models workflow ── */}
-      {mode==="update" && <UpdateModelsFlow onBack={()=>setMode(null)} />}
+      {mode==="update" && <UpdateFlow onBack={()=>setMode(null)} />}
 
       {/* ── Advisor Custom Model workflow ── */}
       {mode==="acm" && <AcmFlow onBack={()=>setMode(null)} />}
 
-      {/* ── Sleeve Strategy workflow ── */}
-      {mode==="sleeve" && <SleeveStrategyFlow onBack={()=>setMode(null)} />}
 
       {/* ── Import workflow (upload/edit/done) ── */}
       {mode==="import" && (
