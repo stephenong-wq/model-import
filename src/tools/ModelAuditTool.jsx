@@ -1,4 +1,4 @@
-// Model Audit Tool v2.1 — dynamic P6 row detection
+// Model Audit Tool v3.0 — STP model review, sleeve strategy review, and the original general audit
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
 
@@ -1205,6 +1205,664 @@ function runAudit(mapping, targetModel, masterHoldings, excludedClasses, thresho
   return { rows, summary, excluded, sumIncluded };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared with OrionImportBuilder.jsx — the model-name rules and the sleeve
+// strategy logic. Keep in sync with that file. (Two small differences, marked
+// below: matchModelVariant takes a family table, and computeSleeveUpdates also
+// reports the detail the look-through review needs.)
+// ═══════════════════════════════════════════════════════════════════════════
+const MODEL_FAMILIES = [
+  { id:"paragon", test:/^\s*paragon\/stp\b/i, source:"savvy", sheetPrefix:"Savvy Total Portfolios", libraryLabel:"Savvy" },
+  { id:"tacticalEtf", test:/^\s*stp\s+tactical\s+etf\b/i,
+    skip:"STP Tactical ETF models are a single Security Set with no categories or classes — nothing to update here" },
+  { id:"direct", test:/^\s*stp\s+direct\s+hh\b/i, source:"direct", sheetPrefix:"STP Direct Med", libraryLabel:"STP Direct" },
+  { id:"stp", test:/^\s*stp\b/i, source:"savvy", sheetPrefix:"Savvy Total Portfolios", libraryLabel:"Savvy" },
+];
+
+function normalizeKey(k) { return (k||"").toString().trim().toLowerCase(); }
+
+function normAlnum(s) {
+  return (s||"").toString().toUpperCase().replace(/[^A-Z0-9]/g,"");
+}
+
+function libraryShortLabel(label) {
+  return (label||"").replace(/\([^)]*\)/g," ").split(" - ")[0].replace(/\s{2,}/g," ").trim();
+}
+
+function matchLibraryLabel(sourceStr, libraryRows) {
+  const ns = normAlnum(sourceStr);
+  if (!ns) return null;
+  const pick = labelOf => {
+    let best = null, bestEnd = -1, bestLen = 0;
+    libraryRows.forEach(row => {
+      const nl = normAlnum(labelOf(row));
+      if (!nl) return;
+      const idx = ns.lastIndexOf(nl);
+      if (idx === -1) return;
+      const end = idx + nl.length;
+      if (end > bestEnd || (end === bestEnd && nl.length > bestLen)) {
+        best = row; bestEnd = end; bestLen = nl.length;
+      }
+    });
+    return best;
+  };
+  return pick(row => row.label) || pick(row => libraryShortLabel(row.label));
+}
+
+function analyzeModelName(modelName) {
+  const core = (modelName||"").replace(/\([^)]*\)/g,"").replace(/\s{2,}/g," ").trim();
+  const flags = {
+    isTaxAware: /tax/i.test(modelName||""),
+    isExUslc: /ex[-\s]?uslc/i.test(modelName||""),
+    isExFI: /\bex[-\s]?fi\b/i.test(modelName||""),
+    isExIntDev: /\bex[-\s]?int(?:l|ernational)?\.?\s*dev/i.test(modelName||""),
+    isExEM: /\bex[-\s]?em\b/i.test(modelName||""),
+    isUsEquityOnly: /us\s+equity\s+only/i.test(modelName||""),
+    isParagon: /^\s*paragon\/stp\b/i.test(modelName||""),
+    holdingsAssetClass: null, // "equity" | "fixedIncome" | "other" | null
+  };
+  let segments;
+  if (flags.isParagon) {
+    // "Paragon/STP All Equity (ex-USLC)" and "Paragon/STP All Equity + Core Stock
+    // Model" have no " - " separator: the prefix is followed directly by the
+    // variant, optionally joined to a stock-model tag with " + ".
+    let rest = core.replace(/^paragon\/stp\s*/i,"").trim();
+    const plus = rest.match(/^(.*?)\s*\+\s*(?:core|growth|value|dividend)\s+stock\s+model$/i);
+    if (plus) { rest = plus[1].trim(); flags.holdingsAssetClass = "equity"; }
+    segments = ["Paragon/STP", rest].filter(Boolean);
+  } else {
+    segments = core.split(" - ").map(s=>s.trim()).filter(Boolean);
+  }
+  let changed = true;
+  while (changed && segments.length > 2) {
+    changed = false;
+    const last = segments[segments.length-1];
+    if (/^tax\s*aware$/i.test(last)) { flags.isTaxAware = true; segments.pop(); changed = true; }
+    else if (/^us\s+equity\s+only$/i.test(last)) { flags.isUsEquityOnly = true; segments.pop(); changed = true; }
+    else if (/^(core|growth|value|dividend)\s+stock\s+model$/i.test(last) || /^enhanced\s+dividend\s+stock$/i.test(last)) {
+      flags.holdingsAssetClass = "equity"; segments.pop(); changed = true;
+    }
+    else if (/^bond\s+ladder$/i.test(last)) { flags.holdingsAssetClass = "fixedIncome"; segments.pop(); changed = true; }
+    else if (/^custom\s+model$/i.test(last)) { flags.holdingsAssetClass = flags.holdingsAssetClass || "other"; segments.pop(); changed = true; }
+  }
+  return { segments, flags };
+}
+
+function matchModelVariant(modelName, librarySheets, families = MODEL_FAMILIES) {
+  const { segments, flags } = analyzeModelName(modelName);
+  const family = families.find(f => f.test.test(modelName||""));
+  if (!family) {
+    return { match:null, flags, reason:"doesn't start with a recognized model family (STP, STP Direct HH, Paragon/STP)" };
+  }
+  if (family.skip) return { match:null, flags, reason:family.skip };
+
+  // An exclusion tag the tool doesn't know would silently produce wrong numbers
+  // (the model would be computed as if it weren't excluded) — skip it instead.
+  const unknownEx = (modelName||"")
+    .replace(/ex[-\s]?uslc/gi,"").replace(/\bex[-\s]?fi\b/gi,"")
+    .replace(/\bex[-\s]?int(?:l|ernational)?\.?\s*dev/gi,"").replace(/\bex[-\s]?em\b/gi,"");
+  if (/\bex[-\s]+[a-z]/i.test(unknownEx)) {
+    return { match:null, flags, reason:"has an exclusion tag the tool doesn't recognize (known: Ex-USLC, Ex-FI, Ex-Int Dev, Ex-EM)" };
+  }
+  if (segments.length !== 2) {
+    return { match:null, flags, reason:`${segments.length} segment(s) left after removing recognized tags (${segments.join(" / ")||"none"}) — doesn't reduce to a single "{prefix} - {variant}" form` };
+  }
+  const candidate = segments[1];
+
+  const fromLibrary = librarySheets.filter(s => !s.source || s.source === family.source);
+  if (fromLibrary.length === 0) {
+    return { match:null, flags, reason:`the ${family.libraryLabel} library hasn't been uploaded` };
+  }
+  const sheetPrefix = typeof family.sheetPrefix === "function" ? family.sheetPrefix(modelName) : family.sheetPrefix;
+  const prefixN = normAlnum(sheetPrefix);
+  const searchIn = fromLibrary.filter(s => normAlnum(s.name).startsWith(prefixN) && s.isTaxAware === flags.isTaxAware);
+  if (searchIn.length === 0) {
+    return { match:null, flags, reason:`no ${flags.isTaxAware?"Tax Aware ":""}"${sheetPrefix}" tab found in the ${family.libraryLabel} library` };
+  }
+
+  for (const sheet of searchIn) {
+    const variant = sheet.variants.find(v => v.toLowerCase() === candidate.toLowerCase());
+    if (variant) return { match:{ kind:"single", sheet, variant }, flags, reason:null };
+  }
+
+  // 30/70-style blend: verified against real data as the average of the two
+  // neighboring risk-ladder variants — pair index = (firstNumber-10)/20 along
+  // the library's own column order (10/90=AllFixed+Conservative, 30/70=
+  // Conservative+ModConservative, 50/50=ModConservative+Moderate, 70/30=
+  // Moderate+ModAggressive). Only reached when the library has no column of
+  // that exact name — a 50/50 or 70/30 column in the library is used directly.
+  const blendMatch = candidate.match(/^(\d{1,3})\s*\/\s*(\d{1,3})$/);
+  if (blendMatch) {
+    const n1 = parseInt(blendMatch[1],10), n2 = parseInt(blendMatch[2],10);
+    if (n1+n2 !== 100) {
+      return { match:null, flags, reason:`blend ratio "${candidate}" doesn't sum to 100 — can't place it on the risk ladder` };
+    }
+    const pairIndex = (n1-10)/20;
+    if (!Number.isInteger(pairIndex)) {
+      return { match:null, flags, reason:`blend ratio "${candidate}" doesn't align to the library's 20-point variant spacing` };
+    }
+    for (const sheet of searchIn) {
+      if (pairIndex>=0 && pairIndex+1 < sheet.variants.length) {
+        return { match:{ kind:"blend", sheet, lowerVariant: sheet.variants[pairIndex], upperVariant: sheet.variants[pairIndex+1] }, flags, reason:null };
+      }
+    }
+    return { match:null, flags, reason:`blend ratio "${candidate}" falls outside the library's variant range` };
+  }
+
+  return { match:null, flags, reason:`"${candidate}" doesn't match any library column name or a recognized blend ratio` };
+}
+
+function getMatchFrac(row, match) {
+  if (!row) return null;
+  if (match.kind === "single") return row.values[match.variant];
+  const a = row.values[match.lowerVariant], b = row.values[match.upperVariant];
+  if ((a===null||a===undefined) && (b===null||b===undefined)) return null;
+  return ((a??0) + (b??0)) / 2;
+}
+
+const SLEEVE_AGG_KEY = "sleeve-agg-map";
+
+async function loadSleeveAggMap() {
+  try {
+    const res = await window.storage.get(SLEEVE_AGG_KEY);
+    return res && res.value ? JSON.parse(res.value) : null;
+  } catch { return null; }
+}
+
+async function saveSleeveAggMap(obj) {
+  try { await window.storage.set(SLEEVE_AGG_KEY, JSON.stringify(obj)); } catch {}
+}
+
+function parseSleeveExport(buffer) {
+  const wb = XLSX.read(buffer, { type:"array" });
+  const raw = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header:1, defval:null });
+  let headerIdx = -1;
+  for (let i=0; i<Math.min(raw.length,10); i++) {
+    if ((raw[i]||[]).map(normalizeKey).includes("model agg id")) { headerIdx = i; break; }
+  }
+  if (headerIdx === -1) throw new Error("Couldn't find a 'Model Agg ID' column — this should be the Sleeve Strategy Export file.");
+  const head = raw[headerIdx].map(normalizeKey);
+  const idCol = head.indexOf("model agg id");
+  let nameCol = head.indexOf("model agg. name");
+  if (nameCol === -1) nameCol = head.indexOf("model agg name");
+  if (nameCol === -1) nameCol = head.indexOf("model");
+  if (nameCol === -1) throw new Error("Couldn't find the 'Model Agg. Name' column in the Sleeve Strategy Export.");
+  const map = {};
+  for (let i=headerIdx+1; i<raw.length; i++) {
+    const row = raw[i]; if (!row) continue;
+    const id = row[idCol], nm = row[nameCol];
+    if (id === null || id === undefined || id === "" || !nm) continue;
+    map[String(id).trim()] = String(nm).trim();
+  }
+  if (Object.keys(map).length === 0) throw new Error("No model aggregates found in the Sleeve Strategy Export.");
+  return map;
+}
+
+function parseSleeveImport(buffer) {
+  const wb = XLSX.read(buffer, { type:"array" });
+  const sheetName = wb.SheetNames[0];
+  const raw = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header:1, defval:null });
+  let headerIdx = -1;
+  for (let i=0; i<Math.min(raw.length,10); i++) {
+    if ((raw[i]||[]).map(normalizeKey).includes("sleeve strategy id")) { headerIdx = i; break; }
+  }
+  if (headerIdx === -1) throw new Error("Couldn't find a 'Sleeve Strategy ID' column — this should be the Sleeve Strategy Import file.");
+  const headers = [];
+  const names = raw[headerIdx].map(c => (c===null||c===undefined) ? null : c.toString().trim());
+  names.forEach(h => { if (h && !headers.includes(h)) headers.push(h); });
+  for (const need of ["Sleeve Strategy ID","Name","SleeveType","Modelagg Id","Target Allocation"]) {
+    if (!headers.includes(need)) throw new Error(`The Sleeve Strategy Import is missing the '${need}' column.`);
+  }
+  const rows = [];
+  for (let i=headerIdx+1; i<raw.length; i++) {
+    const row = raw[i];
+    if (!row || row.every(c=>c===null||c==="")) continue;
+    const obj = {};
+    names.forEach((h,idx)=>{ if (h) obj[h] = row[idx]!==undefined ? row[idx] : null; });
+    if (obj["Sleeve Strategy ID"]===null || obj["Sleeve Strategy ID"]==="") continue;
+    rows.push(obj);
+  }
+  if (rows.length === 0) throw new Error("No sleeve strategies found in the import file.");
+  return { headers, rows, sheetName };
+}
+
+function sleeveKind(n) {
+  if (/thematic/i.test(n)) return "THEMATIC";
+  if (/Large Cap 500/i.test(n)) return "DI_SPX";
+  if (/Total Portfolios Model US Large Cap Equity/i.test(n)) return "DI_USLC";
+  if (/Total Portfolios Global Equity/i.test(n)) return "DI_GLOBAL";
+  if (/Corporate Bond Strategy/i.test(n)) return "CORP_BOND";
+  if (/Municipal Bond Strategy/i.test(n)) return "MUNI_BOND";
+  if (/Paragon Core ETF All Fixed/i.test(n)) return "PARAGON_FI";
+  if (/^Paragon\/STP/i.test(n)) return "PARAGON_EQ";
+  if (/^STP Tactical ETF/i.test(n)) return "TACT_ETF";
+  if (/^STP - /i.test(n)) return /ex-uslc|ex-fi/i.test(n) ? "STP_EX" : "STP";
+  if (/Bond Ladder/i.test(n)) return "LADDER";
+  if (/Custom Indexing|Orion Custom/i.test(n)) return "DI_OTHER";
+  if (/Stock Model|Single Stock/i.test(n)) return "STOCK";
+  return "OTHER";
+}
+
+const SLEEVE_EQUITY_DI = new Set(["DI_SPX","DI_USLC","DI_GLOBAL","DI_OTHER"]);
+
+const SLEEVE_FI = new Set(["CORP_BOND","MUNI_BOND"]);
+
+const sleeveRound = x => +(Math.round(x*100 + 1e-9)/100).toFixed(2);
+
+const isNormalSleeve = r => String(r["SleeveType"] || "").trim().toLowerCase() === "normal"; // only these rows carry the targets; Custodial / Contribution / Distribution rows are ignored
+
+const SLEEVE_TOLERANCE = 1e-9; // exact: any real difference is brought to the library value (float noise only)
+
+function parseDirectStrategyName(name) {
+  const m = (name||"").match(/^STP Direct (Large|Medium)\s*\((NQ|Qualified)\)\s*-\s*(.+?)\s*$/i);
+  if (!m) return null;
+  let profile = m[3].trim(), isTA = false;
+  const t = profile.match(/^(.*?)\s*\((?:TA|Tax[-\s]?Aware)\)\s*$/i);
+  if (t) { profile = t[1].trim(); isTA = true; }
+  const alias = { "mod agg":"Moderately Aggressive", "mod cons":"Moderately Conservative" };
+  profile = alias[profile.toLowerCase()] || profile;
+  return { size: /large/i.test(m[1]) ? "Large" : "Medium", acct: m[2], profile, isTA };
+}
+
+function sleeveExcludedFraction(aggName, librarySheets) {
+  const { match, flags, reason } = matchModelVariant(aggName, librarySheets);
+  if (!match) return { reason };
+  const classRows = match.sheet.rows.filter(x=>x.level==="class");
+  const catRows = match.sheet.rows.filter(x=>x.level==="category");
+  const uslcRow = matchLibraryLabel("US Large Cap", classRows);
+  const intlRow = matchLibraryLabel("Intl Developed ex-US Market", classRows);
+  const emRow = matchLibraryLabel("Emerging Markets", classRows);
+  const raw = row => (row ? (getMatchFrac(row, match) || 0) : 0);
+  // Paragon/STP: international is halved and the other half sits in US Large Cap.
+  const frac = row => {
+    const v = raw(row);
+    if (!flags.isParagon) return v;
+    if (row === intlRow || row === emRow) return v/2;
+    if (row === uslcRow) return v + raw(intlRow)/2 + raw(emRow)/2;
+    return v;
+  };
+  let ex = 0;
+  if (flags.isExUslc) { if (!uslcRow) return { reason:"the library has no US Large Cap row" }; ex += frac(uslcRow); }
+  if (flags.isExIntDev) { if (!intlRow) return { reason:"the library has no Intl Developed row" }; ex += frac(intlRow); }
+  if (flags.isExEM) { if (!emRow) return { reason:"the library has no Emerging Markets row" }; ex += frac(emRow); }
+  if (flags.isExFI) {
+    const fiRow = matchLibraryLabel("FIXED INCOME", catRows);
+    if (!fiRow) return { reason:"the library has no Fixed Income row" };
+    ex += raw(fiRow);
+  }
+  return { frac: ex };
+}
+
+function computeSleeveUpdates(rows, aggMap, librarySheets) {
+  const updated = rows.map(r => ({...r}));
+  const strategies = new Map(); // id -> { id, name, idx: [row indexes of its Normal sleeves] }
+  rows.forEach((r, i) => {
+    const id = r["Sleeve Strategy ID"];
+    if (id === null || id === undefined || id === "") return;
+    if (!strategies.has(id)) strategies.set(id, { id, name: r["Name"], idx: [] });
+    if (isNormalSleeve(r)) strategies.get(id).idx.push(i);
+  });
+  const changes = [], statuses = [];
+
+  for (const s of strategies.values()) {
+    const comps = s.idx.map(i => {
+      const aggId = rows[i]["Modelagg Id"];
+      const aggName = aggMap[String(aggId)];
+      return { i, aggId, aggName, kind: aggName ? sleeveKind(aggName) : null, old: parseFloat(rows[i]["Target Allocation"]) || 0 };
+    });
+    const skip = (group, reason) => statuses.push({ id:s.id, name:s.name, status:"skipped", group, reason,
+      comps: comps.map(c => ({ aggId:c.aggId, aggName:c.aggName, kind:c.kind, current:c.old, expected:c.old })) });
+    // newVals: Map(comp -> new target). Applies only what actually moved.
+    const apply = (family, newVals, ctx) => {
+      let changed = 0;
+      for (const [c, v] of newVals) {
+        if (Math.abs(v - c.old) > SLEEVE_TOLERANCE) {
+          updated[c.i]["Target Allocation"] = v;
+          changes.push({ strategyId:s.id, strategyName:s.name, family, label:c.aggName, oldVal:c.old, newVal:v });
+          changed++;
+        }
+      }
+      statuses.push({ id:s.id, name:s.name, status: changed ? "updated" : "unchanged", family, ctx,
+        comps: comps.map(c => ({ aggId:c.aggId, aggName:c.aggName, kind:c.kind, current:c.old, expected: newVals.has(c) ? newVals.get(c) : c.old })) });
+    };
+
+    if (!/STP|Paragon/i.test(s.name||"")) { skip("Not touched", "No STP or Paragon in the name"); continue; }
+    const unknown = comps.filter(c => !c.aggName).map(c => c.aggId);
+    if (unknown.length) {
+      skip("Needs a fresh Sleeve Strategy Export", `Model Agg ID ${[...new Set(unknown)].join(", ")} isn't in the stored export`);
+      continue;
+    }
+
+    // ── 1. STP Direct ───────────────────────────────────────────────────────
+    if (/^STP Direct\b/i.test(s.name)) {
+      const info = parseDirectStrategyName(s.name);
+      if (!info) { skip("Couldn't read", "Name isn't in the form 'STP Direct Large|Medium (NQ|Qualified) - Profile'"); continue; }
+      const allowed = new Set(["DI_GLOBAL","STOCK","CORP_BOND","MUNI_BOND","TACT_ETF"]);
+      const odd = comps.find(c => !allowed.has(c.kind) || (info.size==="Medium" && SLEEVE_FI.has(c.kind)));
+      if (odd) { skip("Couldn't read", `Unexpected sleeve: ${odd.aggName}`); continue; }
+      const globals = comps.filter(c => c.kind==="DI_GLOBAL" || c.kind==="STOCK");
+      const bonds = comps.filter(c => SLEEVE_FI.has(c.kind));
+      const tacts = comps.filter(c => c.kind==="TACT_ETF");
+      if (tacts.length !== 1 || globals.length > 1 || bonds.length > 1) { skip("Couldn't read", "Expected one Tactical ETF sleeve and at most one Global Equity and one bond sleeve"); continue; }
+      const prefix = normAlnum(info.size==="Large" ? "STP Direct Large" : "STP Direct Med");
+      const sheet = librarySheets.find(x => (!x.source || x.source==="direct") && normAlnum(x.name).startsWith(prefix) && x.isTaxAware===info.isTA);
+      if (!sheet) { skip("Library not available", `no ${info.isTA?"Tax Aware ":""}'STP Direct ${info.size==="Large"?"Large":"Med"}' tab (is the STP Direct library uploaded?)`); continue; }
+      const variant = sheet.variants.find(v => v.toLowerCase()===info.profile.toLowerCase());
+      if (!variant) { skip("Library not available", `'${info.profile}' isn't a column in ${sheet.name}`); continue; }
+      const classRows = sheet.rows.filter(x=>x.level==="class");
+      const gRow = matchLibraryLabel("Global Equity", classRows), igRow = matchLibraryLabel("US Investment Grade", classRows);
+      const pct = row => row ? sleeveRound((row.values[variant] ?? 0) * 100) : 0;
+      const globalPct = pct(gRow), igPct = info.size==="Large" ? pct(igRow) : 0;
+      if (globalPct > 0 && !globals.length) { skip("Couldn't read", "The library has Global Equity for this profile but the strategy has no Global Equity sleeve"); continue; }
+      if (igPct > 0 && !bonds.length) { skip("Couldn't read", "The library has US Investment Grade for this profile but the strategy has no bond sleeve"); continue; }
+      const m = new Map();
+      if (globals.length) m.set(globals[0], globalPct);
+      if (bonds.length) m.set(bonds[0], igPct);
+      m.set(tacts[0], sleeveRound(100 - (globals.length?globalPct:0) - (bonds.length?igPct:0)));
+      apply("STP Direct", m, { type:"direct", info, tact: tacts[0] });
+      continue;
+    }
+
+    // ── 2. ex- model + the sleeve that replaces what it excludes ─────────────
+    const exComps = comps.filter(c => c.kind==="STP_EX" || (c.kind==="PARAGON_EQ" && /ex-uslc/i.test(c.aggName)));
+    if (exComps.length === 0) { skip("Fixed splits", "Percentages are fixed (not derived from the model library)"); continue; }
+    if (exComps.length > 1) { skip("Couldn't read", "More than one ex- model in the strategy"); continue; }
+    const ex = exComps[0];
+    const { flags } = analyzeModelName(ex.aggName);
+    const equityEx = flags.isExUslc || flags.isExIntDev || flags.isExEM, fiEx = flags.isExFI;
+    if (equityEx && fiEx) { skip("Couldn't read", `${ex.aggName} excludes both equity and Fixed Income — that needs two replacement sleeves`); continue; }
+    if (!equityEx && !fiEx) { skip("Couldn't read", `No recognizable exclusion in ${ex.aggName}`); continue; }
+    const wanted = equityEx ? (k => SLEEVE_EQUITY_DI.has(k)) : (k => SLEEVE_FI.has(k));
+    const reps = comps.filter(c => c !== ex && wanted(c.kind));
+    if (reps.length === 0) { skip("Fixed splits", `Nothing library-driven: no ${equityEx?"DI":"bond"} sleeve takes the weight ${ex.aggName} excludes`); continue; }
+    if (reps.length > 1) { skip("Couldn't read", `More than one ${equityEx?"DI":"bond"} sleeve to take the excluded weight`); continue; }
+    const rep = reps[0];
+    const fixedTotal = comps.filter(c => c !== ex && c !== rep).reduce((t, c) => t + c.old, 0);
+    const remainder = 100 - fixedTotal;
+    if (remainder < 0) { skip("Couldn't read", "The fixed sleeves already add to more than 100"); continue; }
+    const exFrac = sleeveExcludedFraction(ex.aggName, librarySheets);
+    if (exFrac.reason) { skip("Library not available", `${ex.aggName}: ${exFrac.reason}`); continue; }
+    const repPct = sleeveRound(remainder * exFrac.frac);
+    const m = new Map([[rep, repPct], [ex, sleeveRound(remainder - repPct)]]);
+    apply(flags.isParagon ? "Paragon" : "STP ex- model + sleeve", m, { type:"split", ex, rep, fixedTotal, remainder });
+  }
+
+  return { updatedRows: updated, changes, statuses, strategyCount: strategies.size };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STP review engine
+// Expected ticker-level holdings for every STP-family model, derived from the
+// model libraries with the same name rules as the Import Builder, compared to
+// the underlying allocations Orion reports (the Model Holding Weighting file).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The audit also routes Tactical ETF models (the Import Builder skips them: they
+// have no categories/classes to update, but their tickers can be reviewed).
+const AUDIT_FAMILIES = [
+  { id:"paragon", test:/^\s*paragon\/stp\b/i, source:"savvy", sheetPrefix:"Savvy Total Portfolios", libraryLabel:"Savvy" },
+  { id:"tacticalEtf", test:/^\s*stp\s+tactical\s+etf\b/i, source:"direct", libraryLabel:"STP Direct",
+    sheetPrefix: n => /\(\s*large\s*\)/i.test(n) ? "STP Direct Large" : "STP Direct Med" },
+  { id:"direct", test:/^\s*stp\s+direct\s+hh\b/i, source:"direct", sheetPrefix:"STP Direct Med", libraryLabel:"STP Direct" },
+  { id:"stp", test:/^\s*stp\s+-\s/i, source:"savvy", sheetPrefix:"Savvy Total Portfolios", libraryLabel:"Savvy" },
+];
+
+// The three filters you use in Orion to find the models that need reviewing.
+const DEFAULT_SCOPE_FILTERS = [
+  { id:"notCustom",  mode:"not", term:"custom model", on:true },
+  { id:"notOptions", mode:"not", term:"options",      on:true },
+  { id:"hasStp",     mode:"has", term:"STP",          on:true },
+];
+function inReviewScope(modelName, filters) {
+  const n = (modelName||"").toLowerCase();
+  return filters.every(f => {
+    const term = (f.term||"").trim().toLowerCase();
+    if (!f.on || !term) return true;
+    return f.mode === "has" ? n.includes(term) : !n.includes(term);
+  });
+}
+
+// ── Library tabs, with ticker rows (the Import Builder's parser ignores them) ──
+// Same shape the shared sleeve/matching code expects (name, variants, rows,
+// isTaxAware, source) plus `tickers`: [{ ticker, name, category, cls, values }].
+function parseLibraryTabs(wb, source) {
+  const tabs = [];
+  for (const sheetName of wb.SheetNames) {
+    const raw = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header:1, defval:null });
+    let headerIdx = -1;
+    for (let i=0; i<Math.min(raw.length,10); i++) {
+      if ((raw[i]||[]).map(normalizeKey).includes("ticker")) { headerIdx = i; break; }
+    }
+    if (headerIdx === -1) continue;
+    const headerRow = raw[headerIdx];
+    const variantCols = [];
+    for (let c=2; c<headerRow.length; c++) {
+      const v = headerRow[c];
+      if (typeof v === "string" && v.trim()) variantCols.push({ idx:c, name:v.trim() });
+      else if (variantCols.length>0) break;
+    }
+    const rows = [], tickers = [];
+    let category = null, cls = null;
+    for (let i=headerIdx+1; i<raw.length; i++) {
+      const row = raw[i]; if (!row) continue;
+      const label = row[0];
+      if (label === null || label === undefined || label === "") continue;
+      const labelStr = label.toString().trim(); if (!labelStr) continue;
+      const fund = row[1];
+      const isTicker = fund !== null && fund !== undefined && fund !== "";
+      const values = {};
+      variantCols.forEach(({idx,name}) => {
+        const n = parseFloat(row[idx]);
+        values[name] = Number.isFinite(n) ? n : null;
+      });
+      if (isTicker) { tickers.push({ ticker: labelStr.toUpperCase(), name: String(fund).trim(), category, cls, values }); continue; }
+      const isCategory = labelStr === labelStr.toUpperCase() && labelStr !== labelStr.toLowerCase();
+      if (isCategory) { category = labelStr; cls = null; rows.push({ level:"category", label:labelStr, values }); }
+      else { if (!/expense ratio/i.test(labelStr)) cls = labelStr; rows.push({ level:"class", label:labelStr, values, category }); }
+    }
+    if (variantCols.length < 2 || !rows.some(r => r.level === "category")) continue;
+    tabs.push({ name:sheetName, variants:variantCols.map(v => v.name), rows, tickers, isTaxAware:/tax|\(\s*ta\s*\)/i.test(sheetName), source });
+  }
+  return tabs;
+}
+
+// Stock-model tabs in the Savvy library (holdings that replace US Large Cap).
+const STOCK_MODEL_TABS = {
+  "Core Stock Model":     "Savvy Core S&P 500 Stock Model",
+  "Growth Stock Model":   "Savvy LC Growth Stock Model",
+  "Dividend Stock Model": "Savvy Dividend Stock Model",
+  "Value Stock Model":    "Savvy Value Stock Model",
+};
+const STOCK_VARIANT_RES = [
+  ["Core Stock Model", /core\s+stock\s+model/i], ["Growth Stock Model", /growth\s+stock\s+model/i],
+  ["Dividend Stock Model", /dividend\s+stock\s+model/i], ["Value Stock Model", /value\s+stock\s+model/i],
+];
+function parseStockModels(wb) {
+  const out = {};
+  for (const [variant, tab] of Object.entries(STOCK_MODEL_TABS)) {
+    const ws = wb.Sheets[tab]; if (!ws) continue;
+    const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
+    const holdings = [];
+    for (let ri=1; ri<raw.length; ri++) {
+      const row = raw[ri]; if (!row) continue;
+      const ticker = String(row[0] || "").trim().toUpperCase();
+      if (!ticker || ticker.length > 6) continue;
+      const weight = parseFloat(row[2]);
+      if (!Number.isFinite(weight) || weight <= 0) continue;
+      holdings.push({ ticker, name:String(row[1] || "").trim(), weight });
+    }
+    const total = holdings.reduce((s,h) => s + h.weight, 0);
+    if (total > 0) { holdings.forEach(h => { h.weight /= total; }); out[variant] = holdings; }
+  }
+  return out;
+}
+
+// ── Expected holdings for one model ──────────────────────────────────────────
+// Returns { positions, notes } — whole-model weights in % (not re-scaled, so what
+// an ex- tag removes is visible) — or { reason } when the model can't be derived.
+const GLOBAL_EQUITY_TICKER = "SAVVY GLOBAL EQUITY"; // the library's Global Equity row; ACWI in the HH models
+const isUSLC = p => /us large cap/i.test(p.cls);
+const isIntlDev = p => /intl developed/i.test(p.cls);
+const isEmMkt = p => /emerging/i.test(p.cls);
+const isFixedIncome = p => /fixed income/i.test(p.assetClass);
+
+function expectedHoldings(modelName, lib) {
+  if (/^\s*<\s*copy of/i.test(modelName)) return { reason:"A copy of another model — review the original" };
+  const clean = modelName.replace(/\.e\s*$/i, "").trim();
+  const m = matchModelVariant(clean, lib.tabs, AUDIT_FAMILIES);
+  if (!m.match) return { reason:m.reason };
+  const { match, flags } = m;
+  const family = AUDIT_FAMILIES.find(f => f.test.test(clean));
+  if (flags.holdingsAssetClass === "fixedIncome") return { reason:"Bond Ladder — the ladder's bonds aren't in the library, so it can't be reviewed ticker by ticker" };
+  if (flags.holdingsAssetClass === "other") return { reason:"Custom model — not defined by the library" };
+
+  const value = t => match.kind === "single"
+    ? (t.values[match.variant] || 0)
+    : ((t.values[match.lowerVariant] || 0) + (t.values[match.upperVariant] || 0)) / 2;
+  let pos = match.sheet.tickers
+    .map(t => ({ ticker:t.ticker, name:t.name, assetClass:toTitleCase(t.category || ""), cls:t.cls || "", target:value(t) * 100 }))
+    .filter(p => p.target > 0);
+  const notes = [`${match.sheet.name} · ${match.kind === "single" ? match.variant : `${match.lowerVariant} + ${match.upperVariant} (average)`}`];
+  const sum = f => pos.filter(f).reduce((s,p) => s + p.target, 0);
+
+  if (family.id === "direct") {
+    pos = pos.map(p => p.ticker === GLOBAL_EQUITY_TICKER ? { ...p, ticker:"ACWI", name:"iShares MSCI ACWI" } : p);
+  }
+  if (family.id === "tacticalEtf") {
+    const large = /\(\s*large\s*\)/i.test(clean);
+    pos = pos.filter(p => p.ticker !== GLOBAL_EQUITY_TICKER && !(large && /us investment grade/i.test(p.cls)));
+    notes.push(large ? "excludes Global Equity and US Investment Grade" : "excludes Global Equity");
+  }
+  if (flags.isParagon) {
+    // Paragon/STP: international (Intl Developed + EM) is half the library's; the other half goes to US Large Cap.
+    const us = sum(isUSLC);
+    if (us <= 0) return { reason:"The library column has no US Large Cap to add Paragon's international half to" };
+    const add = (sum(isIntlDev) + sum(isEmMkt)) / 2;
+    pos = pos.map(p => (isIntlDev(p) || isEmMkt(p)) ? { ...p, target:p.target / 2 } : isUSLC(p) ? { ...p, target:p.target * (1 + add/us) } : p);
+    notes.push("international halved, the other half added to US Large Cap");
+  }
+  if (flags.isUsEquityOnly) {
+    const removed = sum(p => isIntlDev(p) || isEmMkt(p)), us = sum(isUSLC);
+    pos = pos.filter(p => !(isIntlDev(p) || isEmMkt(p)));
+    if (us > 0) pos = pos.map(p => isUSLC(p) ? { ...p, target:p.target * (us + removed) / us } : p);
+    notes.push("US equity only");
+  }
+  if (flags.isExUslc)   { pos = pos.filter(p => !isUSLC(p));      notes.push("ex-US Large Cap"); }
+  if (flags.isExIntDev) { pos = pos.filter(p => !isIntlDev(p));   notes.push("ex-Intl Developed"); }
+  if (flags.isExEM)     { pos = pos.filter(p => !isEmMkt(p));     notes.push("ex-Emerging Markets"); }
+  if (flags.isExFI)     { pos = pos.filter(p => !isFixedIncome(p)); notes.push("ex-Fixed Income"); }
+
+  const sv = STOCK_VARIANT_RES.find(([, re]) => re.test(clean));
+  if (sv || flags.holdingsAssetClass === "equity") {
+    const holdings = sv ? lib.stock[sv[0]] : null;
+    if (!holdings) return { reason: sv ? `The library has no '${STOCK_MODEL_TABS[sv[0]]}' tab to read the ${sv[0]} holdings from` : "A stock-model holdings substitution the library doesn't define" };
+    // STP stock-model variants replace the whole US Large Cap class with the stocks. The Paragon
+    // variant swaps ONLY the VOO (S&P 500) ETF — SCHG, RSP and XLK stay as ETFs.
+    const swap = flags.isParagon ? (p => isUSLC(p) && p.ticker === "VOO") : isUSLC;
+    const swapped = sum(swap);
+    if (swapped > 0) {
+      pos = [...pos.filter(p => !swap(p)), ...holdings.map(h => ({ ticker:h.ticker, name:h.name, assetClass:"Equity", cls:"US Large Cap", target:h.weight * swapped }))];
+      notes.push(flags.isParagon ? `VOO replaced by the ${sv[0]}` : `US Large Cap replaced by the ${sv[0]}`);
+    }
+  }
+  return { positions: dedupePositions(pos), notes, family: family.id };
+}
+
+// ── Compare expected vs actual weights ───────────────────────────────────────
+// actual/expected: [{ ticker, name, assetClass?, target }]. `rescale` re-bases the
+// expected weights to 100 (Orion's model targets always total 100).
+function compareWeights(expected, actual, threshold, { rescale } = {}) {
+  const idx = list => { const m = {}; for (const p of list) { if (!(p.target > 0)) continue; const k = normalizeTicker(p.ticker); m[k] = m[k] ? { ...m[k], target:m[k].target + p.target } : { ...p }; } return m; };
+  const E = idx(expected), A = idx(actual);
+  const eSum = Object.values(E).reduce((s,p) => s + p.target, 0);
+  const rows = [];
+  for (const k of new Set([...Object.keys(E), ...Object.keys(A)])) {
+    const e = E[k], a = A[k];
+    const exp = e ? (rescale && eSum > 0 ? e.target / eSum * 100 : e.target) : null;
+    const act = a ? a.target : null;
+    let status, diff = null;
+    if (act === null) status = "MISSING_MASTER";
+    else if (exp === null) status = "MISSING_TARGET";
+    else { diff = act - exp; status = Math.abs(diff) <= threshold + 1e-9 ? "MATCH" : diff > 0 ? "OVER" : "UNDER"; } // +1e-9: a difference of exactly the tolerance is a match
+    rows.push({ ticker:a?.ticker || e?.ticker || k, name:a?.name || e?.name || k, assetClass:e?.assetClass || "—", masterTarget:act, adjTarget:exp, rawTarget:e ? e.target : null, diff, status });
+  }
+  const order = ["OVER","UNDER","MISSING_MASTER","MISSING_TARGET","MATCH"];
+  rows.sort((x, y) => { const d = order.indexOf(x.status) - order.indexOf(y.status); return d !== 0 ? d : Math.abs(y.diff||0) - Math.abs(x.diff||0); });
+  const count = s => rows.filter(r => r.status === s).length;
+  return { rows, summary:{ total:rows.length, over:count("OVER"), under:count("UNDER"), match:count("MATCH"), missing:count("MISSING_MASTER") + count("MISSING_TARGET") } };
+}
+
+// ── Model review ─────────────────────────────────────────────────────────────
+function indexHoldingsByModel(holdings) {
+  const by = {};
+  for (const h of holdings) { if (h.modelId == null) continue; (by[h.modelId] = by[h.modelId] || []).push(h); }
+  return by;
+}
+// Orion keeps a stale, empty aggregation under a model's plain name and names the live
+// one "<name>.e". When "<name>.e" has accounts and the plain one doesn't, the .e is the
+// model to review.
+function supersededBy(model, modelsByName) {
+  if (/\.e\s*$/i.test(model.name)) return null;
+  const live = modelsByName[model.name + ".e"];
+  return live && live.active && !model.active ? live : null;
+}
+function reviewModel(model, byModelId, lib, threshold, modelsByName) {
+  const live = modelsByName ? supersededBy(model, modelsByName) : null;
+  if (live) return { model, reason:`Superseded by '${live.name}' — the live aggregation (this one has no accounts); it's reviewed there` };
+  const exp = expectedHoldings(model.name, lib);
+  if (exp.reason) return { model, reason:exp.reason };
+  const actual = (byModelId[model.id] || []).map(h => ({ ticker:h.ticker, name:h.name, target:h.target }));
+  return { model, notes:exp.notes, ...compareWeights(exp.positions, actual, threshold, { rescale:true }) };
+}
+
+// ── Sleeve strategy review ───────────────────────────────────────────────────
+// 1) Targets: each library-driven strategy's sleeve targets vs what the libraries say.
+// 2) Look-through: the strategy's blended underlying holdings (each sleeve's target
+//    x that model's holdings in the holding file) vs the library's whole-portfolio
+//    ticker weights — an end-to-end check that sleeve targets and model holdings
+//    together reproduce the library. Only the ETF-based sleeve can be checked ticker
+//    by ticker (DI / bond / thematic sleeves are represented by proxy holdings).
+function sleeveLookThrough(st, byAggId, lib, threshold) {
+  const ctx = st.ctx;
+  if (!ctx) return { skipped:"Not a library-driven strategy" };
+  let sleeve, sleeveName, expected, label;
+  if (ctx.type === "direct") {
+    sleeve = st.comps.find(c => c.kind === "TACT_ETF"); sleeveName = sleeve && sleeve.aggName;
+    const info = ctx.info;
+    const tab = lib.tabs.find(t => t.source === "direct" && normAlnum(t.name).startsWith(normAlnum(info.size === "Large" ? "STP Direct Large" : "STP Direct Med")) && t.isTaxAware === info.isTA);
+    const variant = tab && tab.variants.find(v => v.toLowerCase() === info.profile.toLowerCase());
+    if (!tab || !variant) return { skipped:"The library column for this profile isn't available" };
+    expected = tab.tickers
+      .filter(t => t.ticker !== GLOBAL_EQUITY_TICKER && !(info.size === "Large" && /us investment grade/i.test(t.cls || "")))
+      .map(t => ({ ticker:t.ticker, name:t.name, assetClass:toTitleCase(t.category || ""), target:(t.values[variant] || 0) * 100 }));
+    label = "Tactical ETF sleeve vs the library's ETF weights";
+  } else {
+    sleeve = st.comps.find(c => c.aggName === ctx.ex.aggName); sleeveName = ctx.ex.aggName;
+    const exp = expectedHoldings(sleeveName, lib);
+    if (exp.reason) return { skipped:exp.reason };
+    // The ex- model carries (1 - what it excludes) of the profile; the profile fills `remainder`% of the strategy.
+    expected = exp.positions.map(p => ({ ...p, target:p.target * ctx.remainder / 100 }));
+    label = "ex- model sleeve vs the library's weights";
+  }
+  if (!sleeve) return { skipped:"The strategy has no such sleeve" };
+  const h = byAggId[sleeve.aggId];
+  if (!h || !h.length) return { skipped:`'${sleeveName}' isn't in the holding file` };
+  const actual = h.filter(x => x.target > 0).map(x => ({ ticker:x.ticker, name:x.name, target: x.target * sleeve.current / 100 }));
+  return { label, sleeveName, ...compareWeights(expected, actual, threshold) };
+}
+
+function reviewSleeves(importRows, aggMap, lib, holdings, threshold) {
+  const upd = computeSleeveUpdates(importRows, aggMap, lib.tabs);
+  const byAggId = {};
+  for (const h of (holdings || [])) { if (h.modelId != null) (byAggId[h.modelId] = byAggId[h.modelId] || []).push(h); }
+  return upd.statuses.map(st => {
+    if (st.status === "skipped") return { ...st, targetsOk:null, look:null };
+    const diffs = st.comps.filter(c => Math.abs(c.expected - c.current) > 1e-9);
+    return { ...st, targetsOk: diffs.length === 0, diffs, look: holdings ? sleeveLookThrough(st, byAggId, lib, threshold) : { skipped:"Upload the holdings file to run the look-through" } };
+  });
+}
+
+
 // ── Drag-drop hook ────────────────────────────────────────────────────────────
 function useDrop(onFiles) {
   const [dragging, setDragging] = useState(false);
@@ -1225,7 +1883,7 @@ function useDrop(onFiles) {
 const STORAGE_KEY = "master_file_data";
 
 // ── Main component ────────────────────────────────────────────────────────────
-export default function ModelAuditTool() {
+function GeneralAudit() {
   const [masterData, setMasterData]     = useState(null); // { models, holdings, fileName, savedAt }
   const [masterFromCache, setMasterFromCache] = useState(false);
   const [targetModels, setTargetModels] = useState([]); // parsed target models
@@ -1670,6 +2328,538 @@ export default function ModelAuditTool() {
     </div>
   );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Review modes: STP models and sleeve strategies
+// ═══════════════════════════════════════════════════════════════════════════
+const MODES = [
+  { key:"models",  label:"STP model review" },
+  { key:"sleeves", label:"Sleeve strategy review" },
+  { key:"general", label:"General audit" },
+];
+const SCOPE_LABEL = { not:"Model Name does not contain", has:"Model Name contains" };
+const FAMILY_ORDER = ["STP", "STP Direct HH", "STP Tactical ETF", "Paragon/STP"];
+function modelFamily(name) {
+  if (/^\s*paragon\/stp/i.test(name)) return "Paragon/STP";
+  if (/^\s*stp\s+direct\s+hh/i.test(name)) return "STP Direct HH";
+  if (/^\s*stp\s+tactical\s+etf/i.test(name)) return "STP Tactical ETF";
+  if (/^\s*stp\s+-\s/i.test(name)) return "STP";
+  return "Other";
+}
+
+function downloadWorkbook(sheets, filename) {
+  const wb = XLSX.utils.book_new();
+  for (const [name, rows] of sheets) {
+    const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ Note:"Nothing to report" }]);
+    ws["!cols"] = Object.keys(rows[0] || { Note:"" }).map(k => ({ wch: Math.max(k.length + 2, 14) }));
+    XLSX.utils.book_append_sheet(wb, ws, name.slice(0, 31));
+  }
+  XLSX.writeFile(wb, filename);
+}
+const r3 = x => (x === null || x === undefined) ? "" : Math.round(x * 1000) / 1000;
+
+// Everything the two review modes share: the holdings file, both libraries, the
+// sleeve files and the tolerance. Uploaded once, used by both.
+function useAuditWorkspace() {
+  const [masterData, setMasterData] = useState(null); // { models, holdings, fileName, savedAt }
+  const [masterFromCache, setMasterFromCache] = useState(false);
+  const [storageLoading, setStorageLoading] = useState(true);
+  const [savvy, setSavvy] = useState(null); // { fileName, tabs, stock }
+  const [direct, setDirect] = useState(null); // { fileName, tabs }
+  const [sleeveImport, setSleeveImport] = useState(null); // { fileName, headers, rows }
+  const [aggMeta, setAggMeta] = useState(null); // { map, fileName, savedAt } — stored; shared with the Import Builder
+  const [loading, setLoading] = useState({});
+  const [errors, setErrors] = useState({});
+  const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
+  const setBusy = (k, v) => setLoading(p => ({ ...p, [k]: v }));
+  const setErr = (k, v) => setErrors(p => ({ ...p, [k]: v }));
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await window.storage.get(STORAGE_KEY);
+        if (result?.value) {
+          const data = JSON.parse(result.value);
+          const modelsMap = Object.fromEntries((data.models || []).map(m => [m.id, m.name]));
+          const holdings = data.holdings?.[0]?.t !== undefined ? expandHoldings(data.holdings, modelsMap) : data.holdings;
+          setMasterData({ ...data, holdings }); setMasterFromCache(true);
+        }
+      } catch { /* nothing cached */ }
+      try {
+        const saved = await loadSleeveAggMap();
+        if (saved && saved.map) setAggMeta({ map:saved.map, fileName:saved.fileName, savedAt:saved.savedAt });
+      } catch { /* nothing stored */ }
+      setStorageLoading(false);
+    })();
+  }, []);
+
+  const run = (key, fn) => async files => {
+    setBusy(key, true); setErr(key, null);
+    try { await fn(files[0]); } catch (e) { setErr(key, e.message); }
+    setBusy(key, false);
+  };
+  const handleMaster = useCallback(run("master", async file => {
+    const wb = readXLSX(await readFileBuffer(file));
+    const { models, holdings: slim } = parseMasterFile(wb);
+    if (!models.length) throw new Error("No models found — is this the Model Holding Weighting export?");
+    const modelsMap = Object.fromEntries(models.map(m => [m.id, m.name]));
+    const data = { models, holdings: expandHoldings(slim, modelsMap), fileName:file.name, savedAt:new Date().toLocaleDateString() };
+    setMasterData(data); setMasterFromCache(false);
+    try { await window.storage.set(STORAGE_KEY, JSON.stringify({ models, holdings:slim, fileName:file.name, savedAt:data.savedAt })); } catch {}
+  }), []);
+  const handleSavvy = useCallback(run("savvy", async file => {
+    const wb = readXLSX(await readFileBuffer(file));
+    const tabs = parseLibraryTabs(wb, "savvy");
+    if (!tabs.length) throw new Error("No model matrix tabs found (looked for a 'Ticker' column).");
+    setSavvy({ fileName:file.name, tabs, stock:parseStockModels(wb) });
+  }), []);
+  const handleDirect = useCallback(run("direct", async file => {
+    const wb = readXLSX(await readFileBuffer(file));
+    const tabs = parseLibraryTabs(wb, "direct");
+    if (!tabs.length) throw new Error("No model matrix tabs found in the STP Direct library (looked for a 'Ticker' column).");
+    setDirect({ fileName:file.name, tabs });
+  }), []);
+  const handleSleeveImport = useCallback(run("sleeveImport", async file => {
+    const parsed = parseSleeveImport(new Uint8Array(await readFileBuffer(file)));
+    setSleeveImport({ fileName:file.name, headers:parsed.headers, rows:parsed.rows });
+  }), []);
+  const handleSleeveExport = useCallback(run("sleeveExport", async file => {
+    const map = parseSleeveExport(new Uint8Array(await readFileBuffer(file)));
+    const meta = { map, fileName:file.name, savedAt:new Date().toISOString() };
+    setAggMeta(meta);
+    saveSleeveAggMap({ map, savedAt:meta.savedAt, fileName:file.name });
+  }), []);
+  const clearMaster = useCallback(async () => {
+    setMasterData(null); setMasterFromCache(false);
+    try { await window.storage.delete(STORAGE_KEY); } catch {}
+  }, []);
+
+  const lib = useMemo(() => (savvy || direct)
+    ? { tabs:[...(savvy ? savvy.tabs : []), ...(direct ? direct.tabs : [])], stock:savvy ? savvy.stock : {} }
+    : null, [savvy, direct]);
+
+  return { masterData, masterFromCache, storageLoading, savvy, direct, sleeveImport, aggMeta, loading, errors, threshold, setThreshold,
+           lib, handleMaster, handleSavvy, handleDirect, handleSleeveImport, handleSleeveExport, clearMaster, setSavvy, setDirect, setSleeveImport };
+}
+
+// ── The top-level tool: a mode bar, then one of the three views ──────────────
+export default function ModelAuditTool() {
+  const [mode, setMode] = useState("models");
+  const ws = useAuditWorkspace();
+  return (
+    <div style={{ fontFamily:"'Inter', system-ui, sans-serif", background:"#f1f5f9", minHeight:"100vh" }}>
+      <div style={{ background:"white", borderBottom:"1px solid #e2e8f0", padding:"8px 28px", display:"flex", gap:6, alignItems:"center" }}>
+        {MODES.map(m => (
+          <button key={m.key} onClick={() => setMode(m.key)}
+            style={{ padding:"6px 14px", borderRadius:8, border:"none", fontSize:12, fontWeight:600, cursor:"pointer",
+              background:mode === m.key ? "#0f172a" : "transparent", color:mode === m.key ? "white" : "#64748b" }}>
+            {m.label}
+          </button>
+        ))}
+      </div>
+      {mode === "general" ? <GeneralAudit /> : <ReviewShell mode={mode} ws={ws} />}
+    </div>
+  );
+}
+
+function ReviewShell({ mode, ws }) {
+  const dMaster = useDrop(ws.handleMaster), dSavvy = useDrop(ws.handleSavvy), dDirect = useDrop(ws.handleDirect);
+  const dImport = useDrop(ws.handleSleeveImport), dExport = useDrop(ws.handleSleeveExport);
+  const sleeves = mode === "sleeves";
+  const { masterData, savvy, direct, sleeveImport, aggMeta, loading, errors } = ws;
+  return (
+    <div>
+      <div style={{ background:"#0f172a", padding:"16px 28px", display:"flex", alignItems:"center", gap:14 }}>
+        <div style={{ width:34, height:34, background:"#3b82f6", borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2V9M9 21H5a2 2 0 0 1-2-2V9m0 0h18"/></svg>
+        </div>
+        <div>
+          <div style={{ color:"white", fontWeight:700, fontSize:16 }}>{sleeves ? "Sleeve Strategy Review" : "STP Model Review"}</div>
+          <div style={{ color:"#94a3b8", fontSize:11 }}>{sleeves ? "Sleeve targets and underlying holdings vs the model libraries" : "Underlying holdings in Orion vs the model libraries"}</div>
+        </div>
+      </div>
+
+      <div style={{ padding:"20px 28px", maxWidth:1400, margin:"0 auto" }}>
+        <div style={{ display:"grid", gridTemplateColumns:sleeves ? "repeat(3, 1fr)" : "repeat(4, 1fr)", gap:14, marginBottom:16 }}>
+          <DropZone label="Model Holding Weighting" sublabel="Orion export — underlying ticker allocations for every model"
+            accent="#3b82f6" loading={loading.master || ws.storageLoading} error={errors.master} dragging={dMaster.dragging}
+            dropProps={dMaster} onFiles={ws.handleMaster} hint="Drop or click · .xlsx">
+            {masterData && <FileChip name={masterData.fileName}
+              sub={`${masterData.models.length} models · ${masterData.holdings.length} rows · saved ${masterData.savedAt}`} color="#3b82f6"
+              badge={ws.masterFromCache ? { label:"Cached — re-upload after pushing updates", color:"#92400e", bg:"#fffbeb" } : { label:"Updated", color:"#2563eb", bg:"#eff6ff" }}
+              onRemove={ws.clearMaster} />}
+          </DropZone>
+          <DropZone label="Savvy model library" sublabel="STP and Paragon/STP targets"
+            accent="#0aa89c" loading={loading.savvy} error={errors.savvy} dragging={dSavvy.dragging}
+            dropProps={dSavvy} onFiles={ws.handleSavvy} hint="Drop or click · .xlsx">
+            {savvy && <FileChip name={savvy.fileName} sub={`${savvy.tabs.length} tabs · ${Object.keys(savvy.stock).length} stock models`} color="#0aa89c" onRemove={() => ws.setSavvy(null)} />}
+          </DropZone>
+          <DropZone label="STP Direct library" sublabel="STP Direct HH and Tactical ETF targets"
+            accent="#7c3aed" loading={loading.direct} error={errors.direct} dragging={dDirect.dragging}
+            dropProps={dDirect} onFiles={ws.handleDirect} hint="Drop or click · .xlsx">
+            {direct && <FileChip name={direct.fileName} sub={`${direct.tabs.length} tabs`} color="#7c3aed" onRemove={() => ws.setDirect(null)} />}
+          </DropZone>
+          {sleeves && (
+            <DropZone label="Sleeve Strategy Import" sublabel="The sleeve strategies to review"
+              accent="#f59e0b" loading={loading.sleeveImport} error={errors.sleeveImport} dragging={dImport.dragging}
+              dropProps={dImport} onFiles={ws.handleSleeveImport} hint="Drop or click · .xlsx">
+              {sleeveImport && <FileChip name={sleeveImport.fileName}
+                sub={`${new Set(sleeveImport.rows.map(r => r["Sleeve Strategy ID"])).size} strategies · ${sleeveImport.rows.length} rows`} color="#f59e0b" onRemove={() => ws.setSleeveImport(null)} />}
+            </DropZone>
+          )}
+          {sleeves && (
+            <DropZone label="Sleeve Strategy Export" sublabel="Model Agg ID → name — stored between sessions"
+              accent="#f59e0b" loading={loading.sleeveExport || ws.storageLoading} error={errors.sleeveExport} dragging={dExport.dragging}
+              dropProps={dExport} onFiles={ws.handleSleeveExport} hint="Drop or click · .xlsx">
+              {aggMeta && <FileChip name={aggMeta.fileName || "stored export"}
+                sub={`${Object.keys(aggMeta.map).length} model aggregates · saved ${new Date(aggMeta.savedAt).toLocaleDateString()}`} color="#f59e0b"
+                badge={{ label:"Stored", color:"#16a34a", bg:"#f0fdf4" }} />}
+            </DropZone>
+          )}
+          <div style={{ background:"white", borderRadius:12, padding:16, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", borderTop:"3px solid #0ea5e9" }}>
+            <div style={{ fontWeight:700, fontSize:13, color:"#0f172a", marginBottom:12 }}>Audit Settings</div>
+            <label style={lbl}>Tolerance (±%)</label>
+            <input type="number" step="0.01" min="0" value={ws.threshold}
+              onChange={e => ws.setThreshold(parseFloat(e.target.value) || 0)}
+              style={{ width:"100%", padding:"7px 10px", borderRadius:7, border:"1.5px solid #e2e8f0", fontSize:13, color:"#0f172a", boxSizing:"border-box" }} />
+            <div style={{ marginTop:8, fontSize:11, color:"#94a3b8", lineHeight:1.5 }}>
+              A difference up to this many points counts as on target. The libraries carry weights to 0.1%, so differences under 0.05 are rounding.
+            </div>
+          </div>
+        </div>
+        {sleeves ? <SleeveReviewView ws={ws} /> : <ModelReviewView ws={ws} />}
+      </div>
+    </div>
+  );
+}
+
+// A ticker comparison table (used by both reviews)
+function TickerTable({ rows, actualLabel, expectedLabel }) {
+  if (!rows.length) return <div style={{ padding:24, textAlign:"center", color:"#94a3b8", fontSize:13 }}>No holdings match this filter.</div>;
+  return (
+    <div style={{ overflowX:"auto" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+        <thead>
+          <tr style={{ background:"#f8fafc" }}>
+            {["Status","Ticker","Security","Asset Class",actualLabel,expectedLabel,"Diff"].map(h => (
+              <th key={h} style={{ padding:"9px 14px", textAlign:[actualLabel,expectedLabel,"Diff"].includes(h) ? "right" : "left", fontSize:10, fontWeight:600, color:"#64748b", textTransform:"uppercase", letterSpacing:"0.05em", whiteSpace:"nowrap" }}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => {
+            const s = STATUS[row.status];
+            return (
+              <tr key={row.ticker + i} style={{ background:i % 2 === 0 ? "white" : "#fafbfc", borderBottom:"1px solid #f1f5f9" }}>
+                <td style={{ padding:"8px 14px", whiteSpace:"nowrap" }}>
+                  <span style={{ display:"inline-flex", alignItems:"center", gap:5, background:s.bg, color:s.color, padding:"2px 8px", borderRadius:10, fontSize:11, fontWeight:600 }}>
+                    <span style={{ width:5, height:5, borderRadius:"50%", background:s.dot, flexShrink:0 }} />{s.label}
+                  </span>
+                </td>
+                <td style={{ padding:"8px 14px", fontWeight:600, color:"#0f172a", fontFamily:"monospace", fontSize:12 }}>{row.ticker}</td>
+                <td style={{ padding:"8px 14px", color:"#334155", maxWidth:220, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{row.name}</td>
+                <td style={{ padding:"8px 14px", color:"#64748b", fontSize:12, whiteSpace:"nowrap" }}>{row.assetClass}</td>
+                <td style={{ padding:"8px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#0f172a" }}>
+                  {row.masterTarget !== null ? `${row.masterTarget.toFixed(2)}%` : <span style={{ color:"#cbd5e1" }}>—</span>}
+                </td>
+                <td style={{ padding:"8px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#0f172a" }}>
+                  {row.adjTarget !== null ? `${row.adjTarget.toFixed(2)}%` : <span style={{ color:"#cbd5e1" }}>—</span>}
+                </td>
+                <td style={{ padding:"8px 14px", textAlign:"right", fontWeight:600, fontVariantNumeric:"tabular-nums", color:row.diff === null ? "#cbd5e1" : row.diff > 0 ? "#dc2626" : row.diff < 0 ? "#d97706" : "#16a34a" }}>
+                  {row.diff === null ? "—" : `${row.diff > 0 ? "+" : ""}${row.diff.toFixed(2)}%`}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function StatCard({ label, value, color }) {
+  return (
+    <div style={{ background:"white", borderRadius:10, padding:"12px 16px", boxShadow:"0 1px 3px rgba(0,0,0,0.06)" }}>
+      <div style={{ fontSize:22, fontWeight:700, color }}>{value}</div>
+      <div style={{ fontSize:11, color:"#64748b" }}>{label}</div>
+    </div>
+  );
+}
+
+function NotReviewed({ items }) {
+  // items: [{ name, reason }] grouped by reason
+  if (!items.length) return null;
+  const grouped = items.reduce((g, x) => { (g[x.reason] = g[x.reason] || []).push(x.name); return g; }, {});
+  return (
+    <details style={{ marginTop:14, background:"white", borderRadius:12, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", padding:"12px 20px" }}>
+      <summary style={{ cursor:"pointer", fontSize:13, fontWeight:600, color:"#64748b" }}>Not reviewed — {items.length}</summary>
+      <ul style={{ margin:"10px 0 0", paddingLeft:18, fontSize:12, color:"#64748b", lineHeight:1.7 }}>
+        {Object.entries(grouped).map(([why, names], i) => (
+          <li key={i} style={{ marginBottom:4 }}><strong style={{ color:"#334155" }}>{why}</strong> ({names.length}): {names.join("; ")}</li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+function Prompt({ text }) { return <EmptyState text={text} />; }
+
+// ── STP model review ─────────────────────────────────────────────────────────
+function ModelReviewView({ ws }) {
+  const { masterData, lib, threshold } = ws;
+  const [filters, setFilters] = useState(DEFAULT_SCOPE_FILTERS);
+  const [issuesOnly, setIssuesOnly] = useState(true);
+  const [family, setFamily] = useState("ALL");
+  const [expanded, setExpanded] = useState({});
+  const [rowFilter, setRowFilter] = useState({});
+
+  const review = useMemo(() => {
+    if (!masterData || !lib) return null;
+    const by = indexHoldingsByModel(masterData.holdings);
+    const byName = Object.fromEntries(masterData.models.map(m => [m.name, m]));
+    const scoped = masterData.models.filter(m => inReviewScope(m.name, filters));
+    const results = scoped.map(m => reviewModel(m, by, lib, threshold, byName));
+    const withIssues = r => !r.reason && (r.summary.over + r.summary.under + r.summary.missing) > 0;
+    return { scoped:scoped.length, results, withIssues };
+  }, [masterData, lib, threshold, filters]);
+
+  const setFilter = (id, patch) => setFilters(fs => fs.map(f => f.id === id ? { ...f, ...patch } : f));
+
+  const scopePanel = (
+    <div style={{ background:"white", borderRadius:12, padding:"14px 18px", boxShadow:"0 1px 3px rgba(0,0,0,0.06)", marginBottom:14 }}>
+      <div style={{ fontWeight:700, fontSize:13, color:"#0f172a", marginBottom:2 }}>Review scope</div>
+      <div style={{ fontSize:11, color:"#94a3b8", marginBottom:10 }}>The same filters you use in Orion to pick the models that need reviewing — the holdings file lists every model.</div>
+      <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+        {filters.map(f => (
+          <label key={f.id} style={{ display:"flex", alignItems:"center", gap:10, fontSize:13, color:f.on ? "#0f172a" : "#94a3b8" }}>
+            <input type="checkbox" checked={f.on} onChange={() => setFilter(f.id, { on:!f.on })} style={{ width:15, height:15, accentColor:"#3b82f6" }} />
+            <span style={{ minWidth:200 }}>{SCOPE_LABEL[f.mode]}</span>
+            <input type="text" value={f.term} onChange={e => setFilter(f.id, { term:e.target.value })}
+              style={{ padding:"4px 8px", borderRadius:6, border:"1.5px solid #e2e8f0", fontSize:12, width:170, color:"#0f172a" }} />
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+
+  if (ws.storageLoading) return <>{scopePanel}<Prompt text="Loading saved holdings file…" /></>;
+  if (!masterData) return <>{scopePanel}<Prompt text="Upload the Model Holding Weighting file to begin." /></>;
+  if (!lib) return <>{scopePanel}<Prompt text="Upload the Savvy model library and the STP Direct library to review the models." /></>;
+
+  const { results, withIssues } = review;
+  const reviewed = results.filter(r => !r.reason);
+  const issues = reviewed.filter(withIssues);
+  const notReviewed = results.filter(r => r.reason).map(r => ({ name:r.model.name, reason:r.reason }));
+  const inFamily = r => family === "ALL" || modelFamily(r.model.name) === family;
+  const shown = reviewed.filter(inFamily).filter(r => !issuesOnly || withIssues(r))
+    .sort((a, b) => (withIssues(b) - withIssues(a)) || (b.summary.over + b.summary.under + b.summary.missing) - (a.summary.over + a.summary.under + a.summary.missing));
+  const familiesPresent = [...new Set(reviewed.map(r => modelFamily(r.model.name)))].sort((a, b) => FAMILY_ORDER.indexOf(a) - FAMILY_ORDER.indexOf(b));
+  const allOpen = shown.length > 0 && shown.every(r => expanded[r.model.id]);
+
+  const exportReport = () => {
+    const disc = [], summary = [];
+    for (const r of results) {
+      if (r.reason) { summary.push({ Model:r.model.name, Result:"Not reviewed", Detail:r.reason }); continue; }
+      const bad = r.rows.filter(x => x.status !== "MATCH");
+      summary.push({ Model:r.model.name, Result:bad.length ? "Discrepancies" : "On target", Detail:`${r.notes.join(" · ")}`, "Positions":r.summary.total, Over:r.summary.over, Under:r.summary.under, Missing:r.summary.missing });
+      for (const x of bad) disc.push({ Model:r.model.name, Ticker:x.ticker, Security:x.name, "Asset class":x.assetClass, "In Orion %":r3(x.masterTarget), "Expected %":r3(x.adjTarget), "Diff (pp)":r3(x.diff), Status:STATUS[x.status].label });
+    }
+    downloadWorkbook([["Discrepancies", disc], ["Models", summary]], `STP_Model_Review_${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
+  return (
+    <>
+      {scopePanel}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(5, 1fr)", gap:12, marginBottom:14 }}>
+        <StatCard label="Models in scope" value={review.scoped} color="#0f172a" />
+        <StatCard label="Reviewed" value={reviewed.length} color="#3b82f6" />
+        <StatCard label="On target" value={reviewed.length - issues.length} color="#16a34a" />
+        <StatCard label="With discrepancies" value={issues.length} color={issues.length ? "#dc2626" : "#94a3b8"} />
+        <StatCard label="Not reviewed" value={notReviewed.length} color="#94a3b8" />
+      </div>
+
+      <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", marginBottom:12 }}>
+        {["ALL", ...familiesPresent].map(f => (
+          <button key={f} onClick={() => setFamily(f)}
+            style={{ padding:"5px 12px", borderRadius:20, border:`1.5px solid ${family === f ? "#3b82f6" : "#e2e8f0"}`, background:family === f ? "#eff6ff" : "white", color:family === f ? "#1d4ed8" : "#64748b", fontSize:12, fontWeight:600, cursor:"pointer" }}>
+            {f === "ALL" ? "All families" : f}
+          </button>
+        ))}
+        <label style={{ marginLeft:12, display:"flex", alignItems:"center", gap:6, fontSize:12, color:"#334155", cursor:"pointer" }}>
+          <input type="checkbox" checked={issuesOnly} onChange={() => setIssuesOnly(v => !v)} style={{ accentColor:"#3b82f6" }} /> Discrepancies only
+        </label>
+        <div style={{ marginLeft:"auto", display:"flex", gap:8 }}>
+          <button onClick={() => { const e = {}; shown.forEach(r => { e[r.model.id] = !allOpen; }); setExpanded(e); }}
+            style={{ padding:"6px 14px", borderRadius:8, background:"#334155", border:"none", color:"white", fontSize:12, fontWeight:600, cursor:"pointer" }}>{allOpen ? "⊟ Collapse All" : "⊞ Expand All"}</button>
+          <button onClick={exportReport}
+            style={{ padding:"6px 14px", borderRadius:8, background:"#1d4ed8", border:"none", color:"white", fontSize:12, fontWeight:600, cursor:"pointer" }}>Export report ↓</button>
+        </div>
+      </div>
+
+      {shown.length === 0 && <EmptyState text={issues.length === 0 ? "Every reviewed model is on target." : "No models match this view."} />}
+      {shown.map(r => {
+        const isOpen = expanded[r.model.id] === true, filt = rowFilter[r.model.id] || "DISCREPANCY";
+        const rows = filt === "ALL" ? r.rows : filt === "DISCREPANCY" ? r.rows.filter(x => x.status !== "MATCH") : r.rows.filter(x => x.status === filt);
+        const bad = r.summary.over + r.summary.under + r.summary.missing;
+        return (
+          <div key={r.model.id} style={{ background:"white", borderRadius:12, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", marginBottom:10, overflow:"hidden" }}>
+            <button onClick={() => setExpanded(p => ({ ...p, [r.model.id]: !isOpen }))}
+              style={{ width:"100%", background:"none", border:"none", cursor:"pointer", padding:"13px 20px", display:"flex", alignItems:"center", gap:12, textAlign:"left" }}>
+              <span style={{ fontSize:13, transform:isOpen ? "rotate(90deg)" : "none", transition:"transform 0.2s", color:"#94a3b8", display:"inline-block" }}>▶</span>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontWeight:700, fontSize:14, color:"#0f172a" }}>{r.model.name}</div>
+                <div style={{ fontSize:11, color:"#94a3b8", marginTop:1 }}>Library: <span style={{ color:"#64748b" }}>{r.notes.join(" · ")}</span></div>
+              </div>
+              <div style={{ display:"flex", gap:6, flexShrink:0 }}>
+                {r.summary.over > 0 && <Pill label={`${r.summary.over} over`} color="#dc2626" bg="#fef2f2" />}
+                {r.summary.under > 0 && <Pill label={`${r.summary.under} under`} color="#d97706" bg="#fffbeb" />}
+                {r.summary.missing > 0 && <Pill label={`${r.summary.missing} missing`} color="#7c3aed" bg="#f5f3ff" />}
+                {bad === 0 && <Pill label="All on target" color="#16a34a" bg="#f0fdf4" />}
+                <Pill label={`${r.summary.total} positions`} color="#64748b" bg="#f8fafc" />
+              </div>
+            </button>
+            {isOpen && (
+              <>
+                <div style={{ padding:"0 20px 10px", display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", borderBottom:"1px solid #f1f5f9" }}>
+                  {[["DISCREPANCY", "Discrepancies"], ["ALL", "All"]].map(([f, label]) => (
+                    <button key={f} onClick={() => setRowFilter(p => ({ ...p, [r.model.id]: f }))}
+                      style={{ padding:"4px 10px", borderRadius:20, border:`1.5px solid ${filt === f ? "#3b82f6" : "#e2e8f0"}`, background:filt === f ? "#eff6ff" : "white", color:filt === f ? "#1d4ed8" : "#64748b", fontSize:11, fontWeight:600, cursor:"pointer" }}>{label}</button>
+                  ))}
+                  <span style={{ marginLeft:"auto", fontSize:11, color:"#94a3b8" }}>±{threshold}% tolerance</span>
+                </div>
+                <TickerTable rows={rows} actualLabel="In Orion %" expectedLabel="Expected %" />
+              </>
+            )}
+          </div>
+        );
+      })}
+      <NotReviewed items={notReviewed} />
+    </>
+  );
+}
+
+// ── Sleeve strategy review ───────────────────────────────────────────────────
+function SleeveReviewView({ ws }) {
+  const { masterData, lib, threshold, sleeveImport, aggMeta } = ws;
+  const [issuesOnly, setIssuesOnly] = useState(true);
+  const [expanded, setExpanded] = useState({});
+
+  const results = useMemo(() => (sleeveImport && aggMeta && lib)
+    ? reviewSleeves(sleeveImport.rows, aggMeta.map, lib, masterData ? masterData.holdings : null, threshold)
+    : null, [sleeveImport, aggMeta, lib, masterData, threshold]);
+
+  if (!sleeveImport) return <Prompt text="Upload the Sleeve Strategy Import to review it." />;
+  if (!aggMeta) return <Prompt text="Upload the Sleeve Strategy Export once — it supplies the model names for the sleeves, and is remembered." />;
+  if (!lib) return <Prompt text="Upload the Savvy model library and the STP Direct library to review the sleeve strategies." />;
+
+  const reviewed = results.filter(s => s.status !== "skipped");
+  const lookBad = s => s.look && s.look.summary && (s.look.summary.over + s.look.summary.under + s.look.summary.missing) > 0;
+  const hasIssue = s => !s.targetsOk || lookBad(s);
+  const issues = reviewed.filter(hasIssue);
+  const notReviewed = results.filter(s => s.status === "skipped").map(s => ({ name:s.name, reason:`${s.group} — ${s.reason}` }));
+  const shown = reviewed.filter(s => !issuesOnly || hasIssue(s));
+  shown.sort((a, b) => (hasIssue(b) - hasIssue(a)) || String(a.name).localeCompare(String(b.name)));
+  const allOpen = shown.length > 0 && shown.every(s => expanded[s.id]);
+
+  const exportReport = () => {
+    const targets = [], look = [], summary = [];
+    for (const s of results) {
+      if (s.status === "skipped") { summary.push({ Strategy:s.name, "Strategy ID":s.id, Result:"Not reviewed", Detail:`${s.group} — ${s.reason}` }); continue; }
+      summary.push({ Strategy:s.name, "Strategy ID":s.id, Family:s.family,
+        "Sleeve targets":s.targetsOk ? "Match the libraries" : "Differ from the libraries",
+        "Look-through":s.look.skipped ? `Not reviewed — ${s.look.skipped}` : lookBad(s) ? "Discrepancies" : "On target" });
+      for (const c of s.comps) targets.push({ Strategy:s.name, "Strategy ID":s.id, Sleeve:c.aggName, "Current %":r3(c.current), "Libraries say %":r3(c.expected), "Diff (pp)":r3(c.current - c.expected), Status:Math.abs(c.expected - c.current) > 1e-9 ? "Differs" : "Match" });
+      if (s.look.rows) for (const x of s.look.rows.filter(r => r.status !== "MATCH")) look.push({ Strategy:s.name, "Strategy ID":s.id, Sleeve:s.look.sleeveName, Ticker:x.ticker, Security:x.name, "Blended in Orion %":r3(x.masterTarget), "Library %":r3(x.adjTarget), "Diff (pp)":r3(x.diff), Status:STATUS[x.status].label });
+    }
+    downloadWorkbook([["Strategies", summary], ["Sleeve targets", targets], ["Look-through discrepancies", look]], `Sleeve_Strategy_Review_${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
+  return (
+    <>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(5, 1fr)", gap:12, marginBottom:14 }}>
+        <StatCard label="Strategies in file" value={results.length} color="#0f172a" />
+        <StatCard label="Reviewed" value={reviewed.length} color="#3b82f6" />
+        <StatCard label="On target" value={reviewed.length - issues.length} color="#16a34a" />
+        <StatCard label="Need attention" value={issues.length} color={issues.length ? "#dc2626" : "#94a3b8"} />
+        <StatCard label="Not reviewed" value={notReviewed.length} color="#94a3b8" />
+      </div>
+      {!masterData && (
+        <div style={{ background:"#fffbeb", border:"1px solid #fde68a", borderRadius:10, padding:"10px 14px", fontSize:12, color:"#92400e", marginBottom:12 }}>
+          The holdings file isn't loaded, so only the sleeve targets are checked. Upload it to also check the underlying holdings.
+        </div>
+      )}
+      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:12 }}>
+        <label style={{ display:"flex", alignItems:"center", gap:6, fontSize:12, color:"#334155", cursor:"pointer" }}>
+          <input type="checkbox" checked={issuesOnly} onChange={() => setIssuesOnly(v => !v)} style={{ accentColor:"#3b82f6" }} /> Strategies needing attention only
+        </label>
+        <div style={{ marginLeft:"auto", display:"flex", gap:8 }}>
+          <button onClick={() => { const e = {}; shown.forEach(s => { e[s.id] = !allOpen; }); setExpanded(e); }}
+            style={{ padding:"6px 14px", borderRadius:8, background:"#334155", border:"none", color:"white", fontSize:12, fontWeight:600, cursor:"pointer" }}>{allOpen ? "⊟ Collapse All" : "⊞ Expand All"}</button>
+          <button onClick={exportReport}
+            style={{ padding:"6px 14px", borderRadius:8, background:"#1d4ed8", border:"none", color:"white", fontSize:12, fontWeight:600, cursor:"pointer" }}>Export report ↓</button>
+        </div>
+      </div>
+
+      {shown.length === 0 && <EmptyState text={issues.length === 0 ? "Every reviewed strategy is on target." : "No strategies match this view."} />}
+      {shown.map(s => {
+        const isOpen = expanded[s.id] === true;
+        const lookSkipped = s.look && s.look.skipped, nBad = s.look && s.look.summary ? s.look.summary.over + s.look.summary.under + s.look.summary.missing : 0;
+        return (
+          <div key={s.id} style={{ background:"white", borderRadius:12, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", marginBottom:10, overflow:"hidden" }}>
+            <button onClick={() => setExpanded(p => ({ ...p, [s.id]: !isOpen }))}
+              style={{ width:"100%", background:"none", border:"none", cursor:"pointer", padding:"13px 20px", display:"flex", alignItems:"center", gap:12, textAlign:"left" }}>
+              <span style={{ fontSize:13, transform:isOpen ? "rotate(90deg)" : "none", transition:"transform 0.2s", color:"#94a3b8", display:"inline-block" }}>▶</span>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontWeight:700, fontSize:14, color:"#0f172a" }}>{s.name} <span style={{ fontWeight:400, color:"#94a3b8", fontSize:12 }}>(ID {s.id})</span></div>
+                <div style={{ fontSize:11, color:"#94a3b8", marginTop:1 }}>{s.family}</div>
+              </div>
+              <div style={{ display:"flex", gap:6, flexShrink:0 }}>
+                {s.targetsOk ? <Pill label="Targets match" color="#16a34a" bg="#f0fdf4" /> : <Pill label={`${s.diffs.length} target${s.diffs.length === 1 ? "" : "s"} differ`} color="#dc2626" bg="#fef2f2" />}
+                {lookSkipped ? <Pill label="Holdings not checked" color="#64748b" bg="#f8fafc" />
+                  : nBad === 0 ? <Pill label="Holdings on target" color="#16a34a" bg="#f0fdf4" />
+                  : <Pill label={`${nBad} holding${nBad === 1 ? "" : "s"} off`} color="#d97706" bg="#fffbeb" />}
+              </div>
+            </button>
+            {isOpen && (
+              <div style={{ padding:"0 20px 16px" }}>
+                <div style={{ fontSize:11, fontWeight:600, color:"#64748b", textTransform:"uppercase", letterSpacing:"0.05em", margin:"4px 0 6px" }}>Sleeve targets</div>
+                <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13, marginBottom:14 }}>
+                  <thead><tr style={{ background:"#f8fafc" }}>
+                    {["Sleeve","Current %","Libraries say %","Diff"].map(h => <th key={h} style={{ padding:"8px 12px", textAlign:h === "Sleeve" ? "left" : "right", fontSize:10, fontWeight:600, color:"#64748b", textTransform:"uppercase", letterSpacing:"0.05em" }}>{h}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {s.comps.map((c, i) => {
+                      const d = c.current - c.expected, off = Math.abs(d) > 1e-9;
+                      return (
+                        <tr key={i} style={{ borderBottom:"1px solid #f1f5f9", background:off ? "#fffbeb" : "transparent" }}>
+                          <td style={{ padding:"7px 12px", color:"#334155" }}>{c.aggName}</td>
+                          <td style={{ padding:"7px 12px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>{c.current}%</td>
+                          <td style={{ padding:"7px 12px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>{c.expected}%</td>
+                          <td style={{ padding:"7px 12px", textAlign:"right", fontWeight:600, fontVariantNumeric:"tabular-nums", color:off ? (d > 0 ? "#dc2626" : "#d97706") : "#16a34a" }}>{off ? `${d > 0 ? "+" : ""}${d.toFixed(2)}` : "—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <div style={{ fontSize:11, fontWeight:600, color:"#64748b", textTransform:"uppercase", letterSpacing:"0.05em", margin:"4px 0 2px" }}>Underlying holdings</div>
+                {lookSkipped
+                  ? <div style={{ padding:"10px 0", fontSize:12, color:"#94a3b8" }}>Not checked — {s.look.skipped}.</div>
+                  : <>
+                      <div style={{ fontSize:11, color:"#94a3b8", marginBottom:6 }}>{s.look.label} · {s.look.sleeveName} · ±{threshold}% tolerance</div>
+                      <div style={{ border:"1px solid #f1f5f9", borderRadius:8, overflow:"hidden" }}>
+                        <TickerTable rows={s.look.rows.filter(x => x.status !== "MATCH" || nBad === 0)} actualLabel="Blended in Orion %" expectedLabel="Library %" />
+                      </div>
+                    </>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      <NotReviewed items={notReviewed} />
+    </>
+  );
+}
+
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 const lbl = { fontSize: 11, fontWeight: 600, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 6 };
