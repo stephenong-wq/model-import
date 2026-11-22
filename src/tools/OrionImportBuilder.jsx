@@ -1093,10 +1093,10 @@ function getMatchFrac(row, match) {
 // the export. Adding new classes/categories is not handled (it needs a new
 // Security Set).
 //
-// Differences within `tolerance` percentage points are treated as rounding
-// noise, not a real change — the original value is left exactly as-is.
-// Defaults to 0.05pp but is user-adjustable in the review screen.
-const DEFAULT_CHANGE_TOLERANCE = 0.05;
+// Every value that differs from the library is brought to it — the tolerance
+// defaults to 0 and isn't exposed in the UI (a tolerance is for auditing, not for
+// updating). The argument remains so a caller can still ignore tiny differences.
+const DEFAULT_CHANGE_TOLERANCE = 0;
 
 function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_TOLERANCE) {
   const updated = rows.map(r => ({...r}));
@@ -1111,7 +1111,7 @@ function computeLibraryUpdates(rows, librarySheets, tolerance = DEFAULT_CHANGE_T
   const entryAt = new Map(); // "row|field" -> its review entry, so a later rounding nudge updates it instead of adding a second line
 
   function recordChange(i, field, modelName, label, oldVal, newVal, note) {
-    if (Math.abs(newVal - (parseFloat(oldVal)||0)) > tolerance) {
+    if (Math.abs(newVal - (parseFloat(oldVal)||0)) > tolerance + 1e-9) { // +1e-9: float noise only
       // newVal is part of the key: ex-USLC rows can share the exact same
       // Category label text across genuinely different underlying categories
       // (the file flattens the label, not the number), so two rows with the
@@ -1499,7 +1499,7 @@ const SLEEVE_EQUITY_DI = new Set(["DI_SPX","DI_USLC","DI_GLOBAL","DI_OTHER"]);
 const SLEEVE_FI = new Set(["CORP_BOND","MUNI_BOND"]);
 const sleeveRound = x => +(Math.round(x*100 + 1e-9)/100).toFixed(2);
 const isNormalSleeve = r => String(r["SleeveType"] || "").trim().toLowerCase() === "normal"; // only these rows carry the targets; Custodial / Contribution / Distribution rows are ignored
-const SLEEVE_TOLERANCE = 0.005; // a change smaller than the 2-decimal precision isn't a change
+const SLEEVE_TOLERANCE = 1e-9; // exact: any real difference is brought to the library value (float noise only)
 
 // "STP Direct Large (NQ) - Mod Agg (TA)" -> { size, acct, profile, isTA }
 function parseDirectStrategyName(name) {
@@ -1640,7 +1640,7 @@ function computeSleeveUpdates(rows, aggMap, librarySheets) {
 }
 
 // The two review screens used by UpdateFlow — one per kind of file being updated.
-function ModelsReviewPanel({ result, tolerance, onTolerance, onExport }) {
+function ModelsReviewPanel({ result, onExport }) {
   const { changes, skippedModels, matchedModelCount, unmatchedCategories, unmatchedClasses } = result;
   const grouped = {};
   changes.forEach(c => { (grouped[c.modelName] = grouped[c.modelName]||[]).push(c); });
@@ -1661,15 +1661,6 @@ function ModelsReviewPanel({ result, tolerance, onTolerance, onExport }) {
               <div style={{fontSize:11,color:"#6b7280"}}>{lbl}</div>
             </div>
           ))}
-        </div>
-        <div style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px",minWidth:150}}>
-          <label style={{fontSize:11,color:"#6b7280",display:"block",marginBottom:4}}>Change tolerance (pp)</label>
-          <input type="number" step="0.01" min="0" value={tolerance}
-            onChange={e=>{
-              const v = e.target.value === "" ? 0 : parseFloat(e.target.value);
-              if (!isNaN(v)) onTolerance(v);
-            }}
-            style={{width:"100%",boxSizing:"border-box",border:"0.5px solid #d1d5db",borderRadius:6,padding:"4px 8px",fontSize:14,fontWeight:700,color:"#111827"}} />
         </div>
       </div>
 
@@ -1865,7 +1856,6 @@ function UpdateFlow({ onBack }) {
   const [error, setError] = useState(null);
   const [modelResult, setModelResult] = useState(null);
   const [sleeveResult, setSleeveResult] = useState(null);
-  const [tolerance, setTolerance] = useState(DEFAULT_CHANGE_TOLERANCE);
   const [downloads, setDownloads] = useState([]); // file names exported this session
 
   useEffect(() => {
@@ -1941,14 +1931,10 @@ function UpdateFlow({ onBack }) {
 
   function runCompare() {
     const pooled = pooledLibrary();
-    const mr = existing ? computeLibraryUpdates(existing.rows, pooled, tolerance) : null;
+    const mr = existing ? computeLibraryUpdates(existing.rows, pooled) : null;
     const sr = importData ? computeSleeveUpdates(importData.rows, aggMap, pooled) : null;
     setModelResult(mr); setSleeveResult(sr);
     setTab(mr ? "models" : "sleeves"); setDownloads([]); setStage("review");
-  }
-  function handleToleranceChange(v) {
-    setTolerance(v);
-    if (existing && (library || directLibrary)) setModelResult(computeLibraryUpdates(existing.rows, pooledLibrary(), v));
   }
   const noteDownload = name => setDownloads(d => d.includes(name) ? d : [...d, name]);
   function exportModels(changedOnly) {
@@ -2037,7 +2023,7 @@ function UpdateFlow({ onBack }) {
         </div>
       )}
 
-      {active === "models" && <ModelsReviewPanel result={modelResult} tolerance={tolerance} onTolerance={handleToleranceChange} onExport={exportModels} />}
+      {active === "models" && <ModelsReviewPanel result={modelResult} onExport={exportModels} />}
       {active === "sleeves" && <SleevesReviewPanel result={sleeveResult} onExport={exportSleeves} />}
 
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"0.5px solid #e5e7eb",paddingTop:16,marginTop:8}}>
