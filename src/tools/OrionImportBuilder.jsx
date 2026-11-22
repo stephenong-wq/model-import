@@ -819,7 +819,8 @@ function parseLibraryWorkbook(buffer) {
       else if (variantCols.length>0) break;
     }
     const rows = [];
-    let currentCategory = null;
+    const tickers = []; // security/ticker rows — used for the Security Set updates; the model/sleeve logic ignores them
+    let currentCategory = null, currentClass = null;
     for (let i=headerIdx+1; i<raw.length; i++) {
       const row = raw[i];
       if (!row) continue;
@@ -829,7 +830,12 @@ function parseLibraryWorkbook(buffer) {
       if (!labelStr) continue;
       const fundName = row[1];
       const isTicker = fundName !== null && fundName !== undefined && fundName !== "";
-      if (isTicker) continue; // security/ticker level — not managed by this tool
+      if (isTicker) {
+        const tv = {};
+        variantCols.forEach(({idx,name}) => { const n = parseFloat(row[idx]); tv[name] = Number.isFinite(n) ? n : null; });
+        tickers.push({ ticker:labelStr.toUpperCase(), name:String(fundName).trim(), category:currentCategory, cls:currentClass, values:tv });
+        continue;
+      }
       const isCategory = labelStr === labelStr.toUpperCase() && labelStr !== labelStr.toLowerCase();
       const values = {};
       variantCols.forEach(({idx,name}) => {
@@ -837,9 +843,10 @@ function parseLibraryWorkbook(buffer) {
         values[name] = (v===null||v===undefined||v==="") ? null : parseFloat(v);
       });
       if (isCategory) {
-        currentCategory = labelStr;
+        currentCategory = labelStr; currentClass = null;
         rows.push({ level:"category", label:labelStr, values });
       } else {
+        if (!/expense ratio/i.test(labelStr)) currentClass = labelStr;
         // category tracks which category (by label) this class belongs to,
         // based on the sheet's own row order — needed so exclusion rules
         // (e.g. ex-USLC) know which classes are siblings of the excluded one.
@@ -855,7 +862,7 @@ function parseLibraryWorkbook(buffer) {
     // this doesn't depend on guessing which sheet names to allow.
     if (variantCols.length < 2 || !rows.some(r => r.level === "category")) return;
 
-    sheets.push({ name, variants: variantCols.map(v=>v.name), rows, isTaxAware: /tax|\(\s*ta\s*\)/i.test(name) });
+    sheets.push({ name, variants: variantCols.map(v=>v.name), rows, tickers, isTaxAware: /tax|\(\s*ta\s*\)/i.test(name) });
   });
   return sheets;
 }
@@ -1856,6 +1863,233 @@ function SleevesReviewPanel({ result, onExport }) {
   );
 }
 
+// ── Update Security Sets: STP Tactical ETF ───────────────────────────────────
+// Each "STP Tactical ETF (Large|Medium) - {profile}[ (Tax-Aware)]" Security Set holds only the
+// ETF positions of the matching STP Direct model, pro-rated to 100. What's left out is carried by
+// the sleeve strategies instead: the Savvy Global Equity sleeve (always) and, for Large, the
+// US Investment Grade (Corporate / Muni bond) sleeve. So, from the STP Direct library:
+//   allocation = ticker weight / (1 - the excluded weights), to 2 decimals, totalling exactly 100.
+// Large reads "STP Direct Large", Medium reads "STP Direct Med" (and the "(TA)" tab for Tax-Aware).
+// A ticker the library has dropped is removed from the set, and a new one is added by copying
+// that ticker's own row from another set. The library is the source of truth.
+const SS_SET_LEVEL = ["Security Set ID","Name","Team ID","Security Set Do Not TLH","Description"]; // copied from the set's own rows, not the ticker's
+const ssRound = x => +(Math.round(x*100 + 1e-9)/100).toFixed(2);
+const SS_GLOBAL_EQUITY = "SAVVY GLOBAL EQUITY"; // the library's Global Equity row
+
+function parseSecuritySetDetail(buffer) {
+  const wb = XLSX.read(buffer, { type:"array" });
+  const sheetName = wb.SheetNames[0];
+  const raw = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header:1, defval:null });
+  let headerIdx = -1;
+  for (let i=0; i<Math.min(raw.length,10); i++) {
+    const n = (raw[i]||[]).map(normalizeKey);
+    if (n.includes("security set id") && n.includes("symbol")) { headerIdx = i; break; }
+  }
+  if (headerIdx === -1) throw new Error("Couldn't find 'Security Set ID' and 'Symbol' columns — this should be the Security Set Detail export.");
+  const names = raw[headerIdx].map(c => (c===null||c===undefined) ? null : c.toString().trim());
+  const headers = [];
+  names.forEach(h => { if (h && !headers.includes(h)) headers.push(h); });
+  for (const need of ["Security Set ID","Name","Symbol","Allocation %"]) {
+    if (!headers.includes(need)) throw new Error(`The Security Set Detail is missing the '${need}' column.`);
+  }
+  const rows = [];
+  for (let i=headerIdx+1; i<raw.length; i++) {
+    const row = raw[i];
+    if (!row || row.every(c=>c===null||c==="")) continue;
+    const obj = {};
+    names.forEach((h,idx)=>{ if (h) obj[h] = row[idx]!==undefined ? row[idx] : null; });
+    if (obj["Security Set ID"]===null || obj["Security Set ID"]==="") continue;
+    rows.push(obj);
+  }
+  if (rows.length === 0) throw new Error("No Security Sets found in the file.");
+  return { headers, rows, sheetName };
+}
+
+// "STP Tactical ETF (Large) - Moderately Conservative (Tax-Aware)" -> { size, profile, isTA }
+function parseTacticalSetName(name) {
+  const m = (name||"").match(/^STP Tactical ETF\s*\(\s*(Large|Medium)\s*\)\s*-\s*(.+?)\s*$/i);
+  if (!m) return null;
+  let profile = m[2].trim(), isTA = false;
+  const t = profile.match(/^(.*?)\s*\((?:Tax[-\s]?Aware|TA)\)\s*$/i);
+  if (t) { profile = t[1].trim(); isTA = true; }
+  const alias = { "mod agg":"Moderately Aggressive", "mod cons":"Moderately Conservative" };
+  profile = alias[profile.toLowerCase()] || profile;
+  return { size: /large/i.test(m[1]) ? "Large" : "Medium", profile, isTA };
+}
+
+// Library -> { allocations: Map(ticker -> %), total 100.00 }  |  { reason }
+function tacticalSetAllocations(info, librarySheets) {
+  const prefix = normAlnum(info.size === "Large" ? "STP Direct Large" : "STP Direct Med");
+  const sheet = librarySheets.find(s => (!s.source || s.source === "direct") && normAlnum(s.name).startsWith(prefix) && s.isTaxAware === info.isTA);
+  if (!sheet) return { reason:`no ${info.isTA ? "Tax Aware " : ""}'STP Direct ${info.size === "Large" ? "Large" : "Med"}' tab (is the STP Direct library uploaded?)` };
+  const variant = sheet.variants.find(v => v.toLowerCase() === info.profile.toLowerCase());
+  if (!variant) return { reason:`'${info.profile}' isn't a column in ${sheet.name}` };
+  if (!sheet.tickers || !sheet.tickers.length) return { reason:`${sheet.name} has no ticker rows` };
+  const weights = new Map();
+  for (const t of sheet.tickers) {
+    if (t.ticker === SS_GLOBAL_EQUITY) continue;                                  // carried by the Global Equity sleeve
+    if (info.size === "Large" && /us investment grade/i.test(t.cls || "")) continue; // carried by the bond sleeve
+    const w = t.values[variant] || 0;
+    if (w > 0) weights.set(t.ticker, (weights.get(t.ticker) || 0) + w);
+  }
+  const total = [...weights.values()].reduce((a, b) => a + b, 0);
+  if (total <= 0) return { reason:`nothing is left in ${sheet.name} · ${variant} once the Global Equity${info.size === "Large" ? " and US Investment Grade" : ""} weight is set aside` };
+  const allocations = new Map();
+  for (const [tk, w] of weights) allocations.set(tk, ssRound(w / total * 100));
+  const diff = ssRound(100 - [...allocations.values()].reduce((a, b) => a + b, 0));
+  if (diff !== 0) { // rounding left the set a cent or two off 100 — the largest position absorbs it
+    const big = [...allocations.entries()].reduce((a, b) => b[1] > a[1] ? b : a);
+    allocations.set(big[0], ssRound(big[1] + diff));
+  }
+  return { allocations };
+}
+
+function computeSecuritySetUpdates(rows, librarySheets) {
+  const keyOf = v => String(v == null ? "" : v).trim().toUpperCase();
+  const sets = new Map(); // id -> { id, name, idx: [row indexes] }
+  rows.forEach((r, i) => {
+    const id = r["Security Set ID"];
+    if (!sets.has(id)) sets.set(id, { id, name:r["Name"], idx:[] });
+    sets.get(id).idx.push(i);
+  });
+  // A new row for a ticker copies that ticker's own row (its TLH fields etc.) — the most common version in the file.
+  const versions = new Map(); // ticker -> Map(signature -> { row, n })
+  rows.forEach(r => {
+    const t = keyOf(r["Symbol"]); if (!t) return;
+    const sig = JSON.stringify(Object.keys(r).filter(k => !SS_SET_LEVEL.includes(k) && k !== "Allocation %").sort().map(k => [k, r[k]]));
+    if (!versions.has(t)) versions.set(t, new Map());
+    const m = versions.get(t); m.set(sig, { row:m.has(sig) ? m.get(sig).row : r, n:(m.has(sig) ? m.get(sig).n : 0) + 1 });
+  });
+  const templateFor = t => { const m = versions.get(t); return m ? [...m.values()].reduce((a, b) => b.n > a.n ? b : a).row : null; };
+
+  const updated = rows.map(r => ({ ...r }));
+  const removed = new Set(), addedAfter = new Map(); // last-row index of a set -> rows to insert after it
+  const changes = [], statuses = [];
+  for (const s of sets.values()) {
+    const skip = (group, reason) => statuses.push({ id:s.id, name:s.name, status:"skipped", group, reason });
+    const info = parseTacticalSetName(s.name);
+    if (!info) { skip("Not touched", "Not an STP Tactical ETF set"); continue; }
+    const exp = tacticalSetAllocations(info, librarySheets);
+    if (exp.reason) { skip("Library not available", exp.reason); continue; }
+    const cur = new Map(); let dup = null;
+    for (const i of s.idx) { const t = keyOf(updated[i]["Symbol"]); if (cur.has(t)) dup = t; cur.set(t, i); }
+    if (dup) { skip("Couldn't read", `${dup} appears twice in the set`); continue; }
+    const needNew = [...exp.allocations.keys()].filter(t => !cur.has(t));
+    const noRow = needNew.filter(t => !templateFor(t));
+    if (noRow.length) { skip("Needs a ticker added first", `${noRow.join(", ")} isn't in any Security Set in this file — add it in Orion first`); continue; }
+
+    const mine = [];
+    for (const [t, i] of cur) {
+      const oldVal = parseFloat(updated[i]["Allocation %"]) || 0;
+      if (!exp.allocations.has(t)) { removed.add(i); mine.push({ setId:s.id, setName:s.name, ticker:t, oldVal, newVal:null, kind:"removed" }); }
+      else if (Math.abs(exp.allocations.get(t) - oldVal) > 1e-9) { updated[i]["Allocation %"] = exp.allocations.get(t); mine.push({ setId:s.id, setName:s.name, ticker:t, oldVal, newVal:exp.allocations.get(t), kind:"changed" }); }
+    }
+    const fresh = [];
+    for (const t of needNew) {
+      const row = { ...templateFor(t) };
+      const sibling = rows[s.idx[0]];
+      SS_SET_LEVEL.forEach(k => { if (k in sibling) row[k] = sibling[k]; });
+      row["Symbol"] = t; row["Allocation %"] = exp.allocations.get(t);
+      fresh.push(row); mine.push({ setId:s.id, setName:s.name, ticker:t, oldVal:null, newVal:exp.allocations.get(t), kind:"added" });
+    }
+    if (fresh.length) addedAfter.set(s.idx[s.idx.length - 1], fresh);
+    changes.push(...mine);
+    statuses.push({ id:s.id, name:s.name, status: mine.length ? "updated" : "unchanged" });
+  }
+  const updatedRows = [];
+  updated.forEach((r, i) => { if (!removed.has(i)) updatedRows.push(r); if (addedAfter.has(i)) updatedRows.push(...addedAfter.get(i)); });
+  return { updatedRows, changes, statuses, setCount:sets.size };
+}
+
+function SecuritySetsReviewPanel({ result, onExport }) {
+  const { changes, statuses, setCount } = result;
+  const grouped = {};
+  changes.forEach(c => { (grouped[c.setId] = grouped[c.setId] || { name:c.setName, items:[] }).items.push(c); });
+  const ids = Object.keys(grouped);
+  const unchanged = statuses.filter(s => s.status === "unchanged");
+  const skipped = statuses.filter(s => s.status === "skipped");
+  const skippedByReason = skipped.reduce((g, s) => { const k = `${s.group} — ${s.reason}`; (g[k] = g[k] || []).push(s.name); return g; }, {});
+  return (
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:16}}>
+        {[
+          ["Security Sets in file", setCount, "#1a56db"],
+          ["Being updated", ids.length, ids.length ? "#b45309" : "#9ca3af"],
+          ["Already correct", unchanged.length, "#16a34a"],
+          ["Not updated", skipped.length, "#9ca3af"],
+        ].map(([lbl,val,color])=>(
+          <div key={lbl} style={{background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,padding:"10px 12px"}}>
+            <div style={{fontSize:19,fontWeight:700,color}}>{val}</div>
+            <div style={{fontSize:11,color:"#6b7280"}}>{lbl}</div>
+          </div>
+        ))}
+      </div>
+
+      {ids.length === 0 && (
+        <div style={{background:"#f0fdf4",border:"0.5px solid #bbf7d0",borderRadius:8,padding:"14px",fontSize:13,color:"#166534",marginBottom:16}}>
+          Every STP Tactical ETF Security Set already matches the library — nothing to change.
+        </div>
+      )}
+
+      {ids.map(id => (
+        <div key={id} style={{border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:10,overflow:"hidden"}}>
+          <div style={{background:"#f9fafb",padding:"8px 12px",fontSize:12,fontWeight:700,color:"#111827",borderBottom:"0.5px solid #e5e7eb"}}>
+            {grouped[id].name} <span style={{fontWeight:400,color:"#9ca3af"}}>(ID {id})</span>
+          </div>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+            <tbody>
+              {grouped[id].items.map((c,i)=>(
+                <tr key={i} style={{borderTop:i>0?"0.5px solid #f3f4f6":"none",background:c.kind==="changed"?"transparent":"#fffbeb"}}>
+                  <td style={{padding:"6px 12px",color:"#374151",fontFamily:"monospace",fontWeight:600}}>
+                    {c.ticker}
+                    {c.kind==="added" && <span style={{marginLeft:8,fontSize:9,fontWeight:700,color:"#15803d",background:"#dcfce7",borderRadius:4,padding:"1px 5px",fontFamily:"inherit"}}>NEW ROW</span>}
+                    {c.kind==="removed" && <span style={{marginLeft:8,fontSize:9,fontWeight:700,color:"#b91c1c",background:"#fee2e2",borderRadius:4,padding:"1px 5px",fontFamily:"inherit"}}>ROW REMOVED</span>}
+                  </td>
+                  <td style={{padding:"6px 12px",color:"#dc2626",textAlign:"right",width:80}}>{c.oldVal===null ? "—" : `${c.oldVal}%`}</td>
+                  <td style={{padding:"6px 4px",color:"#9ca3af",width:20}}>→</td>
+                  <td style={{padding:"6px 12px",color:c.kind==="removed"?"#b91c1c":"#16a34a",fontWeight:700,textAlign:"right",width:80}}>{c.kind==="removed" ? "removed" : `${c.newVal}%`}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+
+      {(unchanged.length>0 || skipped.length>0) && (
+        <details style={{marginTop:8,marginBottom:20}}>
+          <summary style={{cursor:"pointer",fontSize:12,fontWeight:600,color:"#6b7280"}}>
+            Not changed — {unchanged.length} already correct, {skipped.length} not updated
+          </summary>
+          <div style={{marginTop:8,padding:"10px 12px",background:"#f9fafb",border:"0.5px solid #e5e7eb",borderRadius:8,fontSize:11,color:"#6b7280",lineHeight:1.7}}>
+            {unchanged.length>0 && (
+              <div style={{marginBottom:8}}>
+                <strong style={{color:"#374151"}}>Already match the library</strong> ({unchanged.length}): {unchanged.map(u=>u.name).join("; ")}
+              </div>
+            )}
+            {skipped.length>0 && (
+              <div>
+                <strong style={{color:"#374151"}}>Not updated</strong> (kept as-is):
+                <ul style={{margin:"4px 0 0",paddingLeft:18}}>
+                  {Object.entries(skippedByReason).map(([why,names],i)=>(
+                    <li key={i} style={{marginBottom:4}}><strong style={{color:"#374151"}}>{why}</strong> ({names.length}): {names.join("; ")}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        </details>
+      )}
+
+      <div style={{display:"flex",justifyContent:"flex-end",alignItems:"center",marginBottom:4}}>
+        <button onClick={()=>onExport()} disabled={ids.length===0}
+          style={{background:ids.length?"#1a56db":"#93c5fd",border:"none",borderRadius:6,padding:"8px 20px",fontSize:13,fontWeight:600,color:"#fff",cursor:ids.length?"pointer":"default"}}>
+          Export changed Security Sets ↓
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Update flow: existing models and sleeve strategies ───────────────────────
 // One workflow for both kinds of file. Upload either (or both) of the model
 // export and the Sleeve Strategy Import, plus the model libraries — which are the
@@ -1867,6 +2101,8 @@ function UpdateFlow({ onBack }) {
   const [existing, setExisting] = useState(null); // model export { headers, rows }
   const [importFile, setImportFile] = useState(null);
   const [importData, setImportData] = useState(null); // sleeve import { headers, rows, sheetName }
+  const [ssFile, setSsFile] = useState(null);
+  const [ssData, setSsData] = useState(null); // Security Set Detail { headers, rows, sheetName }
   const [exportFile, setExportFile] = useState(null);
   const [aggMap, setAggMap] = useState(null); // { modelAggId: name }, kept between sessions
   const [aggMeta, setAggMeta] = useState(null); // { savedAt, fileName, count }
@@ -1877,6 +2113,7 @@ function UpdateFlow({ onBack }) {
   const [error, setError] = useState(null);
   const [modelResult, setModelResult] = useState(null);
   const [sleeveResult, setSleeveResult] = useState(null);
+  const [ssResult, setSsResult] = useState(null);
   const [downloads, setDownloads] = useState([]); // file names exported this session
 
   useEffect(() => {
@@ -1910,6 +2147,11 @@ function UpdateFlow({ onBack }) {
     if (!file) return;
     setError(null); setImportFile(file); setImportData(null);
     readFile(file, parseSleeveImport, setImportData);
+  }
+  function handleSsFile(file) {
+    if (!file) return;
+    setError(null); setSsFile(file); setSsData(null);
+    readFile(file, parseSecuritySetDetail, setSsData);
   }
   function handleExportFile(file) {
     if (!file) return;
@@ -1945,17 +2187,19 @@ function UpdateFlow({ onBack }) {
   ];
 
   const missing = [];
-  if (!existing && !importData) missing.push("a model export and/or a Sleeve Strategy Import");
+  if (!existing && !importData && !ssData) missing.push("a model export, a Sleeve Strategy Import and/or a Security Set Detail");
   if (importData && !aggMap) missing.push("the Sleeve Strategy Export (needed once)");
-  if (!library && !directLibrary) missing.push("at least one model library");
+  if ((existing || importData) && !library && !directLibrary) missing.push("at least one model library");
+  if (ssData && !directLibrary) missing.push("the STP Direct library (for the Security Sets)");
   const ready = missing.length === 0;
 
   function runCompare() {
     const pooled = pooledLibrary();
     const mr = existing ? computeLibraryUpdates(existing.rows, pooled) : null;
     const sr = importData ? computeSleeveUpdates(importData.rows, aggMap, pooled) : null;
-    setModelResult(mr); setSleeveResult(sr);
-    setTab(mr ? "models" : "sleeves"); setDownloads([]); setStage("review");
+    const ss = ssData ? computeSecuritySetUpdates(ssData.rows, pooled) : null;
+    setModelResult(mr); setSleeveResult(sr); setSsResult(ss);
+    setTab(mr ? "models" : sr ? "sleeves" : "security"); setDownloads([]); setStage("review");
   }
   const noteDownload = name => setDownloads(d => d.includes(name) ? d : [...d, name]);
   function exportModels(changedOnly) {
@@ -1976,11 +2220,20 @@ function UpdateFlow({ onBack }) {
     downloadXlsxWithHeaders(rows, importData.headers, name, importData.sheetName);
     noteDownload(name);
   }
+  function exportSecuritySets() {
+    const baseName = ssFile.name.replace(/\.[^.]+$/,"");
+    const changedIds = new Set(ssResult.changes.map(c => c.setId));
+    // Just the sets that changed, with every one of their rows (as they now stand)
+    const rows = ssResult.updatedRows.filter(r => changedIds.has(r["Security Set ID"]));
+    const name = `${baseName}_ChangedSecuritySetsOnly.xlsx`;
+    downloadXlsxWithHeaders(rows, ssData.headers, name, ssData.sheetName);
+    noteDownload(name);
+  }
   function startOver() {
     setStage("upload");
-    setExistingFile(null); setExisting(null); setImportFile(null); setImportData(null); setExportFile(null);
+    setExistingFile(null); setExisting(null); setImportFile(null); setImportData(null); setExportFile(null); setSsFile(null); setSsData(null);
     setLibraryFile(null); setLibrary(null); setDirectFile(null); setDirectLibrary(null);
-    setError(null); setModelResult(null); setSleeveResult(null); setDownloads([]);
+    setError(null); setModelResult(null); setSleeveResult(null); setSsResult(null); setDownloads([]);
   }
 
   const btnGhost = {background:"none",border:"0.5px solid #d1d5db",borderRadius:6,padding:"8px 16px",fontSize:13,color:"#374151",cursor:"pointer"};
@@ -2000,17 +2253,16 @@ function UpdateFlow({ onBack }) {
             file={exportFile || (aggMeta ? { name: aggMeta.fileName || "stored export" } : null)} onFile={handleExportFile} accentColor="#f59e0b" />
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:14}}>
+          <FilePickBox label="Security Set Detail" hint="Optional — the STP Tactical ETF sets to update (.xlsx)"
+            file={ssFile} onFile={handleSsFile} accentColor="#e11d48" />
           <FilePickBox label="Savvy model library" hint="STP and Paragon/STP targets (.xlsx)"
             file={libraryFile} onFile={handleLibraryFile} accentColor="#0aa89c" />
           <FilePickBox label="STP Direct library" hint="STP Direct targets (.xlsx)"
             file={directFile} onFile={handleDirectFile} accentColor="#7c3aed" />
-          <div style={{border:"0.5px solid #e5e7eb",borderRadius:10,background:"#fff",padding:"22px 16px",fontSize:12,color:"#6b7280",lineHeight:1.6,display:"flex",alignItems:"center"}}>
-            The libraries are the source of truth for both the models and the sleeve strategies, so you only upload them once.
-          </div>
         </div>
         {error && <div style={{marginBottom:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
         <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.7,marginBottom:16}}>
-          <strong style={{color:"#0369a1"}}>What this does:</strong> add the model export, the Sleeve Strategy Import, or both. <strong>Models:</strong> recalculates Category and Class targets from the library and leaves bands, Security Sets and anything the library doesn't cover untouched; a class or category the library no longer has for a model — blank, 0%, or deleted from the library — is removed (its row is deleted), and new ones aren't added. <strong>Sleeve strategies:</strong> recalculates Target Allocation for the STP Direct, Paragon and STP + DI strategies and leaves Thematic and other fixed percentages alone. The sleeve export has just the strategies that changed, and only their Normal sleeve rows. You'll see every change before exporting, and each file exports separately.
+          <strong style={{color:"#0369a1"}}>What this does:</strong> add any of the model export, the Sleeve Strategy Import and the Security Set Detail — the libraries are the source of truth for all three. <strong>Models:</strong> recalculates Category and Class targets from the library and leaves bands, Security Sets and anything the library doesn't cover untouched; a class or category the library no longer has for a model — blank, 0%, or deleted from the library — is removed (its row is deleted), and new ones aren't added. <strong>Sleeve strategies:</strong> recalculates Target Allocation for the STP Direct, Paragon and STP + DI strategies and leaves Thematic and other fixed percentages alone. The sleeve export has just the strategies that changed, and only their Normal sleeve rows. <strong>Security Sets:</strong> recalculates the STP Tactical ETF sets from the STP Direct library — the ETF positions pro-rated to 100, with Global Equity (and, for Large, US Investment Grade) set aside for the sleeve strategies — adding or removing a ticker if the library changed; the export has just the sets that changed. You'll see every change before exporting, and each file exports separately.
         </div>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <button onClick={onBack} style={btnGhost}>← Back</button>
@@ -2029,12 +2281,18 @@ function UpdateFlow({ onBack }) {
   // stage === "review"
   const nModels = modelResult ? new Set(modelResult.changes.map(c => c.modelName)).size : 0;
   const nSleeves = sleeveResult ? new Set(sleeveResult.changes.map(c => c.strategyId)).size : 0;
-  const active = modelResult && sleeveResult ? tab : (modelResult ? "models" : "sleeves");
+  const nSets = ssResult ? new Set(ssResult.changes.map(c => c.setId)).size : 0;
+  const sections = [
+    modelResult && ["models", "Models", nModels],
+    sleeveResult && ["sleeves", "Sleeve strategies", nSleeves],
+    ssResult && ["security", "Security sets", nSets],
+  ].filter(Boolean);
+  const active = sections.some(x => x[0] === tab) ? tab : sections[0][0];
   return (
     <div>
-      {modelResult && sleeveResult && (
+      {sections.length > 1 && (
         <div style={{display:"flex",gap:6,marginBottom:16,borderBottom:"0.5px solid #e5e7eb"}}>
-          {[["models","Models",nModels],["sleeves","Sleeve strategies",nSleeves]].map(([id,label,n])=>(
+          {sections.map(([id,label,n])=>(
             <button key={id} onClick={()=>setTab(id)}
               style={{background:"none",border:"none",borderBottom:active===id?"2px solid #1a56db":"2px solid transparent",marginBottom:-1,padding:"8px 14px",fontSize:13,fontWeight:active===id?700:500,color:active===id?"#111827":"#6b7280",cursor:"pointer"}}>
               {label}
@@ -2046,6 +2304,7 @@ function UpdateFlow({ onBack }) {
 
       {active === "models" && <ModelsReviewPanel result={modelResult} onExport={exportModels} />}
       {active === "sleeves" && <SleevesReviewPanel result={sleeveResult} onExport={exportSleeves} />}
+      {active === "security" && <SecuritySetsReviewPanel result={ssResult} onExport={exportSecuritySets} />}
 
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"0.5px solid #e5e7eb",paddingTop:16,marginTop:8}}>
         <button onClick={()=>setStage("upload")} style={btnGhost}>← Back</button>
@@ -3313,7 +3572,7 @@ export default function OrionImportBuilder() {
           <div>
             <div style={{fontSize:18,fontWeight:700,color:"#111827"}}>Orion Import Builder</div>
             <div style={{fontSize:12,color:"#6b7280"}}>
-              {mode===null ? "Upload · visualize · edit · export" : mode==="import" ? "New import file" : mode==="update" ? "Update existing models and sleeve strategies" : "Advisor Custom Model builder"}
+              {mode===null ? "Upload · visualize · edit · export" : mode==="import" ? "New import file" : mode==="update" ? "Update existing models, sleeve strategies and security sets" : "Advisor Custom Model builder"}
             </div>
           </div>
         </div>
@@ -3352,8 +3611,8 @@ export default function OrionImportBuilder() {
                 <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
               </svg>
             </div>
-            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Update existing models and sleeve strategies</div>
-            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload your current model export and/or the Sleeve Strategy Import plus the model libraries — get back updated files with just the changed values.</div>
+            <div style={{fontSize:15,fontWeight:700,color:"#111827",marginBottom:6}}>Update existing models, sleeve strategies and security sets</div>
+            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Upload your model export, Sleeve Strategy Import and/or Security Set Detail plus the model libraries — get back updated files with just the changed values.</div>
           </div>
           <div onClick={()=>setMode("acm")}
             style={{flex:1,border:"0.5px solid #e5e7eb",borderRadius:12,padding:"28px 20px",cursor:"pointer",background:"#fff",transition:"all 0.15s"}}
