@@ -1870,8 +1870,10 @@ function SleevesReviewPanel({ result, onExport }) {
 // US Investment Grade (Corporate / Muni bond) sleeve. So, from the STP Direct library:
 //   allocation = ticker weight / (1 - the excluded weights), to 2 decimals, totalling exactly 100.
 // Large reads "STP Direct Large", Medium reads "STP Direct Med" (and the "(TA)" tab for Tax-Aware).
-// A ticker the library has dropped is removed from the set, and a new one is added by copying
-// that ticker's own row from another set. The library is the source of truth.
+// A ticker the library has dropped is removed from the set. A ticker the library has added gets a
+// new row: copied from that ticker's own row in another set if it has one, or — for a security
+// that's new to every set — built from the set's own row with the ticker-level TLH fields left blank.
+// The library is the source of truth.
 const SS_SET_LEVEL = ["Security Set ID","Name","Team ID","Security Set Do Not TLH","Description"]; // copied from the set's own rows, not the ticker's
 const ssRound = x => +(Math.round(x*100 + 1e-9)/100).toFixed(2);
 const SS_GLOBAL_EQUITY = "SAVVY GLOBAL EQUITY"; // the library's Global Equity row
@@ -1961,6 +1963,15 @@ function computeSecuritySetUpdates(rows, librarySheets) {
     const m = versions.get(t); m.set(sig, { row:m.has(sig) ? m.get(sig).row : r, n:(m.has(sig) ? m.get(sig).n : 0) + 1 });
   });
   const templateFor = t => { const m = versions.get(t); return m ? [...m.values()].reduce((a, b) => b.n > a.n ? b : a).row : null; };
+  // Ticker-level columns (the TLH alternative etc.) are the ones that differ between the rows of a single set.
+  // A security that isn't anywhere in the file yet gets a row built from its set's own row, with these left blank.
+  const tickerCols = new Set();
+  for (const s of sets.values()) {
+    for (const k of Object.keys(rows[s.idx[0]])) {
+      if (SS_SET_LEVEL.includes(k) || k === "Symbol" || k === "Allocation %") continue;
+      if (new Set(s.idx.map(i => rows[i][k])).size > 1) tickerCols.add(k);
+    }
+  }
 
   const updated = rows.map(r => ({ ...r }));
   const removed = new Set(), addedAfter = new Map(); // last-row index of a set -> rows to insert after it
@@ -1975,8 +1986,6 @@ function computeSecuritySetUpdates(rows, librarySheets) {
     for (const i of s.idx) { const t = keyOf(updated[i]["Symbol"]); if (cur.has(t)) dup = t; cur.set(t, i); }
     if (dup) { skip("Couldn't read", `${dup} appears twice in the set`); continue; }
     const needNew = [...exp.allocations.keys()].filter(t => !cur.has(t));
-    const noRow = needNew.filter(t => !templateFor(t));
-    if (noRow.length) { skip("Needs a ticker added first", `${noRow.join(", ")} isn't in any Security Set in this file — add it in Orion first`); continue; }
 
     const mine = [];
     for (const [t, i] of cur) {
@@ -1986,11 +1995,13 @@ function computeSecuritySetUpdates(rows, librarySheets) {
     }
     const fresh = [];
     for (const t of needNew) {
-      const row = { ...templateFor(t) };
       const sibling = rows[s.idx[0]];
+      const known = templateFor(t); // the ticker already sits in another set: copy its row
+      const row = known ? { ...known } : { ...sibling };
       SS_SET_LEVEL.forEach(k => { if (k in sibling) row[k] = sibling[k]; });
+      if (!known) tickerCols.forEach(k => { row[k] = null; }); // a brand-new security: nothing to copy for the TLH alternative
       row["Symbol"] = t; row["Allocation %"] = exp.allocations.get(t);
-      fresh.push(row); mine.push({ setId:s.id, setName:s.name, ticker:t, oldVal:null, newVal:exp.allocations.get(t), kind:"added" });
+      fresh.push(row); mine.push({ setId:s.id, setName:s.name, ticker:t, oldVal:null, newVal:exp.allocations.get(t), kind:"added", brandNew:!known });
     }
     if (fresh.length) addedAfter.set(s.idx[s.idx.length - 1], fresh);
     changes.push(...mine);
@@ -2009,6 +2020,7 @@ function SecuritySetsReviewPanel({ result, onExport }) {
   const unchanged = statuses.filter(s => s.status === "unchanged");
   const skipped = statuses.filter(s => s.status === "skipped");
   const skippedByReason = skipped.reduce((g, s) => { const k = `${s.group} — ${s.reason}`; (g[k] = g[k] || []).push(s.name); return g; }, {});
+  const brandNew = [...new Set(changes.filter(c => c.brandNew).map(c => c.ticker))];
   return (
     <div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:16}}>
@@ -2030,6 +2042,11 @@ function SecuritySetsReviewPanel({ result, onExport }) {
           Every STP Tactical ETF Security Set already matches the library — nothing to change.
         </div>
       )}
+      {brandNew.length > 0 && (
+        <div style={{background:"#fffbeb",border:"0.5px solid #fde68a",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#92400e",lineHeight:1.6,marginBottom:16}}>
+          <strong>New to every Security Set in this file:</strong> {brandNew.join(", ")}. Its rows are built from each set's own row with the TLH alternative left blank — the security needs to exist in Orion for the import to accept it.
+        </div>
+      )}
 
       {ids.map(id => (
         <div key={id} style={{border:"0.5px solid #e5e7eb",borderRadius:8,marginBottom:10,overflow:"hidden"}}>
@@ -2042,7 +2059,7 @@ function SecuritySetsReviewPanel({ result, onExport }) {
                 <tr key={i} style={{borderTop:i>0?"0.5px solid #f3f4f6":"none",background:c.kind==="changed"?"transparent":"#fffbeb"}}>
                   <td style={{padding:"6px 12px",color:"#374151",fontFamily:"monospace",fontWeight:600}}>
                     {c.ticker}
-                    {c.kind==="added" && <span style={{marginLeft:8,fontSize:9,fontWeight:700,color:"#15803d",background:"#dcfce7",borderRadius:4,padding:"1px 5px",fontFamily:"inherit"}}>NEW ROW</span>}
+                    {c.kind==="added" && <span style={{marginLeft:8,fontSize:9,fontWeight:700,color:"#15803d",background:"#dcfce7",borderRadius:4,padding:"1px 5px",fontFamily:"inherit"}}>{c.brandNew ? "NEW SECURITY" : "NEW ROW"}</span>}
                     {c.kind==="removed" && <span style={{marginLeft:8,fontSize:9,fontWeight:700,color:"#b91c1c",background:"#fee2e2",borderRadius:4,padding:"1px 5px",fontFamily:"inherit"}}>ROW REMOVED</span>}
                   </td>
                   <td style={{padding:"6px 12px",color:"#dc2626",textAlign:"right",width:80}}>{c.oldVal===null ? "—" : `${c.oldVal}%`}</td>
@@ -2262,7 +2279,7 @@ function UpdateFlow({ onBack }) {
         </div>
         {error && <div style={{marginBottom:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
         <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.7,marginBottom:16}}>
-          <strong style={{color:"#0369a1"}}>What this does:</strong> add any of the model export, the Sleeve Strategy Import and the Security Set Detail — the libraries are the source of truth for all three. <strong>Models:</strong> recalculates Category and Class targets from the library and leaves bands, Security Sets and anything the library doesn't cover untouched; a class or category the library no longer has for a model — blank, 0%, or deleted from the library — is removed (its row is deleted), and new ones aren't added. <strong>Sleeve strategies:</strong> recalculates Target Allocation for the STP Direct, Paragon and STP + DI strategies and leaves Thematic and other fixed percentages alone. The sleeve export has just the strategies that changed, and only their Normal sleeve rows. <strong>Security Sets:</strong> recalculates the STP Tactical ETF sets from the STP Direct library — the ETF positions pro-rated to 100, with Global Equity (and, for Large, US Investment Grade) set aside for the sleeve strategies — adding or removing a ticker if the library changed; the export has just the sets that changed. You'll see every change before exporting, and each file exports separately.
+          <strong style={{color:"#0369a1"}}>What this does:</strong> add any of the model export, the Sleeve Strategy Import and the Security Set Detail — the libraries are the source of truth for all three. <strong>Models:</strong> recalculates Category and Class targets from the library and leaves bands, Security Sets and anything the library doesn't cover untouched; a class or category the library no longer has for a model — blank, 0%, or deleted from the library — is removed (its row is deleted), and new ones aren't added. <strong>Sleeve strategies:</strong> recalculates Target Allocation for the STP Direct, Paragon and STP + DI strategies and leaves Thematic and other fixed percentages alone. The sleeve export has just the strategies that changed, and only their Normal sleeve rows. <strong>Security Sets:</strong> recalculates the STP Tactical ETF sets from the STP Direct library — the ETF positions pro-rated to 100, with Global Equity (and, for Large, US Investment Grade) set aside for the sleeve strategies — adding or removing a ticker if the library changed (a security that's new to every set gets a row with the TLH alternative left blank); the export has just the sets that changed. You'll see every change before exporting, and each file exports separately.
         </div>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <button onClick={onBack} style={btnGhost}>← Back</button>
