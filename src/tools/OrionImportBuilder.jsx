@@ -1870,6 +1870,10 @@ function SleevesReviewPanel({ result, onExport }) {
 // US Investment Grade (Corporate / Muni bond) sleeve. So, from the STP Direct library:
 //   allocation = ticker weight / (1 - the excluded weights), to 2 decimals, totalling exactly 100.
 // Large reads "STP Direct Large", Medium reads "STP Direct Med" (and the "(TA)" tab for Tax-Aware).
+//
+// "STP Direct HH - Tactical Equity - {profile}" sets (the Tactical Equity sleeve of the HH models) hold the
+// Tactical Equity class of "STP Direct Med" for that profile, pro-rated within the class to 100.
+//
 // A ticker the library has dropped is removed from the set. A ticker the library has added gets a
 // new row: copied from that ticker's own row in another set if it has one, or — for a security
 // that's new to every set — built from the set's own row with the ticker-level TLH fields left blank.
@@ -1946,6 +1950,55 @@ function tacticalSetAllocations(info, librarySheets) {
   return { allocations };
 }
 
+// "STP Direct HH - Tactical Equity - Moderately Aggressive" -> { profile }
+function parseHhTacticalSetName(name) {
+  const m = (name||"").match(/^STP Direct HH\s*-\s*Tactical Equity\s*-\s*(.+?)\s*$/i);
+  if (!m) return null;
+  const alias = { "mod agg":"Moderately Aggressive", "mod cons":"Moderately Conservative" };
+  const p = m[1].trim();
+  return { profile: alias[p.toLowerCase()] || p };
+}
+
+// The Tactical Equity class of the STP Direct library for this profile, pro-rated WITHIN the class to 100.
+// One set serves both HH models (standard and Tax Aware), so the "STP Direct Med" and "STP Direct Med (TA)"
+// tabs must agree on that class — if they ever don't, the set can't be right for both and is left alone.
+function hhTacticalSetAllocations(info, librarySheets) {
+  const find = isTA => librarySheets.find(s => (!s.source || s.source === "direct") && normAlnum(s.name).startsWith(normAlnum("STP Direct Med")) && s.isTaxAware === isTA);
+  const std = find(false), ta = find(true);
+  if (!std || !ta) return { reason:"no 'STP Direct Med' / 'STP Direct Med (TA)' tab (is the STP Direct library uploaded?)" };
+  const read = sheet => {
+    const v = sheet.variants.find(x => x.toLowerCase() === info.profile.toLowerCase());
+    if (!v) return null;
+    if (!sheet.tickers || !sheet.tickers.length) return null;
+    const w = new Map();
+    for (const t of sheet.tickers) { if (/tactical equity/i.test(t.cls || "") && (t.values[v] || 0) > 0) w.set(t.ticker, (w.get(t.ticker) || 0) + t.values[v]); }
+    return w;
+  };
+  const a = read(std), b = read(ta);
+  if (!a || !b) return { reason:`'${info.profile}' isn't a column (or the tab has no ticker rows) in ${std.name} / ${ta.name}` };
+  const agree = a.size === b.size && [...a].every(([k, w]) => Math.abs((b.get(k) || 0) - w) < 1e-12);
+  if (!agree) return { reason:"the standard and Tax Aware STP Direct Med tabs disagree on Tactical Equity, but this set is shared by both HH models" };
+  const total = [...a.values()].reduce((x, y) => x + y, 0);
+  if (total <= 0) return { reason:`the library has no Tactical Equity weight for ${info.profile}` };
+  const allocations = new Map();
+  for (const [tk, w] of a) allocations.set(tk, ssRound(w / total * 100));
+  const diff = ssRound(100 - [...allocations.values()].reduce((x, y) => x + y, 0));
+  if (diff !== 0) { // rounding left the set a cent or two off 100 — the largest position absorbs it
+    const big = [...allocations.entries()].reduce((x, y) => y[1] > x[1] ? y : x);
+    allocations.set(big[0], ssRound(big[1] + diff));
+  }
+  return { allocations };
+}
+
+// What a Security Set should hold, by family. null = not a set this tool manages.
+function securitySetAllocations(name, librarySheets) {
+  const tac = parseTacticalSetName(name);
+  if (tac) return tacticalSetAllocations(tac, librarySheets);
+  const hh = parseHhTacticalSetName(name);
+  if (hh) return hhTacticalSetAllocations(hh, librarySheets);
+  return null;
+}
+
 function computeSecuritySetUpdates(rows, librarySheets) {
   const keyOf = v => String(v == null ? "" : v).trim().toUpperCase();
   const sets = new Map(); // id -> { id, name, idx: [row indexes] }
@@ -1978,9 +2031,8 @@ function computeSecuritySetUpdates(rows, librarySheets) {
   const changes = [], statuses = [];
   for (const s of sets.values()) {
     const skip = (group, reason) => statuses.push({ id:s.id, name:s.name, status:"skipped", group, reason });
-    const info = parseTacticalSetName(s.name);
-    if (!info) { skip("Not touched", "Not an STP Tactical ETF set"); continue; }
-    const exp = tacticalSetAllocations(info, librarySheets);
+    const exp = securitySetAllocations(s.name, librarySheets);
+    if (!exp) { skip("Not touched", "Not an STP Tactical ETF or STP Direct HH Tactical Equity set"); continue; }
     if (exp.reason) { skip("Library not available", exp.reason); continue; }
     const cur = new Map(); let dup = null;
     for (const i of s.idx) { const t = keyOf(updated[i]["Symbol"]); if (cur.has(t)) dup = t; cur.set(t, i); }
@@ -2039,7 +2091,7 @@ function SecuritySetsReviewPanel({ result, onExport }) {
 
       {ids.length === 0 && (
         <div style={{background:"#f0fdf4",border:"0.5px solid #bbf7d0",borderRadius:8,padding:"14px",fontSize:13,color:"#166534",marginBottom:16}}>
-          Every STP Tactical ETF Security Set already matches the library — nothing to change.
+          Every STP Tactical ETF and STP Direct HH Tactical Equity Security Set already matches the library — nothing to change.
         </div>
       )}
       {brandNew.length > 0 && (
@@ -2270,7 +2322,7 @@ function UpdateFlow({ onBack }) {
             file={exportFile || (aggMeta ? { name: aggMeta.fileName || "stored export" } : null)} onFile={handleExportFile} accentColor="#f59e0b" />
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:14}}>
-          <FilePickBox label="Security Set Detail" hint="Optional — the STP Tactical ETF sets to update (.xlsx)"
+          <FilePickBox label="Security Set Detail" hint="Optional — the STP Tactical ETF and HH Tactical Equity sets (.xlsx)"
             file={ssFile} onFile={handleSsFile} accentColor="#e11d48" />
           <FilePickBox label="Savvy model library" hint="STP and Paragon/STP targets (.xlsx)"
             file={libraryFile} onFile={handleLibraryFile} accentColor="#0aa89c" />
@@ -2279,7 +2331,7 @@ function UpdateFlow({ onBack }) {
         </div>
         {error && <div style={{marginBottom:14,background:"#fee2e2",border:"0.5px solid #fca5a5",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#991b1b"}}><strong>Error:</strong> {error}</div>}
         <div style={{background:"#f0f9ff",border:"0.5px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0c4a6e",lineHeight:1.7,marginBottom:16}}>
-          <strong style={{color:"#0369a1"}}>What this does:</strong> add any of the model export, the Sleeve Strategy Import and the Security Set Detail — the libraries are the source of truth for all three. <strong>Models:</strong> recalculates Category and Class targets from the library and leaves bands, Security Sets and anything the library doesn't cover untouched; a class or category the library no longer has for a model — blank, 0%, or deleted from the library — is removed (its row is deleted), and new ones aren't added. <strong>Sleeve strategies:</strong> recalculates Target Allocation for the STP Direct, Paragon and STP + DI strategies and leaves Thematic and other fixed percentages alone. The sleeve export has just the strategies that changed, and only their Normal sleeve rows. <strong>Security Sets:</strong> recalculates the STP Tactical ETF sets from the STP Direct library — the ETF positions pro-rated to 100, with Global Equity (and, for Large, US Investment Grade) set aside for the sleeve strategies — adding or removing a ticker if the library changed (a security that's new to every set gets a row with the TLH alternative left blank); the export has just the sets that changed. You'll see every change before exporting, and each file exports separately.
+          <strong style={{color:"#0369a1"}}>What this does:</strong> add any of the model export, the Sleeve Strategy Import and the Security Set Detail — the libraries are the source of truth for all three. <strong>Models:</strong> recalculates Category and Class targets from the library and leaves bands, Security Sets and anything the library doesn't cover untouched; a class or category the library no longer has for a model — blank, 0%, or deleted from the library — is removed (its row is deleted), and new ones aren't added. <strong>Sleeve strategies:</strong> recalculates Target Allocation for the STP Direct, Paragon and STP + DI strategies and leaves Thematic and other fixed percentages alone. The sleeve export has just the strategies that changed, and only their Normal sleeve rows. <strong>Security Sets:</strong> recalculates the STP Tactical ETF sets from the STP Direct library — the ETF positions pro-rated to 100, with Global Equity (and, for Large, US Investment Grade) set aside for the sleeve strategies — and the STP Direct HH Tactical Equity sets (the Tactical Equity class, pro-rated within the class), adding or removing a ticker if the library changed (a security that's new to every set gets a row with the TLH alternative left blank); the export has just the sets that changed. You'll see every change before exporting, and each file exports separately.
         </div>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <button onClick={onBack} style={btnGhost}>← Back</button>
